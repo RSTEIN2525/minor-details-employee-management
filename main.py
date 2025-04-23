@@ -1,6 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from models.time_log import SQLModel
+from sqlmodel import SQLModel
+import models.time_log  
+import models.shop       
 from db.session import engine
 from contextlib import asynccontextmanager
 from api.time_routes import router as time_router
