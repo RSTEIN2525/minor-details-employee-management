@@ -2,9 +2,14 @@ from sqlmodel import SQLModel, Field
 from typing import Optional
 from enum import Enum
 from datetime import datetime
+from pydantic import BaseModel
 
 # Defines the Structure of Data for a Clock in Call
-
+class PunchRequest(BaseModel):
+    employee_id: str
+    latitude: float | None = None
+    longitude: float | None = None
+    
 # Enum Limiting Punch Type to Just Two Vals
 class PunchType(str, Enum):
     CLOCK_IN = "clock_in"
