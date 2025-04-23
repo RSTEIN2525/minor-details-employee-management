@@ -6,7 +6,6 @@ from pydantic import BaseModel
 
 # Defines the Structure of Data for a Clock in Call
 class PunchRequest(BaseModel):
-    employee_id: str
     latitude: float | None = None
     longitude: float | None = None
     
@@ -19,6 +18,7 @@ class PunchType(str, Enum):
 class TimeLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     employee_id: str
+    dealership_id: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     punch_type: PunchType
     latitude: Optional[float] = None

@@ -1,6 +1,8 @@
 from sqlmodel import Session, select
 from datetime import datetime, timezone
 from models.time_log import TimeLog, PunchType
+from utils.geofence import is_within_radius
+from models.shop import Shop
 
 
 class PunchService:
@@ -8,11 +10,38 @@ class PunchService:
     @staticmethod
     def validate_and_save(
         employee_id: str,
+        user_dealerships: list[str],
         punch_type: PunchType,
         latitude: float,
         longitude: float,
         session: Session,
     ):
+
+        # 0) Must supply location
+        if latitude is None or longitude is None:
+            return {"status": "error", "message": "Location required to punch."}
+
+        # 1) Check each shop the user belongs to
+        valid_shop = None
+        for shop_id in user_dealerships:
+            shop = session.get(Shop, shop_id)
+            if not shop:
+                continue  # unknown shop, skip
+            if is_within_radius(
+                latitude,
+                longitude,
+                shop.center_lat,
+                shop.center_lng,
+                shop.radius_meters,
+            ):
+                valid_shop = shop
+                break
+
+        if not valid_shop:
+            return {
+                "status": "error",
+                "message": "You are not within any assigned dealership’s geofence.",
+            }
 
         # Fetch Most Recent Log For Employee
         last_punch = session.exec(
