@@ -45,10 +45,12 @@ async def get_current_user(request: Request):
     # Extract Critical Information
     name = profile.get("displayName","")
     email = profile.get("email","")
+    role = profile.get("role","")
 
     return {
         "uid": uid,
         "name": name,
         "email": email,
-        "dealerships": dealerships
+        "dealerships": dealerships,
+        "role" : role
     }
