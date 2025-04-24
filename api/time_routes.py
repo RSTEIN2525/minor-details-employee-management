@@ -22,7 +22,7 @@ def clock_in(
 ):
     return PunchService.validate_and_save(
         employee_id=user["uid"],
-        user_dealerships=user["dealerships"],
+        dealership_id=user["dealerships"],
         punch_type=PunchType.CLOCK_IN,
         latitude=data.latitude,
         longitude=data.longitude,
@@ -39,7 +39,7 @@ def clock_out(
 ):
     return PunchService.validate_and_save(
         employee_id=user["uid"],
-        user_dealerships=user["dealerships"],
+        dealership_id=user["dealerships"],
         punch_type=PunchType.CLOCK_OUT,
         latitude=data.latitude,
         longitude=data.longitude,

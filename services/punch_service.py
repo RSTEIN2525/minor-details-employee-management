@@ -10,7 +10,7 @@ class PunchService:
     @staticmethod
     def validate_and_save(
         employee_id: str,
-        user_dealerships: list[str],
+        dealership_id: list[str],
         punch_type: PunchType,
         latitude: float,
         longitude: float,
@@ -23,7 +23,7 @@ class PunchService:
 
         # 1) Check each shop the user belongs to
         valid_shop = None
-        for shop_id in user_dealerships:
+        for shop_id in dealership_id:
             shop = session.get(Shop, shop_id)
             if not shop:
                 continue  # unknown shop, skip
@@ -74,6 +74,7 @@ class PunchService:
         # Creates a TimeLog Object w/ Data From Endpoint Defined In models/TimeLog
         punch = TimeLog(
             employee_id=employee_id,
+            dealership_id=valid_shop.id,
             punch_type=punch_type,
             latitude=latitude,
             longitude=longitude,
