@@ -6,6 +6,8 @@ import models.shop
 from db.session import engine
 from contextlib import asynccontextmanager
 from api.time_routes import router as time_router
+from api.device_routes import router as device_router
+from api.admin_device_routes import router as admin_device_router
 
 # This file is the control center of the whole application
 
@@ -36,3 +38,5 @@ app.add_middleware(
 
 # Connects Routes From Time_Routes (clock-in / out) to main app
 app.include_router(time_router, prefix="/time", tags=["Time Tracking"])
+app.include_router(device_router,prefix="/device", tags=["Device Identification"])
+app.include_router(admin_device_router, prefix="/admin/device-requests", tags=["Admin" "Device Identification"])

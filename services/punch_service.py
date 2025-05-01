@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from models.time_log import TimeLog, PunchType
 from utils.geofence import is_within_radius
 from models.shop import Shop
+from pydantic import TypeAdapter
+from fastapi import HTTPException, status
 
 
 class PunchService:
@@ -19,7 +21,10 @@ class PunchService:
 
         # 0) Must supply location
         if latitude is None or longitude is None:
-            return {"status": "error", "message": "Location required to punch."}
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Location required to punch.",
+            )
 
         # 1) Check each shop the user belongs to
         valid_shop = None
@@ -38,10 +43,10 @@ class PunchService:
                 break
 
         if not valid_shop:
-            return {
-                "status": "error",
-                "message": "You are not within any assigned dealership’s geofence.",
-            }
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"You must be within the geofence of an assigned dealership to punch. Location: ({latitude},{longitude})",
+            )
 
         # Fetch Most Recent Log For Employee
         last_punch = session.exec(
@@ -57,19 +62,19 @@ class PunchService:
             if last_punch.punch_type == punch_type:
 
                 # Return Error Response Code
-                return {
-                    "status": "error",
-                    "message": f"Cannot {punch_type.value.replace('_', ' ')} twice in a row.",
-                }
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,  # 409 Conflict is suitable for state errors
+                    detail=f"Cannot {punch_type.value.replace('_', ' ')} twice in a row.",
+                )
         else:
             # No Previous Punch Exists; There Must CLOCK_IN First
             if punch_type == PunchType.CLOCK_OUT:
 
                 # Return Error Response Code
-                return {
-                    "status": "error",
-                    "message": "Cannot clock out before clocking in.",
-                }
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,  # 409 Conflict
+                    detail="Cannot clock out before clocking in.",
+                )
 
         # Creates a TimeLog Object w/ Data From Endpoint Defined In models/TimeLog
         punch = TimeLog(
