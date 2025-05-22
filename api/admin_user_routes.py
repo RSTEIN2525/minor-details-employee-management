@@ -25,6 +25,12 @@ class UserWageUpdate(BaseModel):
 class UserWageRead(BaseModel):
     hourlyWage: Optional[float] = None
 
+# Model for listing multiple users with their wages
+class UserWageInfo(BaseModel):
+    id: str
+    displayName: str | None
+    hourlyWage: Optional[float] = None
+
 
 @router.get("/users", response_model=List[UserInfo])
 async def list_all_users_for_admin(
@@ -107,6 +113,52 @@ async def set_or_update_user_wage(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not update user wage.",
+        )
+
+
+@router.get("/users/wages", response_model=List[UserWageInfo])
+async def list_all_user_wages_for_admin(
+    admin_user: Annotated[dict, Depends(require_admin_role)],
+):
+    try:
+        users_ref = db.collection("users")
+        users_stream = users_ref.stream()
+        user_wages_list: List[UserWageInfo] = []
+
+        for doc in users_stream:
+            user_data = doc.to_dict()
+            if not user_data:
+                continue # Should not happen if doc.exists is true, but good practice
+
+            # Only include employees
+            if user_data.get("role") != "employee":
+                continue
+
+            # Extract wage, ensure it's a float if present, or None
+            current_wage = user_data.get("hourlyWage")
+            if current_wage is not None and not isinstance(current_wage, (int, float)):
+                print(f"Warning: User {doc.id} has non-numeric wage value: {current_wage}. Treating as not set.")
+                current_wage = None # Treat invalid data as None
+            elif isinstance(current_wage, int):
+                current_wage = float(current_wage) # Convert int to float for consistency
+
+            user_wage_info = UserWageInfo(
+                id=doc.id,
+                displayName=user_data.get("displayName", "Missing Name"),
+                hourlyWage=current_wage
+            )
+            user_wages_list.append(user_wage_info)
+
+        # Sort list alphabetically by display name for consistency
+        user_wages_list.sort(key=lambda x: x.displayName or "")
+
+        return user_wages_list
+
+    except Exception as e:
+        print(f"Error fetching list of user wages: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not retrieve user wages list.",
         )
 
 

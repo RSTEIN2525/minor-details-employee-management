@@ -1,17 +1,32 @@
-from fastapi import APIRouter, Depends
-from sqlmodel import Session, select
-from datetime import datetime, timezone
+from fastapi import APIRouter, Depends, HTTPException
+from sqlmodel import Session, select, SQLModel
+from datetime import datetime, timezone, date
+from typing import Optional, List
+
 from models.time_log import PunchType, TimeLog, PunchRequest
+from models.clock_request_log import ClockRequestLog, RequestTypeEnum, RequestStatusEnum
 from db.session import get_session
 from services.punch_service import PunchService
 from core.deps import get_current_user
 
+# --- Pydantic Models for Request Payloads ---
 
-# Defines API Endpoints For Employee Front-Facing UI/UX Clock Ins
+class BaseClockRequestPayload(SQLModel):
+    day_of_punch: date     
+    requested_start_time_str: str 
+    requested_end_time_str: str   
+    dealership_id: str
+    reason: str
 
-# Collection of Endpoints
+class ClockEditRequestPayload(BaseClockRequestPayload):
+    original_clock_in_timelog_id: int 
+    original_clock_out_timelog_id: int
+
+class ClockCreateRequestPayload(BaseClockRequestPayload):
+    pass 
+
+# Defines API Endpoints
 router = APIRouter()
-
 
 # Clock In Endpoint
 @router.post("/clock-in")
@@ -22,13 +37,12 @@ def clock_in(
 ):
     return PunchService.validate_and_save(
         employee_id=user["uid"],
-        dealership_id=user["dealerships"],
+        dealership_id=user["dealerships"], 
         punch_type=PunchType.CLOCK_IN,
         latitude=data.latitude,
         longitude=data.longitude,
         session=session,
     )
-
 
 # Clock Out Endpoint
 @router.post("/clock-out")
@@ -39,15 +53,14 @@ def clock_out(
 ):
     return PunchService.validate_and_save(
         employee_id=user["uid"],
-        dealership_id=user["dealerships"],
+        dealership_id=user["dealerships"], 
         punch_type=PunchType.CLOCK_OUT,
         latitude=data.latitude,
         longitude=data.longitude,
         session=session,
     )
 
-
-# Get Today’s Punches
+# Get Today's Punches
 @router.get("/today")
 def get_todays_logs(
     session: Session = Depends(get_session),
@@ -64,7 +77,6 @@ def get_todays_logs(
     ).all()
     return {"status": "success", "data": punches}
 
-
 # Get All Punches
 @router.get("/logs")
 def get_all_logs(
@@ -77,7 +89,6 @@ def get_all_logs(
         .order_by(TimeLog.timestamp.desc())
     ).all()
     return {"status": "success", "data": punches}
-
 
 # Get Last Punch
 @router.get("/last-punch")
@@ -95,3 +106,96 @@ def get_last_punch(
         return {"status": "success", "data": None, "message": "No punches found."}
 
     return {"status": "success", "data": last_punch}
+
+@router.post("/request-clock-edit", response_model=ClockRequestLog)
+def request_clock_edit(
+    payload: ClockEditRequestPayload,
+    session: Session = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    # Validate original clock-in punch
+    original_clock_in = session.get(TimeLog, payload.original_clock_in_timelog_id)
+    if not original_clock_in:
+        raise HTTPException(status_code=404, detail=f"Original clock-in punch with ID {payload.original_clock_in_timelog_id} not found.")
+    if original_clock_in.employee_id != current_user["uid"]:
+        raise HTTPException(status_code=403, detail=f"You do not have permission to edit clock-in punch ID {payload.original_clock_in_timelog_id}.")
+    if original_clock_in.punch_type != PunchType.CLOCK_IN:
+        raise HTTPException(status_code=400, detail=f"Punch ID {payload.original_clock_in_timelog_id} is not a clock-in punch.")
+
+    # Validate original clock-out punch
+    original_clock_out = session.get(TimeLog, payload.original_clock_out_timelog_id)
+    if not original_clock_out:
+        raise HTTPException(status_code=404, detail=f"Original clock-out punch with ID {payload.original_clock_out_timelog_id} not found.")
+    if original_clock_out.employee_id != current_user["uid"]:
+        raise HTTPException(status_code=403, detail=f"You do not have permission to edit clock-out punch ID {payload.original_clock_out_timelog_id}.")
+    if original_clock_out.punch_type != PunchType.CLOCK_OUT:
+        raise HTTPException(status_code=400, detail=f"Punch ID {payload.original_clock_out_timelog_id} is not a clock-out punch.")
+    
+    # Optional: Add check to ensure clock_out is after clock_in and they form a reasonable pair
+    if original_clock_out.timestamp <= original_clock_in.timestamp:
+        raise HTTPException(status_code=400, detail="Original clock-out time must be after original clock-in time.")
+    # Optional: Check if dealership_id matches for both original punches, if relevant
+    # if original_clock_in.dealership_id != original_clock_out.dealership_id:
+    #     raise HTTPException(status_code=400, detail="Original punches are from different dealerships.")
+
+    new_request = ClockRequestLog(
+        employee_id=current_user["uid"],
+        request_type=RequestTypeEnum.EDIT,
+        original_clock_in_timelog_id=payload.original_clock_in_timelog_id,
+        original_clock_out_timelog_id=payload.original_clock_out_timelog_id,
+        day_of_punch=payload.day_of_punch,
+        requested_start_time_str=payload.requested_start_time_str,
+        requested_end_time_str=payload.requested_end_time_str,
+        dealership_id=payload.dealership_id,
+        reason=payload.reason,
+        status=RequestStatusEnum.PENDING,
+        requested_at=datetime.now(timezone.utc)
+    )
+
+    session.add(new_request)
+    session.commit()
+    session.refresh(new_request)
+
+    return new_request
+
+@router.post("/request-clock-creation", response_model=ClockRequestLog)
+def request_clock_creation(
+    payload: ClockCreateRequestPayload,
+    session: Session = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    new_request = ClockRequestLog(
+        employee_id=current_user["uid"],
+        request_type=RequestTypeEnum.CREATION,
+        day_of_punch=payload.day_of_punch,
+        requested_start_time_str=payload.requested_start_time_str,
+        requested_end_time_str=payload.requested_end_time_str,
+        dealership_id=payload.dealership_id,
+        reason=payload.reason,
+        status=RequestStatusEnum.PENDING,
+        requested_at=datetime.now(timezone.utc)
+    )
+
+    session.add(new_request)
+    session.commit()
+    session.refresh(new_request)
+
+    return new_request
+
+@router.get("/my-clock-requests", response_model=List[ClockRequestLog])
+def get_my_clock_requests(
+    session: Session = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+    limit: int = 10 # Default limit to 5, can be overridden by query parameter e.g. /my-clock-requests?limit=10
+):
+    """
+    Retrieves the most recent clock edit or creation requests made by the authenticated user.
+    """
+    requests = session.exec(
+        select(ClockRequestLog)
+        .where(ClockRequestLog.employee_id == current_user["uid"])
+        .order_by(ClockRequestLog.requested_at.desc()) # Get newest first
+        .limit(limit) # Limit the number of results
+    ).all()
+
+    return requests
