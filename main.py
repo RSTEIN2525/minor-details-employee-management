@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import SQLModel
 import models.time_log  
 import models.shop       
+import models.clock_request_log # Ensure this model is known by SQLModel for table creation
 from db.session import engine
 from contextlib import asynccontextmanager
 from api.time_routes import router as time_router
@@ -12,6 +13,7 @@ from api.admin_user_routes import router as admin_user_router
 from api.admin_shop_routes import router as admin_shop_router
 from api.admin_dealership_routes import router as admin_dealership_router
 from api.user_dashboard_routes import router as user_dashboard_router
+from api.admin_clock_request_routes import router as admin_clock_request_router
 
 # This file is the control center of the whole application
 
@@ -43,8 +45,9 @@ app.add_middleware(
 # Connects Routes From Time_Routes (clock-in / out) to main app
 app.include_router(time_router, prefix="/time", tags=["Time Tracking"])
 app.include_router(device_router,prefix="/device", tags=["Device Identification"])
-app.include_router(admin_device_router, prefix="/admin/device-requests", tags=["Admin" "Device Identification"])
+app.include_router(admin_device_router, prefix="/admin/device-requests", tags=["Admin", "Device Identification"])
 app.include_router(admin_user_router, prefix="/admin/user-requests", tags = ["Admin", "User Management"])
 app.include_router(admin_shop_router, prefix="/admin/shop-requests", tags = ["Admin", "Shop Management"])
 app.include_router(admin_dealership_router,prefix="/admin/dealership-requests", tags=["Admin", "Dealerships"] )
 app.include_router(user_dashboard_router, prefix = "/user-dashboard-requests", tags=["User", "Finances"])
+app.include_router(admin_clock_request_router, prefix="/admin/clock-requests", tags=["Admin", "Clock Requests"])
