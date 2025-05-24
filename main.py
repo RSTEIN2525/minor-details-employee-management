@@ -14,6 +14,7 @@ from api.admin_shop_routes import router as admin_shop_router
 from api.admin_dealership_routes import router as admin_dealership_router
 from api.user_dashboard_routes import router as user_dashboard_router
 from api.admin_clock_request_routes import router as admin_clock_request_router
+from api.admin_analytics_routes import router as admin_analytics_router
 
 # This file is the control center of the whole application
 
@@ -51,3 +52,4 @@ app.include_router(admin_shop_router, prefix="/admin/shop-requests", tags = ["Ad
 app.include_router(admin_dealership_router,prefix="/admin/dealership-requests", tags=["Admin", "Dealerships"] )
 app.include_router(user_dashboard_router, prefix = "/user-dashboard-requests", tags=["User", "Finances"])
 app.include_router(admin_clock_request_router, prefix="/admin/clock-requests", tags=["Admin", "Clock Requests"])
+app.include_router(admin_analytics_router, prefix="/admin/analytics", tags=["Admin", "Labor Analytics"])
