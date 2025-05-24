@@ -1,7 +1,7 @@
 from sqlmodel import SQLModel, Field
 from typing import Optional
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel
 
 # Defines the Structure of Data for a Clock in Call
@@ -19,7 +19,7 @@ class TimeLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     employee_id: str
     dealership_id: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     punch_type: PunchType
     latitude: Optional[float] = None
     longitude: Optional[float] = None
