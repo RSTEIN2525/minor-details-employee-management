@@ -18,6 +18,8 @@ class DeviceRequestHistory(BaseModel):
     userEmail: str | None
     userName: str | None
     deviceId: str
+    phoneNumber: str | None  # Phone number extracted from device ID
+    idPhotoUrl: str | None  # URL to uploaded ID photo
     status: str
     requestedAt: datetime | str | None
     processedAt: datetime | str | None
@@ -460,6 +462,8 @@ async def get_latest_device_request_info(  # Renamed for clarity
             userEmail=data.get("userEmail"),
             userName=data.get("userName"),
             deviceId=data.get("deviceId", device_id),  # Should match input
+            phoneNumber=data.get("phoneNumber"),
+            idPhotoUrl=data.get("idPhotoUrl"),
             status=data.get("status", "unknown"),
             requestedAt=requested_at_str,
             processedAt=processed_at_str,
