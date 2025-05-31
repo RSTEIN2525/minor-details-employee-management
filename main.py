@@ -5,6 +5,7 @@ import models.time_log
 import models.shop       
 import models.clock_request_log # Ensure this model is known by SQLModel for table creation
 import models.shift_change # New model for shift changes
+import models.device_photo # New model for device photos stored in database
 from db.session import engine
 from contextlib import asynccontextmanager
 from api.time_routes import router as time_router
@@ -47,9 +48,9 @@ app.add_middleware(
 )
 
 # Connects Routes From Time_Routes (clock-in / out) to main app
-app.include_router(time_router, prefix="/time", tags=["Time Tracking"])
-app.include_router(device_router,prefix="/device", tags=["Device Identification"])
-app.include_router(admin_device_router, prefix="/admin/device-requests", tags=["Admin", "Device Identification"])
+app.include_router(time_router, prefix="/time", tags=["Time"])
+app.include_router(device_router, prefix="/device", tags=["Device"])
+app.include_router(admin_device_router, prefix="/admin/device-requests", tags=["Admin Device"])
 app.include_router(admin_user_router, prefix="/admin/user-requests", tags = ["Admin", "User Management"])
 app.include_router(admin_shop_router, prefix="/admin/shop-requests", tags = ["Admin", "Shop Management"])
 app.include_router(admin_dealership_router,prefix="/admin/dealership-requests", tags=["Admin", "Dealerships"] )

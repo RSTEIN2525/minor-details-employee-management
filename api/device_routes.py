@@ -5,7 +5,9 @@ from core.firebase import db
 from core.deps import get_current_user, get_current_user_basic_auth
 from datetime import datetime,timezone
 from google.cloud.firestore_v1.transforms import ArrayUnion
-from utils.storage import upload_id_photo, validate_device_id_format, extract_phone_from_device_id
+from google.cloud.firestore_v1.base_query import FieldFilter
+from utils.storage import validate_device_id_format, extract_phone_from_device_id
+from utils.database_storage import store_device_photo_in_db
 
 router = APIRouter()
 
@@ -57,52 +59,58 @@ async def register_device(
         )
 
     try:
+        print(f"🔄 DEVICE REGISTRATION: user_uid={user_uid}, device_id={device_id}")
 
         # Pull Collection W/ All Requests
         request_ref = db.collection("deviceRequests")
 
         # pull all exisiting requests
         existing_query = (
-            request_ref.where("userId", "==", user_uid)
-            .where("deviceId", "==", device_id)
-            .where("status", "==", "pending")
+            request_ref.where(filter=FieldFilter("userId", "==", user_uid))
+            .where(filter=FieldFilter("deviceId", "==", device_id))
+            .where(filter=FieldFilter("status", "==", "pending"))
             .limit(1)
         )
         
         # Execute query     
         users_existing_requests = list(existing_query.stream()) 
+        print(f"📋 Found {len(users_existing_requests)} existing pending requests for this device")
 
         # Inform User They Have a Pending Request Already For This Device
         if len(users_existing_requests) > 0:
-            raise HTTPException(
+            print(f"⚠️ EARLY RETURN: Existing pending request found - not uploading file")
+            return JSONResponse(
                 status_code=status.HTTP_202_ACCEPTED,
                 content={
                     "status": "pending",
                     "message": "Device registration request is already pending approval.",
-                },
+                }
             )
 
-        # Upload ID photo to Firebase Storage
+        print(f"✅ No existing requests found - proceeding with upload")
+        
+        # Store ID photo in database (more secure than Firebase Storage)
         try:
-            photo_url = await upload_id_photo(id_photo, user_uid, device_id)
+            photo_id = await store_device_photo_in_db(id_photo, user_uid, device_id)
+            print(f"✅ Photo stored in database with ID: {photo_id}")
         except HTTPException as upload_error:
             # Re-raise upload errors directly
             raise upload_error
         except Exception as e:
-            print(f"Unexpected error uploading ID photo: {e}")
+            print(f"Unexpected error storing ID photo in database: {e}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to upload ID photo. Please try again.",
+                detail="Failed to store ID photo. Please try again.",
             )
         
-        # Add to Firestore Collection with additional fields
+        # Add to Firestore Collection with photo_id instead of photo_url
         request_doc_ref, write_result = request_ref.add({
             "userId" : user_uid,
             "userEmail" : current_user.get("email"),
             "userName" : current_user.get("name"),
             "deviceId" : device_id,
             "phoneNumber" : phone_number,  # Extracted phone number
-            "idPhotoUrl" : photo_url,  # URL to uploaded ID photo
+            "photoId" : photo_id,  # Database photo ID (secure internal reference)
             "status" : "pending",
             "requestedAt" : datetime.now(timezone.utc)
         })
