@@ -1,12 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from typing import Annotated
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from core.firebase import db
 from google.cloud.firestore_v1.transforms import ArrayUnion, ArrayRemove
 from google.cloud.firestore_v1.base_query import FieldFilter
 from core.deps import require_admin_role, get_current_user_basic_auth
 from pydantic import BaseModel
 from typing import List
+from google.cloud import storage
+import os
+from utils.storage import generate_secure_photo_url
 
 router = APIRouter()
 
@@ -554,4 +557,28 @@ async def get_user_device_request_summary(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not retrieve device request summary for the user.",
+        )
+
+
+@router.get("/get-id-photo-url")
+async def get_id_photo_signed_url(
+    object_path: Annotated[str, Query(description="The GCS object path, e.g., 'employee_device_registration_identification/user_id/device_id_timestamp.jpg'")],
+    admin_user: Annotated[dict, Depends(require_admin_role)]
+):
+    """
+    Generates a signed URL for accessing an ID photo.
+    The object_path is the 'idPhotoUrl' stored in Firestore for a device request.
+    """
+    try:
+        # Use the utility function that handles multiple authentication methods
+        signed_url = await generate_secure_photo_url(object_path, expiration_minutes=15)
+        return {"signed_url": signed_url}
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        print(f"Error generating signed URL for {object_path}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not generate access URL for ID photo."
         )
