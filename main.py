@@ -19,6 +19,7 @@ from api.admin_clock_request_routes import router as admin_clock_request_router
 from api.admin_analytics_routes import router as admin_analytics_router
 from api.admin_shift_change_routes import router as admin_shift_change_router
 from api.user_shift_change_routes import router as user_shift_change_router
+from api.admin_time_routes import router as admin_time_router
 
 # This file is the control center of the whole application
 
@@ -59,3 +60,4 @@ app.include_router(admin_clock_request_router, prefix="/admin/clock-requests", t
 app.include_router(admin_analytics_router, prefix="/admin/analytics", tags=["Admin", "Labor Analytics"])
 app.include_router(admin_shift_change_router, prefix="/admin/shift-changes", tags=["Admin", "Shift Changes"])
 app.include_router(user_shift_change_router, prefix="/shift-changes", tags=["User", "Shift Changes"])
+app.include_router(admin_time_router, prefix="/admin/time", tags=["Admin", "Direct Time Management"])

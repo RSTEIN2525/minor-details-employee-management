@@ -392,4 +392,130 @@ async def get_upcoming_shift_changes(
             employee_viewed_at=shift_change.employee_viewed_at,
         ))
     
+    return response_list
+
+@router.get("/recent", response_model=List[ShiftChangeResponse])
+async def get_recent_shift_changes(
+    session: Session = Depends(get_session),
+    admin_user: dict = Depends(require_admin_role),
+    limit: int = 10,
+):
+    """
+    Get the most recent shift changes (default last 10).
+    """
+    
+    shift_changes = session.exec(
+        select(ShiftChange)
+        .order_by(ShiftChange.created_at.desc())
+        .limit(limit)
+    ).all()
+    
+    # Enrich with user names
+    response_list = []
+    for shift_change in shift_changes:
+        employee_name = await get_user_name(shift_change.employee_id)
+        owner_name = await get_user_name(shift_change.created_by_owner_id)
+        swap_employee_name = None
+        if shift_change.swap_with_employee_id:
+            swap_employee_name = await get_user_name(shift_change.swap_with_employee_id)
+        
+        response_list.append(ShiftChangeResponse(
+            id=shift_change.id,
+            employee_id=shift_change.employee_id,
+            employee_name=employee_name,
+            created_by_owner_id=shift_change.created_by_owner_id,
+            created_by_owner_name=owner_name,
+            change_type=shift_change.change_type,
+            effective_date=shift_change.effective_date,
+            reason=shift_change.reason,
+            notes=shift_change.notes,
+            original_start_time=shift_change.original_start_time,
+            original_end_time=shift_change.original_end_time,
+            original_dealership_id=shift_change.original_dealership_id,
+            new_start_time=shift_change.new_start_time,
+            new_end_time=shift_change.new_end_time,
+            new_dealership_id=shift_change.new_dealership_id,
+            swap_with_employee_id=shift_change.swap_with_employee_id,
+            swap_with_employee_name=swap_employee_name,
+            created_at=shift_change.created_at,
+            status=shift_change.status,
+            employee_notified=shift_change.employee_notified,
+            employee_viewed_at=shift_change.employee_viewed_at,
+        ))
+    
+    return response_list
+
+@router.get("/search/employee/{employee_id}", response_model=List[ShiftChangeResponse])
+async def search_shift_changes_by_employee(
+    employee_id: str,
+    session: Session = Depends(get_session),
+    admin_user: dict = Depends(require_admin_role),
+    limit: Optional[int] = None,
+    include_past: bool = True,
+    change_type: Optional[ShiftChangeType] = None,
+):
+    """
+    Search for all shift changes for a specific employee with optional filters.
+    
+    Args:
+        employee_id: The employee ID to search for
+        limit: Maximum number of results (no limit if None)
+        include_past: Whether to include past shift changes
+        change_type: Filter by specific change type
+    """
+    
+    # Start with base query
+    query = select(ShiftChange).where(ShiftChange.employee_id == employee_id)
+    
+    # Filter by change type if specified
+    if change_type:
+        query = query.where(ShiftChange.change_type == change_type)
+    
+    # Filter out past changes if requested
+    if not include_past:
+        today = date.today()
+        query = query.where(ShiftChange.effective_date >= today)
+    
+    # Order by most recent first
+    query = query.order_by(ShiftChange.created_at.desc())
+    
+    # Apply limit if specified
+    if limit:
+        query = query.limit(limit)
+    
+    shift_changes = session.exec(query).all()
+    
+    # Enrich with user names
+    response_list = []
+    for shift_change in shift_changes:
+        employee_name = await get_user_name(shift_change.employee_id)
+        owner_name = await get_user_name(shift_change.created_by_owner_id)
+        swap_employee_name = None
+        if shift_change.swap_with_employee_id:
+            swap_employee_name = await get_user_name(shift_change.swap_with_employee_id)
+        
+        response_list.append(ShiftChangeResponse(
+            id=shift_change.id,
+            employee_id=shift_change.employee_id,
+            employee_name=employee_name,
+            created_by_owner_id=shift_change.created_by_owner_id,
+            created_by_owner_name=owner_name,
+            change_type=shift_change.change_type,
+            effective_date=shift_change.effective_date,
+            reason=shift_change.reason,
+            notes=shift_change.notes,
+            original_start_time=shift_change.original_start_time,
+            original_end_time=shift_change.original_end_time,
+            original_dealership_id=shift_change.original_dealership_id,
+            new_start_time=shift_change.new_start_time,
+            new_end_time=shift_change.new_end_time,
+            new_dealership_id=shift_change.new_dealership_id,
+            swap_with_employee_id=shift_change.swap_with_employee_id,
+            swap_with_employee_name=swap_employee_name,
+            created_at=shift_change.created_at,
+            status=shift_change.status,
+            employee_notified=shift_change.employee_notified,
+            employee_viewed_at=shift_change.employee_viewed_at,
+        ))
+    
     return response_list 
