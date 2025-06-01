@@ -62,6 +62,35 @@ class UserOvertimeWageResponse(BaseModel):
     overtime_hourly_wage: Optional[float] = None
     message: str
 
+class UserBaseWageInfoResponse(BaseModel):
+    regular_hourly_rate: Optional[float] = None
+    overtime_multiplier: float = 1.5
+    overtime_threshold_hours: float = 40.0 # Weekly threshold
+    message: str
+
+# Pydantic models for the new daily breakdown endpoint
+class DailyHoursItem(BaseModel):
+    date: str # YYYY-MM-DD
+    total_hours: float
+    regular_hours: float
+    overtime_hours: float
+    estimated_earnings: float
+
+class WeeklyTotalItem(BaseModel):
+    week_start_date: str # YYYY-MM-DD
+    week_end_date: str # YYYY-MM-DD
+    total_hours: float
+    total_earnings: float
+
+class CumulativeTotals(BaseModel):
+    total_hours_past_N_weeks: float
+    total_earnings_past_N_weeks: float
+
+class DailyBreakdownResponse(BaseModel):
+    daily_hours: List[DailyHoursItem]
+    weekly_totals: List[WeeklyTotalItem]
+    cumulative_totals: Optional[CumulativeTotals] = None
+
 # --- Helper Functions ---
 
 async def get_user_wage_from_firestore(user_id: str) -> Optional[float]:
@@ -425,6 +454,258 @@ async def get_user_overtime_wage(
         message=message
     )
 
+@router.get("/wage/base_rate", response_model=UserBaseWageInfoResponse)
+async def get_user_base_wage_info(
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user["uid"]
+    regular_wage: Optional[float] = None
+    message: str
+    overtime_multiplier = 1.5  # Standard value
+    overtime_threshold_hours = 40.0  # Standard value
+
+    try:
+        user_ref = firestore_db.collection("users").document(user_id)
+        user_doc = user_ref.get()
+
+        if user_doc.exists:
+            user_data = user_doc.to_dict()
+            regular_wage = user_data.get("hourlyWage")
+
+            if regular_wage is not None and isinstance(regular_wage, (int, float)) and regular_wage > 0:
+                message = "User base wage information retrieved."
+            elif regular_wage is not None:
+                message = "Regular hourly wage is set to an invalid value."
+            else:
+                message = "Regular hourly wage not set for this user."
+        else:
+            message = "User profile not found."
+            # Consider raising HTTPException 404 here if preferred
+            # raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User profile not found.")
+            return UserBaseWageInfoResponse(message=message, regular_hourly_rate=None)
+
+
+    except Exception as e:
+        print(f"Error fetching base wage info for {user_id}: {e}")
+        message = f"An error occurred while retrieving user base wage information: {str(e)}"
+        # Optionally:
+        # raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=message)
+        return UserBaseWageInfoResponse(message=message, regular_hourly_rate=None)
+
+    return UserBaseWageInfoResponse(
+        regular_hourly_rate=regular_wage if isinstance(regular_wage, (int, float)) else None,
+        overtime_multiplier=overtime_multiplier,
+        overtime_threshold_hours=overtime_threshold_hours,
+        message=message
+    )
+
+@router.get("/work_hours/daily_breakdown", response_model=DailyBreakdownResponse)
+async def get_daily_work_hours_breakdown(
+    weeks: int,
+    session: Session = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user["uid"]
+    weekly_overtime_threshold_hours = 40.0 # For weekly overtime calculation
+
+    # Fetch user's wage info
+    regular_hourly_rate: Optional[float] = None
+    overtime_multiplier: float = 1.5 # Default
+    
+    try:
+        user_ref = firestore_db.collection("users").document(user_id)
+        user_doc = user_ref.get()
+        if user_doc.exists:
+            user_data = user_doc.to_dict()
+            regular_hourly_rate = user_data.get("hourlyWage")
+            # Potentially fetch overtime_multiplier and weekly_overtime_threshold_hours if stored per user
+            # For now, using defaults set above.
+            if not (regular_hourly_rate and isinstance(regular_hourly_rate, (int, float)) and regular_hourly_rate > 0):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User hourly wage not set or invalid.")
+        else:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User profile not found.")
+    except Exception as e:
+        # Log error
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Could not retrieve user wage information: {str(e)}")
+
+    overtime_rate = regular_hourly_rate * overtime_multiplier
+
+    # Determine date range
+    now_utc = datetime.now(timezone.utc)
+    # Go back to the start of the week for 'weeks-1' ago, then include the current partial week.
+    # Example: if weeks=1, we want current week's data up to today.
+    # if weeks=3, we want last 2 full weeks + current partial week.
+    # So, start_date is (weeks-1) weeks before the start of the current week.
+    
+    # Start of the current week (Monday)
+    start_of_current_week = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now_utc.weekday())
+    
+    # Calculate the very first day to fetch punches from
+    # If weeks = 1, start_date_for_query is start_of_current_week
+    # If weeks = N, start_date_for_query is (N-1) weeks before start_of_current_week
+    start_date_for_query = start_of_current_week - timedelta(weeks=weeks -1)
+    
+    # Fetch all punches in the date range
+    punches = session.exec(
+        select(TimeLog)
+        .where(TimeLog.employee_id == user_id)
+        .where(TimeLog.timestamp >= start_date_for_query)
+        .where(TimeLog.timestamp <= now_utc) # Up to current moment
+        .order_by(TimeLog.timestamp.asc())
+    ).all()
+
+    # Process punches into daily summaries
+    daily_data_map = {} # Key: "YYYY-MM-DD", Value: total_seconds_worked
+
+    last_clock_in_time: Optional[datetime] = None
+    for punch in punches:
+        punch_time_utc = punch.timestamp.replace(tzinfo=timezone.utc) if punch.timestamp.tzinfo is None else punch.timestamp
+
+        if punch.punch_type == PunchType.CLOCK_IN:
+            last_clock_in_time = punch_time_utc
+        elif punch.punch_type == PunchType.CLOCK_OUT and last_clock_in_time:
+            if punch_time_utc > last_clock_in_time: # Ensure clock out is after clock in
+                
+                # Distribute hours across days if a shift spans midnight
+                current_process_time = last_clock_in_time
+                while current_process_time < punch_time_utc:
+                    day_str = current_process_time.strftime("%Y-%m-%d")
+                    
+                    # End of the current day for current_process_time
+                    end_of_day_for_current_process_time = (current_process_time + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                    
+                    # Segment end is either the actual punch_out_time or the end of the current_process_time's day
+                    segment_end_time = min(punch_time_utc, end_of_day_for_current_process_time)
+                    
+                    duration_seconds_on_day = (segment_end_time - current_process_time).total_seconds()
+                    
+                    if day_str not in daily_data_map:
+                        daily_data_map[day_str] = 0.0
+                    daily_data_map[day_str] += duration_seconds_on_day
+                    
+                    current_process_time = segment_end_time # Move to the start of the next segment/day
+
+            last_clock_in_time = None # Reset for next pair
+
+    # Handle currently active shift (if any)
+    if last_clock_in_time and last_clock_in_time < now_utc : # It's an open shift
+        current_process_time = last_clock_in_time
+        while current_process_time < now_utc:
+            day_str = current_process_time.strftime("%Y-%m-%d")
+            end_of_day_for_current_process_time = (current_process_time + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            segment_end_time = min(now_utc, end_of_day_for_current_process_time)
+            duration_seconds_on_day = (segment_end_time - current_process_time).total_seconds()
+            if day_str not in daily_data_map:
+                daily_data_map[day_str] = 0.0
+            daily_data_map[day_str] += duration_seconds_on_day
+            current_process_time = segment_end_time
+
+
+    # Create DailyHoursItem list
+    daily_hours_list: List[DailyHoursItem] = []
+    
+    # Ensure all days in the range are present, even if no hours worked
+    # Iterate from start_date_for_query up to today
+    current_day_iterator = start_date_for_query
+    while current_day_iterator.date() <= now_utc.date():
+        day_str_iter = current_day_iterator.strftime("%Y-%m-%d")
+        if day_str_iter not in daily_data_map:
+            daily_data_map[day_str_iter] = 0.0 # Add day with 0 hours if not present
+        current_day_iterator += timedelta(days=1)
+    
+    all_dates_sorted = sorted(daily_data_map.keys())
+
+    # Process each day with sophisticated weekly overtime calculation
+    for date_str in all_dates_sorted:
+        current_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        total_seconds = daily_data_map.get(date_str, 0.0)
+        total_hours_day = round(total_seconds / 3600, 2)
+
+        # Find the start of the week for this day (Monday)
+        days_since_monday = current_date.weekday()
+        week_start_date = current_date - timedelta(days=days_since_monday)
+        
+        # Calculate hours worked earlier in this week (before current day)
+        hours_worked_earlier_this_week = 0.0
+        for i in range(days_since_monday):
+            earlier_date = week_start_date + timedelta(days=i)
+            earlier_date_str = earlier_date.strftime("%Y-%m-%d")
+            if earlier_date_str in daily_data_map:
+                hours_worked_earlier_this_week += daily_data_map[earlier_date_str] / 3600
+        
+        # Calculate how many of today's hours are regular vs overtime
+        hours_remaining_before_overtime = max(0, weekly_overtime_threshold_hours - hours_worked_earlier_this_week)
+        
+        if hours_remaining_before_overtime >= total_hours_day:
+            # All of today's hours are regular
+            daily_reg_hours = total_hours_day
+            daily_ot_hours = 0.0
+        else:
+            # Some or all of today's hours are overtime
+            daily_reg_hours = hours_remaining_before_overtime
+            daily_ot_hours = total_hours_day - hours_remaining_before_overtime
+        
+        # Round for consistency
+        daily_reg_hours = round(daily_reg_hours, 2)
+        daily_ot_hours = round(daily_ot_hours, 2)
+
+        # Calculate accurate daily earnings
+        daily_earnings = (daily_reg_hours * regular_hourly_rate) + (daily_ot_hours * overtime_rate)
+        
+        daily_hours_list.append(DailyHoursItem(
+            date=date_str,
+            total_hours=total_hours_day,
+            regular_hours=daily_reg_hours,
+            overtime_hours=daily_ot_hours,
+            estimated_earnings=round(daily_earnings, 2)
+        ))
+
+    # Calculate Weekly Totals
+    weekly_totals_list: List[WeeklyTotalItem] = []
+    
+    # Group daily hours by week
+    weeks_map = {}  # Key: week_start_date_str, Value: list of daily items for that week
+    
+    for daily_item in daily_hours_list:
+        daily_date = datetime.strptime(daily_item.date, "%Y-%m-%d").date()
+        week_start = daily_date - timedelta(days=daily_date.weekday())
+        week_start_str = week_start.strftime("%Y-%m-%d")
+        
+        if week_start_str not in weeks_map:
+            weeks_map[week_start_str] = []
+        weeks_map[week_start_str].append(daily_item)
+    
+    # Calculate totals for each week
+    for week_start_str in sorted(weeks_map.keys()):
+        week_days = weeks_map[week_start_str]
+        week_start_date = datetime.strptime(week_start_str, "%Y-%m-%d").date()
+        week_end_date = min(week_start_date + timedelta(days=6), now_utc.date())
+        
+        total_hours_week = sum(day.total_hours for day in week_days)
+        total_earnings_week = sum(day.estimated_earnings for day in week_days)
+        
+        weekly_totals_list.append(WeeklyTotalItem(
+            week_start_date=week_start_str,
+            week_end_date=week_end_date.strftime("%Y-%m-%d"),
+            total_hours=round(total_hours_week, 2),
+            total_earnings=round(total_earnings_week, 2)
+        ))
+
+    # Cumulative Totals
+    cumulative_total_hours = sum(item.total_hours for item in daily_hours_list)
+    cumulative_total_earnings = sum(item.estimated_earnings for item in daily_hours_list)
+
+    cumulative_totals_obj = CumulativeTotals(
+        total_hours_past_N_weeks=round(cumulative_total_hours, 2),
+        total_earnings_past_N_weeks=round(cumulative_total_earnings, 2)
+    )
+
+    return DailyBreakdownResponse(
+        daily_hours=daily_hours_list,
+        weekly_totals=weekly_totals_list,
+        cumulative_totals=cumulative_totals_obj
+    )
+
 @router.get("/punch_history/past_three_weeks", response_model=PastPunchesResponse)
 async def get_punch_history_past_three_weeks(
     session: Session = Depends(get_session),
@@ -461,3 +742,77 @@ async def get_punch_history_past_three_weeks(
         punches=response_punches,
         message="Punch history for the past three weeks retrieved."
     )
+
+@router.get("/debug/user-info")
+async def debug_user_info(
+    session: Session = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Debug endpoint to help identify employee_id format issues.
+    Shows user's UID and recent TimeLog entries.
+    """
+    user_id = current_user["uid"]
+    
+    # Get all TimeLog entries for this user (last 10)
+    recent_punches = session.exec(
+        select(TimeLog)
+        .where(TimeLog.employee_id == user_id)
+        .order_by(TimeLog.timestamp.desc())
+        .limit(10)
+    ).all()
+    
+    # Get all TimeLog entries with admin_modifier_id set (last 10)
+    admin_created_punches = session.exec(
+        select(TimeLog)
+        .where(TimeLog.admin_modifier_id.is_not(None))
+        .order_by(TimeLog.timestamp.desc())
+        .limit(10)
+    ).all()
+    
+    return {
+        "user_firebase_uid": user_id,
+        "user_firebase_uid_length": len(user_id),
+        "recent_punches_for_this_user": [
+            {
+                "id": punch.id,
+                "employee_id": punch.employee_id,
+                "timestamp": punch.timestamp.isoformat(),
+                "punch_type": punch.punch_type,
+                "admin_created": punch.admin_modifier_id is not None,
+                "admin_notes": punch.admin_notes
+            }
+            for punch in recent_punches
+        ],
+        "recent_admin_created_punches_all_users": [
+            {
+                "id": punch.id,
+                "employee_id": punch.employee_id,
+                "employee_id_length": len(punch.employee_id),
+                "timestamp": punch.timestamp.isoformat(),
+                "punch_type": punch.punch_type,
+                "admin_modifier_id": punch.admin_modifier_id,
+                "admin_notes": punch.admin_notes
+            }
+            for punch in admin_created_punches
+        ]
+    }
+
+@router.get("/debug/system-time")
+async def debug_system_time():
+    """
+    Debug endpoint to check system time and timezone settings.
+    """
+    now_utc = datetime.now(timezone.utc)
+    now_local = datetime.now()
+    
+    return {
+        "system_time_utc": now_utc.isoformat(),
+        "system_time_local": now_local.isoformat(),
+        "current_date_utc": now_utc.date().isoformat(),
+        "current_date_local": now_local.date().isoformat(),
+        "timezone_info": {
+            "utc_offset_hours": (now_local - now_utc).total_seconds() / 3600,
+            "local_timezone": str(now_local.tzinfo) if now_local.tzinfo else "None (naive)"
+        }
+    }
