@@ -20,12 +20,30 @@ from api.admin_clock_request_routes import router as admin_clock_request_router
 from api.admin_analytics_routes import router as admin_analytics_router
 from api.admin_time_routes import router as admin_time_router
 import logging # Add this import
+import os
+from dotenv import load_dotenv
 
 # Configure logging
 logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING) # Add this line
 
 # This file is the control center of the whole application
 
+# Load environment variables from .env file, if it exists
+load_dotenv()
+
+# Default values can be provided if the env var is not set
+DEV_DOMAIN = os.getenv("DEV_DOMAIN", "http://localhost:5173")
+PRODUCTION_DOMAIN = os.getenv("PRODUCTION_DOMAIN")
+
+# Construct the list of allowed origins, filtering out None if PRODUCTION_DOMAIN isn't set
+allowed_origins_list = [DEV_DOMAIN]
+if PRODUCTION_DOMAIN:
+    allowed_origins_list.append(PRODUCTION_DOMAIN)
+else:
+    # Optional: Log a warning if PRODUCTION_DOMAIN is not set, especially in a production context
+    # This print might be noisy for local dev if PRODUCTION_DOMAIN is often unset.
+    # Consider a more sophisticated logging approach for actual production warnings.
+    print("Warning: PRODUCTION_DOMAIN environment variable is not set.")
 
 # When We Start, Create the DB Tables if they don't exist
 @asynccontextmanager
@@ -43,10 +61,7 @@ app = FastAPI(lifespan=lifespan)
 # Allow requests from your React dev server & production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",  # React dev
-        "https://minorautodetails.app",  # Production domain
-    ],
+    allow_origins=allowed_origins_list, # Use the constructed list
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

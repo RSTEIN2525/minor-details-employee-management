@@ -36,3 +36,9 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.temp
+
+# Secrets
+.env
+
+# Deployment Instructions (Contains Secrets)
+README.md
