@@ -19,8 +19,8 @@ class ClockRequestLog(SQLModel, table=True):
     employee_id: str = Field(index=True)
     request_type: RequestTypeEnum
     
-    original_clock_in_timelog_id: Optional[int] = Field(default=None, foreign_key="timelog.id", nullable=True)
-    original_clock_out_timelog_id: Optional[int] = Field(default=None, foreign_key="timelog.id", nullable=True)
+    original_clock_in_timelog_id: Optional[int] = Field(default=None, foreign_key="time_log.id", nullable=True)
+    original_clock_out_timelog_id: Optional[int] = Field(default=None, foreign_key="time_log.id", nullable=True)
 
     day_of_punch: date 
 

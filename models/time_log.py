@@ -47,3 +47,5 @@ class TimeLog(SQLModel, table=True):
     punch_type: PunchType
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    admin_notes: Optional[str] = Field(default=None)
+    admin_modifier_id: Optional[str] = Field(default=None)
