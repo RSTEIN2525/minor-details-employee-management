@@ -33,17 +33,20 @@ load_dotenv()
 
 # Default values can be provided if the env var is not set
 DEV_DOMAIN = os.getenv("DEV_DOMAIN", "http://localhost:5173")
-PRODUCTION_DOMAIN = os.getenv("PRODUCTION_DOMAIN")
+PRODUCTION_DOMAIN = os.getenv("PRODUCTION_DOMAIN", "https://minorautodetails.app")
 
-# Construct the list of allowed origins, filtering out None if PRODUCTION_DOMAIN isn't set
-allowed_origins_list = [DEV_DOMAIN]
-if PRODUCTION_DOMAIN:
-    allowed_origins_list.append(PRODUCTION_DOMAIN)
-else:
-    # Optional: Log a warning if PRODUCTION_DOMAIN is not set, especially in a production context
-    # This print might be noisy for local dev if PRODUCTION_DOMAIN is often unset.
-    # Consider a more sophisticated logging approach for actual production warnings.
-    print("Warning: PRODUCTION_DOMAIN environment variable is not set.")
+# Construct the list of allowed origins, always including both dev and production
+allowed_origins_list = [
+    DEV_DOMAIN,
+    PRODUCTION_DOMAIN,
+    "http://localhost:3000",  # Additional fallback for React dev
+    "http://127.0.0.1:5173",  # Additional fallback for Vite dev
+]
+
+# Remove any None values and duplicates
+allowed_origins_list = list(set([origin for origin in allowed_origins_list if origin]))
+
+print(f"🌐 CORS: Allowing origins: {allowed_origins_list}")
 
 # When We Start, Create the DB Tables if they don't exist
 @asynccontextmanager
