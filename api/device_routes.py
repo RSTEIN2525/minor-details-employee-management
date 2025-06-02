@@ -134,3 +134,110 @@ async def register_device(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not register device.",
         )
+
+@router.get("/debug/my-devices")
+async def debug_my_devices(
+    current_user: Annotated[dict, Depends(get_current_user_basic_auth)],
+):
+    """
+    Debug endpoint to show what devices are registered for the current user.
+    This helps troubleshoot device validation issues.
+    """
+    try:
+        user_uid = current_user.get("uid")
+        
+        # Fetch user profile from Firestore
+        doc_ref = db.collection("users").document(user_uid)
+        snapshot = doc_ref.get()
+        
+        if not snapshot.exists:
+            return {
+                "status": "error",
+                "message": "User profile not found in Firestore",
+                "user_id": user_uid
+            }
+        
+        profile = snapshot.to_dict()
+        devices = profile.get("devices", [])
+        
+        return {
+            "status": "success",
+            "user_id": user_uid,
+            "user_email": current_user.get("email"),
+            "registered_devices": devices,
+            "device_count": len(devices),
+            "message": f"Found {len(devices)} registered device(s)"
+        }
+        
+    except Exception as e:
+        print(f"Error in debug endpoint for user {current_user.get('uid')}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not retrieve device information."
+        )
+
+@router.post("/debug/test-device-validation")
+async def debug_test_device_validation(
+    current_user: Annotated[dict, Depends(get_current_user_basic_auth)],
+    x_device_id: Annotated[str | None, Header(alias="X-Device-Id")] = None,
+):
+    """
+    Debug endpoint to test device validation logic without triggering the full clock-in process.
+    Send the X-Device-Id header to test if it validates against registered devices.
+    """
+    try:
+        user_uid = current_user.get("uid")
+        
+        # Fetch user profile from Firestore
+        doc_ref = db.collection("users").document(user_uid)
+        snapshot = doc_ref.get()
+        
+        if not snapshot.exists:
+            return {
+                "status": "error",
+                "message": "User profile not found in Firestore",
+                "user_id": user_uid
+            }
+        
+        profile = snapshot.to_dict()
+        registered_devices = profile.get("devices", [])
+        
+        result = {
+            "status": "success",
+            "user_id": user_uid,
+            "user_email": current_user.get("email"),
+            "sent_device_id": x_device_id,
+            "registered_devices": registered_devices,
+            "device_count": len(registered_devices)
+        }
+        
+        if not x_device_id:
+            result["validation_result"] = "NO_DEVICE_ID_HEADER"
+            result["message"] = "No X-Device-Id header provided"
+        elif x_device_id in registered_devices:
+            result["validation_result"] = "VALID"
+            result["message"] = "Device ID found in registered devices"
+        else:
+            result["validation_result"] = "INVALID"
+            result["message"] = "Device ID not found in registered devices"
+            
+            # Check for case mismatches
+            case_matches = [d for d in registered_devices if d.lower() == x_device_id.lower()]
+            if case_matches:
+                result["case_mismatch"] = case_matches
+                result["message"] += " (but found case mismatch)"
+            
+            # Check for partial matches
+            partial_matches = [d for d in registered_devices if x_device_id in d or d in x_device_id]
+            if partial_matches:
+                result["partial_matches"] = partial_matches
+                result["message"] += " (but found partial matches)"
+        
+        return result
+        
+    except Exception as e:
+        print(f"Error in device validation test for user {current_user.get('uid')}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not test device validation."
+        )

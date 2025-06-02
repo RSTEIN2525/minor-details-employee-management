@@ -66,9 +66,13 @@ async def get_current_user(
 
     # Trusted Device Check
     if x_device_id:
+        print(f"🔍 DEVICE VALIDATION DEBUG for user {uid}:")
+        print(f"📱 Client sent device ID: '{x_device_id}'")
 
         # Initialize User's Trusted Devices
         trusted_devices = profile.get("devices", [])
+        print(f"💾 User's registered devices: {trusted_devices}")
+        print(f"📊 Number of registered devices: {len(trusted_devices)}")
 
         # Ensure Formatting Of List Is Correct
         if not isinstance(trusted_devices, list):
@@ -81,7 +85,24 @@ async def get_current_user(
 
         # The device ID sent by the client is not in the user's trusted list.
         if x_device_id not in trusted_devices:
+            print(f"❌ DEVICE NOT FOUND: '{x_device_id}' not in {trusted_devices}")
+            print(f"🔧 Exact string comparison failed")
+            
+            # Debug: Check for any similar device IDs (case insensitive)
+            similar_devices = [d for d in trusted_devices if d.lower() == x_device_id.lower()]
+            if similar_devices:
+                print(f"⚠️ CASE MISMATCH: Found similar device with different case: {similar_devices}")
+            
+            # Debug: Check for partial matches
+            partial_matches = [d for d in trusted_devices if x_device_id in d or d in x_device_id]
+            if partial_matches:
+                print(f"⚠️ PARTIAL MATCH: Found partial matches: {partial_matches}")
+            
             raise DEVICE_TRUST_EXCEPTION
+        else:
+            print(f"✅ DEVICE VALIDATED: '{x_device_id}' found in registered devices")
+    else:
+        print(f"⚠️ NO DEVICE ID: X-Device-Id header not provided by client for user {uid}")
 
     # 4) Extract their shops list
     raw = profile.get("dealerships", "")  # Firestore field name
