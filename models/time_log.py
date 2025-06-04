@@ -8,6 +8,9 @@ from pydantic import BaseModel
 class PunchRequest(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
+    # New fields for injury reporting on clockout
+    injured_at_work: bool | None = None
+    safety_signature: str | None = None
     
 # Enum Limiting Punch Type to Just Two Vals
 class PunchType(str, Enum):
@@ -38,6 +41,9 @@ class TimeLog(SQLModel, table=True):
         
         # Index for punch type filtering
         Index("ix_time_log_punch_type", "punch_type"),
+        
+        # Index for injury tracking queries
+        Index("ix_time_log_injured_at_work", "injured_at_work"),
     )
     
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -49,3 +55,6 @@ class TimeLog(SQLModel, table=True):
     longitude: Optional[float] = None
     admin_notes: Optional[str] = Field(default=None)
     admin_modifier_id: Optional[str] = Field(default=None)
+    # New fields for injury reporting
+    injured_at_work: Optional[bool] = Field(default=None)
+    safety_signature: Optional[str] = Field(default=None, max_length=10)  # Limiting to 10 chars for initials

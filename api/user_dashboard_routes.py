@@ -44,6 +44,9 @@ class PunchLogResponse(BaseModel):
     punch_type: PunchType
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # New injury reporting fields (only present on clockout entries)
+    injured_at_work: Optional[bool] = None
+    safety_signature: Optional[str] = None
 
 class PastPunchesResponse(BaseModel):
     punches: List[PunchLogResponse]

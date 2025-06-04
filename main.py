@@ -19,6 +19,7 @@ from api.user_dashboard_routes import router as user_dashboard_router
 from api.admin_clock_request_routes import router as admin_clock_request_router
 from api.admin_analytics_routes import router as admin_analytics_router
 from api.admin_time_routes import router as admin_time_router
+from api.admin_injury_routes import router as admin_injury_router
 import logging # Add this import
 import os
 from dotenv import load_dotenv
@@ -81,3 +82,4 @@ app.include_router(user_dashboard_router, prefix = "/user-dashboard-requests", t
 app.include_router(admin_clock_request_router, prefix="/admin/clock-requests", tags=["Admin", "Clock Requests"])
 app.include_router(admin_analytics_router, prefix="/admin/analytics", tags=["Admin", "Labor Analytics"])
 app.include_router(admin_time_router, prefix="/admin/time", tags=["Admin", "Direct Time Management"])
+app.include_router(admin_injury_router, prefix="/admin/injury", tags=["Admin", "Injury Reports"])

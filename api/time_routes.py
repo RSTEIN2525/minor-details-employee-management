@@ -58,6 +58,8 @@ def clock_out(
         latitude=data.latitude,
         longitude=data.longitude,
         session=session,
+        injured_at_work=data.injured_at_work,
+        safety_signature=data.safety_signature,
     )
 
 # Get Today's Punches

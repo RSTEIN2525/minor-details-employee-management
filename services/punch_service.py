@@ -5,6 +5,7 @@ from utils.geofence import is_within_radius
 from models.shop import Shop
 from pydantic import TypeAdapter
 from fastapi import HTTPException, status
+from typing import Optional
 
 
 class PunchService:
@@ -17,6 +18,8 @@ class PunchService:
         latitude: float,
         longitude: float,
         session: Session,
+        injured_at_work: Optional[bool] = None,
+        safety_signature: Optional[str] = None,
     ):
 
         # 0) Must supply location
@@ -25,6 +28,24 @@ class PunchService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Location required to punch.",
             )
+
+        # Validate injury reporting fields for clockout
+        if punch_type == PunchType.CLOCK_OUT:
+            if injured_at_work is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Injury status is required for clock out.",
+                )
+            if safety_signature is None or safety_signature.strip() == "":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Safety signature (initials) is required for clock out.",
+                )
+            if len(safety_signature.strip()) > 10:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Safety signature must be 10 characters or less.",
+                )
 
         # 1) Check each shop the user belongs to
         valid_shop = None
@@ -84,6 +105,8 @@ class PunchService:
             latitude=latitude,
             longitude=longitude,
             timestamp=datetime.now(timezone.utc),
+            injured_at_work=injured_at_work if punch_type == PunchType.CLOCK_OUT else None,
+            safety_signature=safety_signature.strip() if punch_type == PunchType.CLOCK_OUT and safety_signature else None,
         )
 
         # Append New Punch to List of Changes
