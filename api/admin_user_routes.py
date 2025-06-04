@@ -16,14 +16,17 @@ class UserInfo(BaseModel):
     id: str
     displayName: str | None
 
+
 # Models For Wage Management
 class UserWageUpdate(BaseModel):
     hourlyWage: float = PydanticField(
         ..., ge=0, description="The employee's hourly wage rate."
     )
 
+
 class UserWageRead(BaseModel):
     hourlyWage: Optional[float] = None
+
 
 # Model for listing multiple users with their wages
 class UserWageInfo(BaseModel):
@@ -38,6 +41,17 @@ async def list_all_users_for_admin(
 ):
 
     try:
+
+        # Available Roles
+        valid_roles = [
+            "employee",
+            "clockOnlyEmployee",
+            "minorDetailsManager",
+            "minorDetailsSupervisor",
+            "serviceWash",
+            "photos",
+            "lotPrep",
+        ]
 
         # Reference To User Collection
         users_ref = db.collection("users")
@@ -55,7 +69,7 @@ async def list_all_users_for_admin(
             user_data = doc.to_dict()
 
             # Don't Include Users Who Aren't Employees
-            if user_data.get("role") != "employee":
+            if user_data.get("role") not in valid_roles:
                 continue
 
             # Extract required fields
@@ -128,7 +142,7 @@ async def list_all_user_wages_for_admin(
         for doc in users_stream:
             user_data = doc.to_dict()
             if not user_data:
-                continue # Should not happen if doc.exists is true, but good practice
+                continue  # Should not happen if doc.exists is true, but good practice
 
             # Only include employees
             if user_data.get("role") != "employee":
@@ -137,15 +151,19 @@ async def list_all_user_wages_for_admin(
             # Extract wage, ensure it's a float if present, or None
             current_wage = user_data.get("hourlyWage")
             if current_wage is not None and not isinstance(current_wage, (int, float)):
-                print(f"Warning: User {doc.id} has non-numeric wage value: {current_wage}. Treating as not set.")
-                current_wage = None # Treat invalid data as None
+                print(
+                    f"Warning: User {doc.id} has non-numeric wage value: {current_wage}. Treating as not set."
+                )
+                current_wage = None  # Treat invalid data as None
             elif isinstance(current_wage, int):
-                current_wage = float(current_wage) # Convert int to float for consistency
+                current_wage = float(
+                    current_wage
+                )  # Convert int to float for consistency
 
             user_wage_info = UserWageInfo(
                 id=doc.id,
                 displayName=user_data.get("displayName", "Missing Name"),
-                hourlyWage=current_wage
+                hourlyWage=current_wage,
             )
             user_wages_list.append(user_wage_info)
 
