@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
 from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from db.session import get_session #
 from core.deps import get_current_user #
 from core.firebase import db as firestore_db #
@@ -93,6 +93,35 @@ class DailyBreakdownResponse(BaseModel):
     daily_hours: List[DailyHoursItem]
     weekly_totals: List[WeeklyTotalItem]
     cumulative_totals: Optional[CumulativeTotals] = None
+
+# --- Pydantic models for the new SINGLE WEEKLY breakdown endpoint ---
+class SingleWeekDailySummary(BaseModel):
+    date: str # YYYY-MM-DD
+    day_name: str # e.g., Monday, Tuesday
+    total_hours: float
+    regular_hours: float
+    overtime_hours: float # Calculated against a weekly threshold
+    estimated_earnings: float
+
+class SingleWeeklyTotal(BaseModel):
+    week_start_date: str # YYYY-MM-DD
+    week_end_date: str # YYYY-MM-DD
+    total_hours: float
+    total_regular_hours: float
+    total_overtime_hours: float
+    total_estimated_earnings: float
+
+class WeeklyBreakdownResponse(BaseModel):
+    daily_summaries: List[SingleWeekDailySummary]
+    weekly_total: SingleWeeklyTotal
+    message: Optional[str] = None
+
+# --- Pydantic model for the new DAILY summary endpoint ---
+class DailySummaryResponse(BaseModel):
+    target_date: str # YYYY-MM-DD
+    total_hours_today: float
+    total_earnings_today: float
+    message: Optional[str] = None
 
 # --- Helper Functions ---
 
@@ -819,3 +848,218 @@ async def debug_system_time():
             "local_timezone": str(now_local.tzinfo) if now_local.tzinfo else "None (naive)"
         }
     }
+
+@router.get("/work_hours/weekly_breakdown", response_model=WeeklyBreakdownResponse)
+async def get_weekly_breakdown(
+    week_start_date: date, # Expects YYYY-MM-DD from query
+    session: Session = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user["uid"]
+
+    # Get user wage info (similar to daily_breakdown)
+    user_profile_ref = firestore_db.collection("users").document(user_id)
+    user_profile_doc = user_profile_ref.get() # Removed await here
+    if not user_profile_doc.exists:
+        raise HTTPException(status_code=404, detail="User profile not found for wage information.")
+    
+    user_data = user_profile_doc.to_dict()
+    hourly_wage = user_data.get("hourlyWage")
+    overtime_multiplier = user_data.get("overtimeMultiplier", 1.5) # Default to 1.5 if not set
+    overtime_threshold_hours = user_data.get("overtimeThresholdHours", 40.0) # Default to 40 if not set
+
+    if hourly_wage is None or not isinstance(hourly_wage, (int, float)) or hourly_wage <= 0:
+        raise HTTPException(status_code=400, detail="User hourly wage not set or invalid. Cannot calculate earnings.")
+
+    overtime_wage = hourly_wage * overtime_multiplier
+
+    # Calculate week_end_date
+    week_end_date = week_start_date + timedelta(days=6)
+
+    # Convert to datetime for DB query (start of day to end of day)
+    start_datetime_utc = datetime.combine(week_start_date, datetime.min.time(), tzinfo=timezone.utc)
+    end_datetime_utc = datetime.combine(week_end_date, datetime.max.time(), tzinfo=timezone.utc)
+
+    # Fetch punches for the specified week
+    punches = session.exec(
+        select(TimeLog)
+        .where(TimeLog.employee_id == user_id)
+        .where(TimeLog.timestamp >= start_datetime_utc)
+        .where(TimeLog.timestamp <= end_datetime_utc)
+        .order_by(TimeLog.timestamp.asc())
+    ).all()
+
+    daily_hours_map = { (week_start_date + timedelta(days=i)): {"total": 0.0, "punches": []} for i in range(7) }
+
+    for punch in punches:
+        punch_date = punch.timestamp.astimezone(timezone.utc).date()
+        if punch_date in daily_hours_map:
+            daily_hours_map[punch_date]["punches"].append(punch)
+
+    daily_summaries: List[SingleWeekDailySummary] = []
+    week_total_hours = 0.0
+    week_total_regular_hours = 0.0
+    week_total_overtime_hours = 0.0
+    week_total_earnings = 0.0
+
+    # Calculate hours per day
+    for day_offset in range(7):
+        current_date = week_start_date + timedelta(days=day_offset)
+        day_data = daily_hours_map.get(current_date)
+        day_total_hours = 0.0
+
+        if day_data:
+            day_punches = sorted(day_data["punches"], key=lambda p: p.timestamp)
+            clock_in_time: Optional[datetime] = None
+            for punch in day_punches:
+                if punch.punch_type == PunchType.CLOCK_IN:
+                    if clock_in_time is None: # First clock-in or after a clock-out
+                        clock_in_time = punch.timestamp
+                elif punch.punch_type == PunchType.CLOCK_OUT:
+                    if clock_in_time is not None:
+                        duration = (punch.timestamp - clock_in_time).total_seconds() / 3600
+                        day_total_hours += duration
+                        clock_in_time = None # Reset for next pair
+            # If an open clock-in exists at the end of the day's punches for the specified range (should not happen if querying a past week)
+            # For simplicity, we assume closed pairs within the queried range.
+
+        week_total_hours += day_total_hours
+        # Overtime calculation will be done on a weekly basis after summing all daily hours
+        daily_summaries.append(
+            SingleWeekDailySummary(
+                date=current_date.isoformat(),
+                day_name=current_date.strftime("%A"),
+                total_hours=round(day_total_hours, 2),
+                regular_hours=0, # Placeholder, will be filled after weekly OT calc
+                overtime_hours=0, # Placeholder
+                estimated_earnings=0 # Placeholder
+            )
+        )
+    
+    # Distribute weekly total hours into regular and overtime for the week
+    if week_total_hours > overtime_threshold_hours:
+        week_total_overtime_hours = round(week_total_hours - overtime_threshold_hours, 2)
+        week_total_regular_hours = overtime_threshold_hours
+    else:
+        week_total_regular_hours = round(week_total_hours, 2)
+        week_total_overtime_hours = 0.0
+
+    # Now, distribute these weekly regular/overtime hours back to daily summaries
+    # This is a simplified distribution: assumes OT is on later days/hours.
+    # A more precise daily OT would require more complex logic if daily OT rules also apply.
+    remaining_weekly_overtime = week_total_overtime_hours
+    temp_total_earnings = 0.0
+
+    for ds in daily_summaries:
+        daily_reg_hours = ds.total_hours
+        daily_ot_hours = 0.0
+        
+        if remaining_weekly_overtime > 0:
+            if ds.total_hours <= remaining_weekly_overtime:
+                daily_ot_hours = ds.total_hours
+                daily_reg_hours = 0.0
+                remaining_weekly_overtime -= daily_ot_hours
+            else:
+                daily_ot_hours = remaining_weekly_overtime
+                daily_reg_hours = ds.total_hours - daily_ot_hours
+                remaining_weekly_overtime = 0.0
+        
+        ds.regular_hours = round(daily_reg_hours, 2)
+        ds.overtime_hours = round(daily_ot_hours, 2)
+        ds.estimated_earnings = round((daily_reg_hours * hourly_wage) + (daily_ot_hours * overtime_wage), 2)
+        temp_total_earnings += ds.estimated_earnings
+
+    weekly_total_summary = SingleWeeklyTotal(
+        week_start_date=week_start_date.isoformat(),
+        week_end_date=week_end_date.isoformat(),
+        total_hours=round(week_total_hours, 2),
+        total_regular_hours=round(week_total_regular_hours, 2),
+        total_overtime_hours=round(week_total_overtime_hours, 2),
+        total_estimated_earnings=round(temp_total_earnings, 2) # Summing up rounded daily earnings
+    )
+
+    return WeeklyBreakdownResponse(
+        daily_summaries=daily_summaries,
+        weekly_total=weekly_total_summary,
+        message="Weekly breakdown retrieved successfully."
+    )
+
+@router.get("/work_hours/daily_summary", response_model=DailySummaryResponse)
+async def get_daily_summary(
+    target_date: date, # Expects YYYY-MM-DD from query
+    session: Session = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user["uid"]
+
+    # Get user wage info
+    user_profile_ref = firestore_db.collection("users").document(user_id)
+    user_profile_doc = user_profile_ref.get()
+    if not user_profile_doc.exists:
+        raise HTTPException(status_code=404, detail="User profile not found for wage information.")
+    
+    user_data = user_profile_doc.to_dict()
+    hourly_wage = user_data.get("hourlyWage")
+    # Overtime typically calculated weekly, but fetch if needed for complex daily rules not implemented here yet
+    # overtime_multiplier = user_data.get("overtimeMultiplier", 1.5)
+    # overtime_threshold_hours = user_data.get("overtimeThresholdHours", 40.0) 
+
+    if hourly_wage is None or not isinstance(hourly_wage, (int, float)) or hourly_wage <= 0:
+        # Return 0 hours/earnings if wage isn't set, rather than erroring, for a smoother card display
+        return DailySummaryResponse(
+            target_date=target_date.isoformat(),
+            total_hours_today=0.0,
+            total_earnings_today=0.0,
+            message="User hourly wage not set or invalid. Cannot calculate earnings."
+        )
+
+    # Define the time range for the target_date (full day)
+    start_datetime_utc = datetime.combine(target_date, datetime.min.time(), tzinfo=timezone.utc)
+    end_datetime_utc = datetime.combine(target_date, datetime.max.time(), tzinfo=timezone.utc)
+
+    # Fetch punches for the target date
+    punches_today = session.exec(
+        select(TimeLog)
+        .where(TimeLog.employee_id == user_id)
+        .where(TimeLog.timestamp >= start_datetime_utc)
+        .where(TimeLog.timestamp <= end_datetime_utc)
+        .order_by(TimeLog.timestamp.asc())
+    ).all()
+
+    total_seconds_worked_today = 0
+    clock_in_time: Optional[datetime] = None
+
+    for punch in punches_today:
+        punch_timestamp = punch.timestamp.replace(tzinfo=timezone.utc) if punch.timestamp.tzinfo is None else punch.timestamp
+        if punch.punch_type == PunchType.CLOCK_IN:
+            if clock_in_time is None: # Handles multiple clock-ins if user forgot to clock out previously
+                clock_in_time = punch_timestamp
+        elif punch.punch_type == PunchType.CLOCK_OUT:
+            if clock_in_time is not None:
+                # Ensure clock_out is after clock_in for this segment
+                if punch_timestamp > clock_in_time:
+                    duration = (punch_timestamp - clock_in_time).total_seconds()
+                    total_seconds_worked_today += duration
+                clock_in_time = None # Reset for the next pair
+    
+    # If user is currently clocked in (last punch on target_date was CLOCK_IN and it's the target_date still)
+    # For a specific target_date in the past, this part might not be relevant
+    # If target_date is today, and they are still clocked in:
+    if clock_in_time is not None and target_date == datetime.now(timezone.utc).date():
+        now_utc_for_calc = datetime.now(timezone.utc)
+        # Ensure current time is after the last clock in, and within the same day
+        if now_utc_for_calc > clock_in_time:
+            duration_current_shift = (now_utc_for_calc - clock_in_time).total_seconds()
+            total_seconds_worked_today += duration_current_shift
+
+    total_hours_today = round(total_seconds_worked_today / 3600, 2)
+    # For a single day summary, we'll use the regular hourly wage.
+    # More complex daily overtime (e.g., after 8 hours/day) is not implemented here.
+    total_earnings_today = round(total_hours_today * hourly_wage, 2)
+
+    return DailySummaryResponse(
+        target_date=target_date.isoformat(),
+        total_hours_today=total_hours_today,
+        total_earnings_today=total_earnings_today,
+        message="Daily summary retrieved successfully."
+    )
