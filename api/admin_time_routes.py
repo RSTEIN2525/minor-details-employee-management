@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
 from typing import List, Optional
 from datetime import datetime, timezone, time, date
+import pytz
 
 from models.time_log import TimeLog, PunchType
 from models.admin_time_change import AdminTimeChange, AdminTimeChangeAction
@@ -41,10 +42,24 @@ class AdminClockDeleteRequestPayload(BaseModel):
 
 # --- Helper function to combine date and time string --- 
 def combine_date_time_str(punch_date: date, time_str: str) -> datetime:
+    """
+    Combine date and time string (in EST/EDT) and convert to UTC for database storage.
+    """
     try:
         parsed_time = time.fromisoformat(time_str) # Expects HH:MM or HH:MM:SS
-        dt = datetime.combine(punch_date, parsed_time)
-        return dt.replace(tzinfo=timezone.utc) # Assume UTC, adjust if handling local timezones
+        
+        # Create datetime object in EST/EDT timezone
+        eastern = pytz.timezone('US/Eastern')
+        dt_naive = datetime.combine(punch_date, parsed_time)
+        
+        # Localize to Eastern timezone (handles EST/EDT automatically)
+        dt_eastern = eastern.localize(dt_naive)
+        
+        # Convert to UTC for database storage
+        dt_utc = dt_eastern.astimezone(pytz.UTC)
+        
+        return dt_utc
+        
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, 
