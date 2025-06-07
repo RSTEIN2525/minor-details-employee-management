@@ -10,6 +10,7 @@ from db.session import get_session
 from core.deps import require_admin_role
 from core.firebase import db as firestore_db
 from pydantic import BaseModel
+from utils.datetime_helpers import format_utc_datetime
 
 
 router = APIRouter()
@@ -187,8 +188,8 @@ def admin_direct_clock_creation(
             "clock_in_id": new_clock_in.id,
             "clock_out_id": new_clock_out.id,
             "employee_id": payload.employee_id,
-            "start_time": new_start_datetime.isoformat(),
-            "end_time": new_end_datetime.isoformat(),
+            "start_time": format_utc_datetime(new_start_datetime),
+            "end_time": format_utc_datetime(new_end_datetime),
             "reason": payload.reason,
             "created_by_admin": admin_uid
         }
@@ -305,10 +306,10 @@ def admin_direct_clock_edit(
             "clock_in_id": original_clock_in.id,
             "clock_out_id": original_clock_out.id,
             "employee_id": payload.employee_id,
-            "original_start_time": original_start_time.isoformat(),
-            "original_end_time": original_end_time.isoformat(),
-            "new_start_time": new_start_datetime.isoformat(),
-            "new_end_time": new_end_datetime.isoformat(),
+            "original_start_time": format_utc_datetime(original_start_time),
+            "original_end_time": format_utc_datetime(original_end_time),
+            "new_start_time": format_utc_datetime(new_start_datetime),
+            "new_end_time": format_utc_datetime(new_end_datetime),
             "reason": payload.reason,
             "edited_by_admin": admin_uid
         }
@@ -359,7 +360,7 @@ def get_employee_recent_punches(
     for punch in recent_punches:
         formatted_punches.append({
             "id": punch.id,
-            "timestamp": punch.timestamp.isoformat(),
+            "timestamp": format_utc_datetime(punch.timestamp),
             "punch_type": punch.punch_type.value,
             "dealership_id": punch.dealership_id,
             "date": punch.timestamp.date().isoformat(),
@@ -415,14 +416,14 @@ async def get_recent_global_entries(
             "admin_name": admin_name,
             "action": change.action.value,
             "reason": change.reason,
-            "created_at": change.created_at.isoformat(),
+            "created_at": format_utc_datetime(change.created_at),
             "clock_in_id": change.clock_in_id,
             "clock_out_id": change.clock_out_id,
             "dealership_id": change.dealership_id,
-            "start_time": change.start_time.isoformat() if change.start_time else None,
-            "end_time": change.end_time.isoformat() if change.end_time else None,
-            "original_start_time": change.original_start_time.isoformat() if change.original_start_time else None,
-            "original_end_time": change.original_end_time.isoformat() if change.original_end_time else None,
+            "start_time": format_utc_datetime(change.start_time),
+            "end_time": format_utc_datetime(change.end_time),
+            "original_start_time": format_utc_datetime(change.original_start_time),
+            "original_end_time": format_utc_datetime(change.original_end_time),
             "punch_date": change.punch_date,
             "date": change.created_at.date().isoformat(),
             "time": change.created_at.time().strftime("%H:%M")
@@ -474,14 +475,14 @@ async def get_employee_admin_changes(
             "admin_name": admin_name,
             "action": change.action.value,
             "reason": change.reason,
-            "created_at": change.created_at.isoformat(),
+            "created_at": format_utc_datetime(change.created_at),
             "clock_in_id": change.clock_in_id,
             "clock_out_id": change.clock_out_id,
             "dealership_id": change.dealership_id,
-            "start_time": change.start_time.isoformat() if change.start_time else None,
-            "end_time": change.end_time.isoformat() if change.end_time else None,
-            "original_start_time": change.original_start_time.isoformat() if change.original_start_time else None,
-            "original_end_time": change.original_end_time.isoformat() if change.original_end_time else None,
+            "start_time": format_utc_datetime(change.start_time),
+            "end_time": format_utc_datetime(change.end_time),
+            "original_start_time": format_utc_datetime(change.original_start_time),
+            "original_end_time": format_utc_datetime(change.original_end_time),
             "punch_date": change.punch_date,
             "date": change.created_at.date().isoformat(),
             "time": change.created_at.time().strftime("%H:%M")
@@ -577,8 +578,8 @@ def admin_direct_clock_delete(
             "deleted_clock_in_id": payload.clock_in_timelog_id,
             "deleted_clock_out_id": payload.clock_out_timelog_id,
             "employee_id": payload.employee_id,
-            "deleted_start_time": deleted_start_time.isoformat(),
-            "deleted_end_time": deleted_end_time.isoformat(),
+            "deleted_start_time": format_utc_datetime(deleted_start_time),
+            "deleted_end_time": format_utc_datetime(deleted_end_time),
             "dealership_id": dealership_id,
             "reason": payload.reason,
             "deleted_by_admin": admin_uid

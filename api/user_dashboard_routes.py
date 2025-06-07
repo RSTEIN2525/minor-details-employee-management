@@ -7,6 +7,7 @@ from db.session import get_session #
 from core.deps import get_current_user #
 from core.firebase import db as firestore_db #
 from models.time_log import TimeLog, PunchType #
+from utils.datetime_helpers import format_utc_datetime
 
 router = APIRouter()
 
@@ -809,7 +810,7 @@ async def debug_user_info(
             {
                 "id": punch.id,
                 "employee_id": punch.employee_id,
-                "timestamp": punch.timestamp.isoformat(),
+                "timestamp": format_utc_datetime(punch.timestamp),
                 "punch_type": punch.punch_type,
                 "admin_created": punch.admin_modifier_id is not None,
                 "admin_notes": punch.admin_notes
@@ -821,7 +822,7 @@ async def debug_user_info(
                 "id": punch.id,
                 "employee_id": punch.employee_id,
                 "employee_id_length": len(punch.employee_id),
-                "timestamp": punch.timestamp.isoformat(),
+                "timestamp": format_utc_datetime(punch.timestamp),
                 "punch_type": punch.punch_type,
                 "admin_modifier_id": punch.admin_modifier_id,
                 "admin_notes": punch.admin_notes
@@ -839,7 +840,7 @@ async def debug_system_time():
     now_local = datetime.now()
     
     return {
-        "system_time_utc": now_utc.isoformat(),
+        "system_time_utc": format_utc_datetime(now_utc),
         "system_time_local": now_local.isoformat(),
         "current_date_utc": now_utc.date().isoformat(),
         "current_date_local": now_local.date().isoformat(),
