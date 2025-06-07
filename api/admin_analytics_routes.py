@@ -108,6 +108,24 @@ class EmployeeDetailResponse(BaseModel):
     todays_summary: TodaysSummary
     two_week_total_pay: float
 
+# New model for dealership employee hours breakdown
+class EmployeeHoursBreakdown(BaseModel):
+    employee_id: str
+    employee_name: Optional[str] = None
+    hourly_wage: Optional[float] = None
+    total_hours: float
+    regular_hours: float
+    overtime_hours: float
+    estimated_pay: float
+    is_currently_active: bool
+
+class DealershipEmployeeHoursResponse(BaseModel):
+    dealership_id: str
+    start_date: str  # YYYY-MM-DD
+    end_date: str    # YYYY-MM-DD
+    employees: List[EmployeeHoursBreakdown]
+    summary: Dict[str, float]  # totals for all employees combined
+
 # --- Helper Functions ---
 
 async def get_user_details(user_id: str) -> Dict[str, Any]:
@@ -360,7 +378,40 @@ async def get_enhanced_daily_labor_spend(
                     clock_in_time = None
                     employee_had_activity = True
             
-            # Count employee if they had any clock activity
+            # Handle active shifts (if employee is still clocked in)
+            if clock_in_time is not None:
+                # Employee is currently clocked in - calculate time until target date end OR current time (whichever is earlier)
+                now = datetime.now(timezone.utc)
+                end_time = min(now, end_of_day)
+                
+                if end_time > clock_in_time:
+                    duration_hours = (end_time - clock_in_time).total_seconds() / 3600
+                    spend = duration_hours * hourly_wage
+                    
+                    # Add to dealership totals
+                    dealership_labor_spend += spend
+                    dealership_hours += duration_hours
+                    
+                    # Add to hourly breakdown for active shift
+                    shift_start_hour = clock_in_time.hour
+                    current_hour = end_time.hour
+                    
+                    if shift_start_hour == current_hour:
+                        # Active shift within the same hour
+                        hourly_breakdown[shift_start_hour]["spend"] += spend
+                        hourly_breakdown[shift_start_hour]["employees"].add(employee_id)
+                    else:
+                        # Distribute across hours for active shift
+                        for hour in range(shift_start_hour, current_hour + 1):
+                            hour_mod = hour % 24
+                            hourly_breakdown[hour_mod]["employees"].add(employee_id)
+                            # Simple proportional distribution
+                            hour_fraction = 1.0 / (current_hour - shift_start_hour + 1)
+                            hourly_breakdown[hour_mod]["spend"] += spend * hour_fraction
+                    
+                    employee_had_activity = True
+
+            # Count employee if they had any clock activity (including active shifts)
             if employee_had_activity:
                 employees_with_activity.add(employee_id)
         
@@ -426,10 +477,10 @@ async def get_daily_labor_spend(
         .order_by(TimeLog.timestamp.asc())
     ).all()
     
-    # Group time logs by employee for calculating hours
-    employee_logs = defaultdict(list)
+    # Group time logs by dealership and employee for accurate counting
+    dealership_employee_logs = defaultdict(lambda: defaultdict(list))
     for log in time_logs:
-        employee_logs[log.employee_id].append(log)
+        dealership_employee_logs[log.dealership_id][log.employee_id].append(log)
     
     # Calculate hours and labor spend for each employee
     total_labor_spend = 0.0
@@ -437,60 +488,106 @@ async def get_daily_labor_spend(
     
     # Track hourly and dealership breakdowns
     hourly_breakdown = defaultdict(lambda: {"spend": 0.0, "employees": set()})
-    dealership_breakdown = defaultdict(lambda: {"spend": 0.0, "hours": 0.0})
+    dealership_breakdown = defaultdict(lambda: {"spend": 0.0, "hours": 0.0, "employees": set()})
     
-    for employee_id, logs in employee_logs.items():
-        # Get employee's hourly wage
-        user_details = await get_user_details(employee_id)
-        hourly_wage = user_details.get("hourly_wage", 0.0)
-        
-        # Sort logs by timestamp
-        sorted_logs = sorted(logs, key=lambda x: x.timestamp)
-        
-        # Calculate hours worked and corresponding spend
-        clock_in_time: Optional[datetime] = None
-        for log in sorted_logs:
-            log_ts = log.timestamp
-            if log_ts.tzinfo is None:
-                log_ts = log_ts.replace(tzinfo=timezone.utc)
+    # Process each dealership and its employees
+    for dealership_id, employee_logs in dealership_employee_logs.items():
+        for employee_id, logs in employee_logs.items():
+            # Get employee's hourly wage
+            user_details = await get_user_details(employee_id)
+            hourly_wage = user_details.get("hourly_wage", 0.0)
+            
+            # Sort logs by timestamp
+            sorted_logs = sorted(logs, key=lambda x: x.timestamp)
+            
+            # Calculate hours worked and corresponding spend
+            clock_in_time: Optional[datetime] = None
+            employee_had_activity = False
+            
+            for log in sorted_logs:
+                log_ts = log.timestamp
+                if log_ts.tzinfo is None:
+                    log_ts = log_ts.replace(tzinfo=timezone.utc)
 
-            if log.punch_type == PunchType.CLOCK_IN:
-                clock_in_time = log_ts
-            elif log.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-                # clock_in_time is already UTC aware
-                duration_hours = (log_ts - clock_in_time).total_seconds() / 3600
-                spend = duration_hours * hourly_wage
+                if log.punch_type == PunchType.CLOCK_IN:
+                    clock_in_time = log_ts
+                    employee_had_activity = True
+                elif log.punch_type == PunchType.CLOCK_OUT and clock_in_time:
+                    # clock_in_time is already UTC aware
+                    duration_hours = (log_ts - clock_in_time).total_seconds() / 3600
+                    spend = duration_hours * hourly_wage
+                    
+                    # Add to totals
+                    total_labor_spend += spend
+                    total_hours += duration_hours
+                    
+                    # Add to dealership breakdown
+                    dealership_breakdown[dealership_id]["spend"] += spend
+                    dealership_breakdown[dealership_id]["hours"] += duration_hours
+                    
+                    # Add to hourly breakdown
+                    # For each hour of the shift, distribute the labor spend proportionally
+                    shift_start_hour = clock_in_time.hour # clock_in_time is UTC aware
+                    shift_end_hour = log_ts.hour # log_ts is UTC aware
+                    
+                    # Handle shifts that span multiple hours
+                    if shift_start_hour == shift_end_hour:
+                        # Shift within the same hour
+                        hourly_breakdown[shift_start_hour]["spend"] += spend
+                        hourly_breakdown[shift_start_hour]["employees"].add(employee_id)
+                    else:
+                        # Distribute across hours
+                        for hour in range(shift_start_hour, shift_end_hour + 1):
+                            hour_mod = hour % 24  # Handle overnight shifts
+                            hourly_breakdown[hour_mod]["employees"].add(employee_id)
+                            
+                            # Simple proportional distribution
+                            hour_fraction = 1.0 / (shift_end_hour - shift_start_hour + 1)
+                            hourly_breakdown[hour_mod]["spend"] += spend * hour_fraction
+                    
+                    clock_in_time = None
+                    employee_had_activity = True
+            
+            # Handle active shifts (if employee is still clocked in)
+            if clock_in_time is not None:
+                # Employee is currently clocked in - calculate time until target date end OR current time (whichever is earlier)
+                now = datetime.now(timezone.utc)
+                end_time = min(now, end_of_day)
                 
-                # Add to totals
-                total_labor_spend += spend
-                total_hours += duration_hours
-                
-                # Add to dealership breakdown
-                dealership_id = log.dealership_id
-                dealership_breakdown[dealership_id]["spend"] += spend
-                dealership_breakdown[dealership_id]["hours"] += duration_hours
-                
-                # Add to hourly breakdown
-                # For each hour of the shift, distribute the labor spend proportionally
-                shift_start_hour = clock_in_time.hour # clock_in_time is UTC aware
-                shift_end_hour = log_ts.hour # log_ts is UTC aware
-                
-                # Handle shifts that span multiple hours
-                if shift_start_hour == shift_end_hour:
-                    # Shift within the same hour
-                    hourly_breakdown[shift_start_hour]["spend"] += spend
-                    hourly_breakdown[shift_start_hour]["employees"].add(employee_id)
-                else:
-                    # Distribute across hours
-                    for hour in range(shift_start_hour, shift_end_hour + 1):
-                        hour_mod = hour % 24  # Handle overnight shifts
-                        hourly_breakdown[hour_mod]["employees"].add(employee_id)
-                        
-                        # Simple proportional distribution
-                        hour_fraction = 1.0 / (shift_end_hour - shift_start_hour + 1)
-                        hourly_breakdown[hour_mod]["spend"] += spend * hour_fraction
-                
-                clock_in_time = None
+                if end_time > clock_in_time:
+                    duration_hours = (end_time - clock_in_time).total_seconds() / 3600
+                    spend = duration_hours * hourly_wage
+                    
+                    # Add to totals
+                    total_labor_spend += spend
+                    total_hours += duration_hours
+                    
+                    # Add to dealership breakdown
+                    dealership_breakdown[dealership_id]["spend"] += spend
+                    dealership_breakdown[dealership_id]["hours"] += duration_hours
+                    
+                    # Add to hourly breakdown for active shift
+                    shift_start_hour = clock_in_time.hour
+                    current_hour = end_time.hour
+                    
+                    if shift_start_hour == current_hour:
+                        # Active shift within the same hour
+                        hourly_breakdown[shift_start_hour]["spend"] += spend
+                        hourly_breakdown[shift_start_hour]["employees"].add(employee_id)
+                    else:
+                        # Distribute across hours for active shift
+                        for hour in range(shift_start_hour, current_hour + 1):
+                            hour_mod = hour % 24
+                            hourly_breakdown[hour_mod]["employees"].add(employee_id)
+                            # Simple proportional distribution
+                            hour_fraction = 1.0 / (current_hour - shift_start_hour + 1)
+                            hourly_breakdown[hour_mod]["spend"] += spend * hour_fraction
+                    
+                    employee_had_activity = True
+
+            # Count employee if they had any clock activity at this dealership (including active shifts)
+            if employee_had_activity:
+                dealership_breakdown[dealership_id]["employees"].add(employee_id)
     
     # Format hourly breakdown for response
     formatted_hourly_breakdown = [
@@ -580,6 +677,17 @@ async def get_dealership_labor_spend(
                 total_labor_spend += duration_hours * hourly_wage
                 total_hours += duration_hours
                 clock_in_time = None
+        
+        # Handle active shifts (if employee is still clocked in at this dealership)
+        if clock_in_time is not None:
+            # Employee is currently clocked in - calculate time until target date end OR current time (whichever is earlier)
+            now = datetime.now(timezone.utc)
+            end_time = min(now, end_of_day)
+            
+            if end_time > clock_in_time:
+                duration_hours = (end_time - clock_in_time).total_seconds() / 3600
+                total_labor_spend += duration_hours * hourly_wage
+                total_hours += duration_hours
     
     return DealershipLaborSpend(
         dealership_id=dealership_id,
@@ -1217,3 +1325,144 @@ async def get_all_employees_details(
     all_employee_details.sort(key=lambda x: x.employee_name or "")
     
     return all_employee_details
+
+@router.get("/dealership/{dealership_id}/employee-hours", response_model=DealershipEmployeeHoursResponse)
+async def get_dealership_employee_hours_breakdown(
+    dealership_id: str,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    session: Session = Depends(get_session),
+    admin_user: dict = Depends(require_admin_role)
+):
+    """
+    Get a breakdown of all employees at a dealership with their regular and overtime hours.
+    Perfect for labor cost overview and management.
+    
+    Args:
+        dealership_id: The ID of the dealership
+        start_date: Start date for the calculation (defaults to current week start)
+        end_date: End date for the calculation (defaults to current week end)
+    
+    Returns:
+        DealershipEmployeeHoursResponse with each employee's hours breakdown
+    """
+    
+    # Set default date range to current week if not provided
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    
+    if not start_date:
+        # Default to start of current week (Monday)
+        start_date = today - timedelta(days=today.weekday())
+    
+    if not end_date:
+        # Default to end of current week (Sunday)
+        end_date = start_date + timedelta(days=6)
+    
+    # Convert dates to datetime objects with timezone
+    start_datetime = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+    end_datetime = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=timezone.utc)
+    
+    # Get all time logs for this dealership in the date range
+    time_logs = session.exec(
+        select(TimeLog)
+        .where(TimeLog.dealership_id == dealership_id)
+        .where(TimeLog.timestamp >= start_datetime)
+        .where(TimeLog.timestamp <= end_datetime)
+        .order_by(TimeLog.timestamp.asc())
+    ).all()
+    
+    # Group time logs by employee
+    employee_logs = defaultdict(list)
+    for log in time_logs:
+        employee_logs[log.employee_id].append(log)
+    
+    # Get all unique employee IDs for this dealership
+    employee_ids = list(employee_logs.keys())
+    
+    # Calculate summary totals
+    summary_total_hours = 0.0
+    summary_regular_hours = 0.0
+    summary_overtime_hours = 0.0
+    summary_estimated_pay = 0.0
+    
+    employee_breakdown_list = []
+    
+    for employee_id in employee_ids:
+        # Get employee details from Firestore
+        user_details = await get_user_details(employee_id)
+        employee_name = user_details.get("name", "Unknown")
+        hourly_wage = user_details.get("hourly_wage", 0.0)
+        
+        # Check if employee is currently active at this dealership
+        is_currently_active, _ = await is_employee_currently_active(session, employee_id, dealership_id)
+        
+        # Calculate total hours worked by this employee
+        logs = employee_logs[employee_id]
+        sorted_logs = sorted(logs, key=lambda x: x.timestamp)
+        
+        total_hours_worked = 0.0
+        clock_in_time: Optional[datetime] = None
+        
+        for log in sorted_logs:
+            log_ts = log.timestamp
+            if log_ts.tzinfo is None:
+                log_ts = log_ts.replace(tzinfo=timezone.utc)
+
+            if log.punch_type == PunchType.CLOCK_IN:
+                clock_in_time = log_ts
+            elif log.punch_type == PunchType.CLOCK_OUT and clock_in_time:
+                duration_hours = (log_ts - clock_in_time).total_seconds() / 3600
+                total_hours_worked += duration_hours
+                clock_in_time = None
+        
+        # If still clocked in within our date range
+        if clock_in_time and clock_in_time <= end_datetime:
+            # Calculate duration until end of period or current time (whichever is earlier)
+            end_time = min(now, end_datetime)
+            duration_hours = (end_time - clock_in_time).total_seconds() / 3600
+            total_hours_worked += duration_hours
+        
+        # Calculate regular vs overtime hours
+        regular_hours, overtime_hours = calculate_regular_and_overtime_hours(total_hours_worked)
+        
+        # Calculate estimated pay with overtime
+        estimated_pay = calculate_pay_with_overtime(regular_hours, overtime_hours, hourly_wage)
+        
+        # Add to summary totals
+        summary_total_hours += total_hours_worked
+        summary_regular_hours += regular_hours
+        summary_overtime_hours += overtime_hours
+        summary_estimated_pay += estimated_pay
+        
+        employee_breakdown_list.append(EmployeeHoursBreakdown(
+            employee_id=employee_id,
+            employee_name=employee_name,
+            hourly_wage=hourly_wage,
+            total_hours=round(total_hours_worked, 2),
+            regular_hours=round(regular_hours, 2),
+            overtime_hours=round(overtime_hours, 2),
+            estimated_pay=round(estimated_pay, 2),
+            is_currently_active=is_currently_active
+        ))
+    
+    # Sort by total hours (highest first) for better overview
+    employee_breakdown_list.sort(key=lambda x: x.total_hours, reverse=True)
+    
+    # Create summary dictionary
+    summary = {
+        "total_hours": round(summary_total_hours, 2),
+        "regular_hours": round(summary_regular_hours, 2),
+        "overtime_hours": round(summary_overtime_hours, 2),
+        "estimated_total_pay": round(summary_estimated_pay, 2),
+        "employee_count": len(employee_breakdown_list),
+        "average_hours_per_employee": round(summary_total_hours / len(employee_breakdown_list) if employee_breakdown_list else 0, 2)
+    }
+    
+    return DealershipEmployeeHoursResponse(
+        dealership_id=dealership_id,
+        start_date=start_date.isoformat(),
+        end_date=end_date.isoformat(),
+        employees=employee_breakdown_list,
+        summary=summary
+    )

@@ -928,7 +928,7 @@ async def get_weekly_breakdown(
     week_total_overtime_hours = 0.0
     week_total_earnings = 0.0
 
-    # Calculate hours per day
+    # Calculate hours per day using consistent admin logic
     for day_offset in range(7):
         current_date = week_start_date + timedelta(days=day_offset)
         day_data = daily_hours_map.get(current_date)
@@ -937,63 +937,77 @@ async def get_weekly_breakdown(
         if day_data:
             day_punches = sorted(day_data["punches"], key=lambda p: p.timestamp)
             clock_in_time: Optional[datetime] = None
+            
+            # Use the same logic as admin analytics for consistency
             for punch in day_punches:
+                punch_ts = punch.timestamp
+                if punch_ts.tzinfo is None:
+                    punch_ts = punch_ts.replace(tzinfo=timezone.utc)
+                    
                 if punch.punch_type == PunchType.CLOCK_IN:
-                    if clock_in_time is None: # First clock-in or after a clock-out
-                        clock_in_time = punch.timestamp
-                elif punch.punch_type == PunchType.CLOCK_OUT:
-                    if clock_in_time is not None:
-                        duration = (punch.timestamp - clock_in_time).total_seconds() / 3600
-                        day_total_hours += duration
-                        clock_in_time = None # Reset for next pair
-            # If an open clock-in exists at the end of the day's punches for the specified range (should not happen if querying a past week)
-            # For simplicity, we assume closed pairs within the queried range.
+                    clock_in_time = punch_ts
+                elif punch.punch_type == PunchType.CLOCK_OUT and clock_in_time:
+                    duration_hours = (punch_ts - clock_in_time).total_seconds() / 3600
+                    day_total_hours += duration_hours
+                    clock_in_time = None
+
+            # Handle currently active shift if it exists at end of day's punches
+            if clock_in_time is not None:
+                # If the current date is today and user is still clocked in, add time until now
+                now_utc = datetime.now(timezone.utc)
+                if current_date == now_utc.date():
+                    duration_hours = (now_utc - clock_in_time).total_seconds() / 3600
+                    day_total_hours += duration_hours
 
         week_total_hours += day_total_hours
-        # Overtime calculation will be done on a weekly basis after summing all daily hours
+        
+        # Calculate regular/overtime for this day based on weekly total so far
+        # For daily display, we need to show how much of each day is regular vs overtime
+        # But overtime is calculated on weekly basis
         daily_summaries.append(
             SingleWeekDailySummary(
                 date=current_date.isoformat(),
                 day_name=current_date.strftime("%A"),
                 total_hours=round(day_total_hours, 2),
-                regular_hours=0, # Placeholder, will be filled after weekly OT calc
-                overtime_hours=0, # Placeholder
-                estimated_earnings=0 # Placeholder
+                regular_hours=0, # Will be calculated after we have weekly totals
+                overtime_hours=0, # Will be calculated after we have weekly totals
+                estimated_earnings=0 # Will be calculated after we have weekly totals
             )
         )
     
-    # Distribute weekly total hours into regular and overtime for the week
-    if week_total_hours > overtime_threshold_hours:
-        week_total_overtime_hours = round(week_total_hours - overtime_threshold_hours, 2)
-        week_total_regular_hours = overtime_threshold_hours
-    else:
-        week_total_regular_hours = round(week_total_hours, 2)
+    # Use the same overtime calculation logic as admin analytics
+    if week_total_hours <= overtime_threshold_hours:
+        week_total_regular_hours = week_total_hours
         week_total_overtime_hours = 0.0
-
-    # Now, distribute these weekly regular/overtime hours back to daily summaries
-    # This is a simplified distribution: assumes OT is on later days/hours.
-    # A more precise daily OT would require more complex logic if daily OT rules also apply.
-    remaining_weekly_overtime = week_total_overtime_hours
-    temp_total_earnings = 0.0
+    else:
+        week_total_regular_hours = overtime_threshold_hours
+        week_total_overtime_hours = week_total_hours - overtime_threshold_hours
+    
+    # Calculate daily regular/overtime hours properly
+    # For weekly overtime, we need to determine which hours count as overtime
+    # Standard approach: first 40 hours are regular, rest are overtime
+    remaining_regular_hours = week_total_regular_hours
+    total_earnings = 0.0
 
     for ds in daily_summaries:
-        daily_reg_hours = ds.total_hours
-        daily_ot_hours = 0.0
+        if remaining_regular_hours >= ds.total_hours:
+            # All hours for this day are regular
+            ds.regular_hours = round(ds.total_hours, 2)
+            ds.overtime_hours = 0.0
+            remaining_regular_hours -= ds.total_hours
+        elif remaining_regular_hours > 0:
+            # Some hours are regular, some are overtime
+            ds.regular_hours = round(remaining_regular_hours, 2)
+            ds.overtime_hours = round(ds.total_hours - remaining_regular_hours, 2)
+            remaining_regular_hours = 0.0
+        else:
+            # All hours for this day are overtime
+            ds.regular_hours = 0.0
+            ds.overtime_hours = round(ds.total_hours, 2)
         
-        if remaining_weekly_overtime > 0:
-            if ds.total_hours <= remaining_weekly_overtime:
-                daily_ot_hours = ds.total_hours
-                daily_reg_hours = 0.0
-                remaining_weekly_overtime -= daily_ot_hours
-            else:
-                daily_ot_hours = remaining_weekly_overtime
-                daily_reg_hours = ds.total_hours - daily_ot_hours
-                remaining_weekly_overtime = 0.0
-        
-        ds.regular_hours = round(daily_reg_hours, 2)
-        ds.overtime_hours = round(daily_ot_hours, 2)
-        ds.estimated_earnings = round((daily_reg_hours * hourly_wage) + (daily_ot_hours * overtime_wage), 2)
-        temp_total_earnings += ds.estimated_earnings
+        # Calculate earnings using same logic as admin analytics
+        ds.estimated_earnings = round((ds.regular_hours * hourly_wage) + (ds.overtime_hours * overtime_wage), 2)
+        total_earnings += ds.estimated_earnings
 
     weekly_total_summary = SingleWeeklyTotal(
         week_start_date=week_start_date.isoformat(),
@@ -1001,7 +1015,7 @@ async def get_weekly_breakdown(
         total_hours=round(week_total_hours, 2),
         total_regular_hours=round(week_total_regular_hours, 2),
         total_overtime_hours=round(week_total_overtime_hours, 2),
-        total_estimated_earnings=round(temp_total_earnings, 2) # Summing up rounded daily earnings
+        total_estimated_earnings=round(total_earnings, 2)
     )
 
     return WeeklyBreakdownResponse(
@@ -1058,15 +1072,14 @@ async def get_daily_summary(
     for punch in punches_today:
         punch_timestamp = punch.timestamp.replace(tzinfo=timezone.utc) if punch.timestamp.tzinfo is None else punch.timestamp
         if punch.punch_type == PunchType.CLOCK_IN:
-            if clock_in_time is None: # Handles multiple clock-ins if user forgot to clock out previously
-                clock_in_time = punch_timestamp
-        elif punch.punch_type == PunchType.CLOCK_OUT:
-            if clock_in_time is not None:
-                # Ensure clock_out is after clock_in for this segment
-                if punch_timestamp > clock_in_time:
-                    duration = (punch_timestamp - clock_in_time).total_seconds()
-                    total_seconds_worked_today += duration
-                clock_in_time = None # Reset for the next pair
+            # Use same logic as current_week_overtime - always update clock_in_time
+            clock_in_time = punch_timestamp
+        elif punch.punch_type == PunchType.CLOCK_OUT and clock_in_time:
+            # Ensure clock_out is after clock_in for this segment
+            if punch_timestamp > clock_in_time:
+                duration = (punch_timestamp - clock_in_time).total_seconds()
+                total_seconds_worked_today += duration
+            clock_in_time = None # Reset for the next pair
     
     # If user is currently clocked in (last punch on target_date was CLOCK_IN and it's the target_date still)
     # For a specific target_date in the past, this part might not be relevant
@@ -1089,3 +1102,117 @@ async def get_daily_summary(
         total_earnings_today=total_earnings_today,
         message="Daily summary retrieved successfully."
     )
+
+@router.get("/debug/weekly_breakdown_punches")
+async def debug_weekly_breakdown_punches(
+    week_start_date: date, # Expects YYYY-MM-DD from query
+    session: Session = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Debug endpoint to see exactly what punches are fetched and how they're calculated."""
+    user_id = current_user["uid"]
+    
+    # Calculate week_end_date
+    week_end_date = week_start_date + timedelta(days=6)
+
+    # Convert to datetime for DB query (start of day to end of day)
+    start_datetime_utc = datetime.combine(week_start_date, datetime.min.time(), tzinfo=timezone.utc)
+    end_datetime_utc = datetime.combine(week_end_date, datetime.max.time(), tzinfo=timezone.utc)
+
+    # Fetch punches for the specified week - SAME QUERY AS WEEKLY_BREAKDOWN
+    punches = session.exec(
+        select(TimeLog)
+        .where(TimeLog.employee_id == user_id)
+        .where(TimeLog.timestamp >= start_datetime_utc)
+        .where(TimeLog.timestamp <= end_datetime_utc)
+        .order_by(TimeLog.timestamp.asc())
+    ).all()
+
+    # Format punches for display
+    punch_data = []
+    for punch in punches:
+        punch_data.append({
+            "id": punch.id,
+            "timestamp": punch.timestamp.isoformat() + "Z" if punch.timestamp.tzinfo else punch.timestamp.isoformat(),
+            "punch_type": punch.punch_type.value,
+            "dealership_id": punch.dealership_id,
+            "date": punch.timestamp.astimezone(timezone.utc).date().isoformat()
+        })
+
+    # Calculate total hours using SAME LOGIC as weekly_breakdown
+    daily_hours_map = { (week_start_date + timedelta(days=i)): {"total": 0.0, "punches": []} for i in range(7) }
+
+    for punch in punches:
+        punch_date = punch.timestamp.astimezone(timezone.utc).date()
+        if punch_date in daily_hours_map:
+            daily_hours_map[punch_date]["punches"].append(punch)
+
+    daily_calculations = []
+    week_total_hours = 0.0
+
+    # Calculate hours per day using same logic as weekly_breakdown
+    for day_offset in range(7):
+        current_date = week_start_date + timedelta(days=day_offset)
+        day_data = daily_hours_map.get(current_date)
+        day_total_hours = 0.0
+        day_punch_details = []
+
+        if day_data:
+            day_punches = sorted(day_data["punches"], key=lambda p: p.timestamp)
+            clock_in_time = None
+            
+            for punch in day_punches:
+                punch_ts = punch.timestamp
+                if punch_ts.tzinfo is None:
+                    punch_ts = punch_ts.replace(tzinfo=timezone.utc)
+                    
+                if punch.punch_type == PunchType.CLOCK_IN:
+                    clock_in_time = punch_ts
+                    day_punch_details.append({
+                        "action": "clock_in",
+                        "timestamp": punch_ts.isoformat(),
+                        "punch_id": punch.id
+                    })
+                elif punch.punch_type == PunchType.CLOCK_OUT and clock_in_time:
+                    duration_hours = (punch_ts - clock_in_time).total_seconds() / 3600
+                    day_total_hours += duration_hours
+                    day_punch_details.append({
+                        "action": "clock_out",
+                        "timestamp": punch_ts.isoformat(),
+                        "punch_id": punch.id,
+                        "paired_with_clock_in": clock_in_time.isoformat(),
+                        "duration_hours": duration_hours
+                    })
+                    clock_in_time = None
+
+            # Handle currently active shift if it exists at end of day's punches
+            if clock_in_time is not None:
+                now_utc = datetime.now(timezone.utc)
+                if current_date == now_utc.date():
+                    duration_hours = (now_utc - clock_in_time).total_seconds() / 3600
+                    day_total_hours += duration_hours
+                    day_punch_details.append({
+                        "action": "active_shift",
+                        "clock_in_time": clock_in_time.isoformat(),
+                        "duration_until_now": duration_hours
+                    })
+
+        week_total_hours += day_total_hours
+        
+        daily_calculations.append({
+            "date": current_date.isoformat(),
+            "day_name": current_date.strftime("%A"),
+            "total_hours": round(day_total_hours, 2),
+            "punch_details": day_punch_details
+        })
+
+    return {
+        "week_start_date": week_start_date.isoformat(),
+        "week_end_date": week_end_date.isoformat(),
+        "query_start": start_datetime_utc.isoformat(),
+        "query_end": end_datetime_utc.isoformat(),
+        "total_punches_found": len(punches),
+        "total_week_hours": round(week_total_hours, 2),
+        "punches": punch_data,
+        "daily_calculations": daily_calculations
+    }
