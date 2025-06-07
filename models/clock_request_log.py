@@ -2,6 +2,8 @@ from sqlmodel import SQLModel, Field
 from typing import Optional
 from datetime import datetime, timezone, date
 from enum import Enum
+from pydantic import field_serializer
+from utils.datetime_helpers import format_utc_datetime
 
 class RequestTypeEnum(str, Enum):
     EDIT = "edit"
@@ -35,4 +37,11 @@ class ClockRequestLog(SQLModel, table=True):
     
     reviewed_by_admin_id: Optional[str] = Field(default=None, index=True)
     reviewed_at: Optional[datetime] = Field(default=None)
-    admin_notes: Optional[str] = Field(default=None) 
+    admin_notes: Optional[str] = Field(default=None)
+
+    @field_serializer('requested_at', 'reviewed_at')
+    def serialize_timestamps(self, dt: Optional[datetime]) -> Optional[str]:
+        """Ensure timestamps are formatted as UTC with Z suffix"""
+        if dt is None:
+            return None
+        return format_utc_datetime(dt) 

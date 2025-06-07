@@ -2,7 +2,8 @@ from sqlmodel import SQLModel, Field, Index
 from typing import Optional
 from enum import Enum
 from datetime import datetime, timezone
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
+from utils.datetime_helpers import format_utc_datetime
 
 # Defines the Structure of Data for a Clock in Call
 class PunchRequest(BaseModel):
@@ -58,3 +59,8 @@ class TimeLog(SQLModel, table=True):
     # New fields for injury reporting
     injured_at_work: Optional[bool] = Field(default=None)
     safety_signature: Optional[str] = Field(default=None, max_length=10)  # Limiting to 10 chars for initials
+
+    @field_serializer('timestamp')
+    def serialize_timestamp(self, dt: datetime) -> str:
+        """Ensure timestamp is formatted as UTC with Z suffix"""
+        return format_utc_datetime(dt)

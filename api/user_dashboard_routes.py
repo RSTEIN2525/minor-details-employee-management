@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_serializer
 from typing import List, Optional
 from datetime import datetime, timedelta, timezone, date
 from db.session import get_session #
@@ -18,6 +18,11 @@ class CurrentShiftDurationResponse(BaseModel):
     shift_start_time: Optional[datetime] = None
     message: str
 
+    @field_serializer('shift_start_time')
+    def serialize_shift_start_time(self, dt: Optional[datetime]) -> Optional[str]:
+        """Ensure shift_start_time is formatted as UTC with Z suffix"""
+        return format_utc_datetime(dt)
+
 class UserWageResponse(BaseModel):
     hourly_wage: Optional[float] = None
     message: str
@@ -34,6 +39,11 @@ class WeeklyHoursResponse(BaseModel):
     week_end_date: datetime
     message: str
 
+    @field_serializer('week_start_date', 'week_end_date')
+    def serialize_dates(self, dt: datetime) -> str:
+        """Ensure dates are formatted as UTC with Z suffix"""
+        return format_utc_datetime(dt)
+
 class PunchLogResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
@@ -49,6 +59,11 @@ class PunchLogResponse(BaseModel):
     injured_at_work: Optional[bool] = None
     safety_signature: Optional[str] = None
 
+    @field_serializer('timestamp')
+    def serialize_timestamp(self, dt: datetime) -> str:
+        """Ensure timestamp is formatted as UTC with Z suffix"""
+        return format_utc_datetime(dt)
+
 class PastPunchesResponse(BaseModel):
     punches: List[PunchLogResponse]
     message: str
@@ -60,6 +75,11 @@ class WeeklyOvertimeHoursResponse(BaseModel):
     week_end_date: datetime
     overtime_threshold: float = 40.0
     message: str
+
+    @field_serializer('week_start_date', 'week_end_date')
+    def serialize_dates(self, dt: datetime) -> str:
+        """Ensure dates are formatted as UTC with Z suffix"""
+        return format_utc_datetime(dt)
 
 class UserOvertimeWageResponse(BaseModel):
     regular_hourly_wage: Optional[float] = None
@@ -769,6 +789,11 @@ async def get_punch_history_past_three_weeks(
     # Make Sure Exists
     if not response_punches:
         return PastPunchesResponse(punches=[], message="No punch history found for the past three weeks.")
+
+    print(PastPunchesResponse(
+        punches=response_punches,
+        message="Punch history for the past three weeks retrieved."
+    ))
 
     # Return All Punches Exists
     return PastPunchesResponse(

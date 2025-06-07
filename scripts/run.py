@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""Script to run the FastAPI application using Uvicorn."""
-
 import uvicorn
 import os
 

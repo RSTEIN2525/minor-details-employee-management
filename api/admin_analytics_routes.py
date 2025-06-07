@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select, func
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime, date, timedelta, timezone
 from db.session import get_session
@@ -9,6 +9,7 @@ from core.firebase import db as firestore_db
 from models.time_log import TimeLog, PunchType
 from models.shop import Shop
 from collections import defaultdict
+from utils.datetime_helpers import format_utc_datetime
 
 router = APIRouter()
 
@@ -56,6 +57,11 @@ class EmployeeShiftInfo(BaseModel):
     weekly_hours_worked: float
     is_overtime: bool = False
 
+    @field_serializer('shift_start_time')
+    def serialize_shift_start_time(self, dt: datetime) -> str:
+        """Ensure shift_start_time is formatted as UTC with Z suffix"""
+        return format_utc_datetime(dt)
+
 class DealershipEmployeeStatus(BaseModel):
     dealership_id: str
     active_employees: List[EmployeeShiftInfo]
@@ -70,6 +76,11 @@ class EmployeeClockEntry(BaseModel):
     timestamp: datetime
     punch_type: PunchType
     dealership_id: str
+
+    @field_serializer('timestamp')
+    def serialize_timestamp(self, dt: datetime) -> str:
+        """Ensure timestamp is formatted as UTC with Z suffix"""
+        return format_utc_datetime(dt)
 
 class WeekSummary(BaseModel):
     week_start_date: str

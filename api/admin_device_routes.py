@@ -6,12 +6,13 @@ from core.firebase import db
 from google.cloud.firestore_v1.transforms import ArrayUnion, ArrayRemove
 from google.cloud.firestore_v1.base_query import FieldFilter
 from core.deps import require_admin_role, get_current_user_basic_auth
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 from typing import List
 from google.cloud import storage
 import os
 from utils.storage import generate_secure_photo_url, debug_file_metadata, remove_download_tokens_from_file
 from utils.database_storage import get_device_photo_from_db, photo_to_base64
+from utils.datetime_helpers import format_utc_datetime
 
 router = APIRouter()
 
@@ -31,11 +32,29 @@ class DeviceRequestHistory(BaseModel):
     processedByUid: str | None
     processedByEmail: str | None
 
+    @field_serializer('requestedAt', 'processedAt')
+    def serialize_timestamps(self, dt: datetime | str | None) -> str | None:
+        """Ensure timestamps are formatted as UTC with Z suffix"""
+        if dt is None:
+            return None
+        if isinstance(dt, str):
+            return dt  # Already a string
+        return format_utc_datetime(dt)
+
 
 # Return Model For User Device Registration Analytics Endpoint
 class DeviceRequestSummary(BaseModel):
     totalRequests: int
     lastRequestedAt: datetime | str | None
+
+    @field_serializer('lastRequestedAt')
+    def serialize_last_requested_at(self, dt: datetime | str | None) -> str | None:
+        """Ensure lastRequestedAt is formatted as UTC with Z suffix"""
+        if dt is None:
+            return None
+        if isinstance(dt, str):
+            return dt  # Already a string
+        return format_utc_datetime(dt)
 
 
 @router.get("/pending")

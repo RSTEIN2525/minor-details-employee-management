@@ -2,12 +2,13 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
 from typing import List, Optional
 from datetime import datetime, timezone, date
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 
 from models.shift_change import ShiftChange, ShiftChangeType
 from db.session import get_session
 from core.deps import get_current_user
 from core.firebase import db as firestore_db
+from utils.datetime_helpers import format_utc_datetime
 
 router = APIRouter()
 
@@ -34,6 +35,13 @@ class UserShiftChangeResponse(BaseModel):
     created_at: datetime
     created_by_owner_name: Optional[str] = None
     employee_viewed_at: Optional[datetime] = None
+
+    @field_serializer('created_at', 'employee_viewed_at')
+    def serialize_timestamps(self, dt: Optional[datetime]) -> Optional[str]:
+        """Ensure timestamps are formatted as UTC with Z suffix"""
+        if dt is None:
+            return None
+        return format_utc_datetime(dt)
 
 class ShiftChangeSummary(BaseModel):
     total_changes: int

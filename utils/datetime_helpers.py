@@ -3,36 +3,31 @@ from typing import Optional
 
 def format_utc_datetime(dt: Optional[datetime]) -> Optional[str]:
     """
-    Format a UTC datetime object to ISO 8601 string with 'Z' suffix.
+    Format a datetime object to an ISO 8601 string with 'Z' suffix.
+
+    If the datetime is naive, it is assumed to be in UTC and is made aware.
+    If it is timezone-aware, it is converted to UTC.
     
     Args:
-        dt: UTC datetime object or None
+        dt: A datetime object or None
         
     Returns:
-        ISO 8601 formatted string with 'Z' suffix, or None if input is None
-        
-    Example:
-        Input:  datetime(2025, 6, 7, 13, 25, 39, 765881, tzinfo=timezone.utc)
-        Output: "2025-06-07T13:25:39.765881Z"
+        An ISO 8601 formatted string with 'Z' suffix, or None if the input is None.
     """
     if dt is None:
         return None
-    
-    # If the datetime has timezone info, ensure it's UTC and format with Z
-    if dt.tzinfo is not None:
-        # Convert to UTC if not already
-        if dt.tzinfo != timezone.utc:
-            dt = dt.astimezone(timezone.utc)
-        
-        # Format as ISO string and replace +00:00 with Z
-        iso_string = dt.isoformat()
-        if iso_string.endswith('+00:00'):
-            return iso_string.replace('+00:00', 'Z')
-        elif iso_string.endswith('Z'):
-            return iso_string
-        else:
-            # If it doesn't end with +00:00, just append Z (assuming UTC)
-            return iso_string + 'Z'
+
+    # If the datetime is naive, assume it's UTC and make it timezone-aware.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    # If it's already timezone-aware, ensure it's in UTC.
     else:
-        # If no timezone info, assume UTC and append Z
-        return dt.isoformat() + 'Z' 
+        dt = dt.astimezone(timezone.utc)
+
+    # Format to ISO string and replace the +00:00 suffix with 'Z'.
+    iso_string = dt.isoformat()
+    
+    if iso_string.endswith('+00:00'):
+        return iso_string.replace('+00:00', 'Z')
+    
+    return iso_string 

@@ -6,7 +6,8 @@ from datetime import datetime, timezone, date
 from models.time_log import TimeLog, PunchType
 from db.session import get_session
 from core.deps import require_admin_role
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
+from utils.datetime_helpers import format_utc_datetime
 
 router = APIRouter()
 
@@ -21,6 +22,11 @@ class InjuryReportEntry(BaseModel):
     safety_signature: str
     admin_notes: Optional[str] = None
     admin_modifier_id: Optional[str] = None
+
+    @field_serializer('timestamp')
+    def serialize_timestamp(self, dt: datetime) -> str:
+        """Ensure timestamp is formatted as UTC with Z suffix"""
+        return format_utc_datetime(dt)
 
 class InjuryReportSummary(BaseModel):
     total_clockouts: int
