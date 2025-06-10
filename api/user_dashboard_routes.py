@@ -7,6 +7,7 @@ from db.session import get_session #
 from core.deps import get_current_user #
 from core.firebase import db as firestore_db #
 from models.time_log import TimeLog, PunchType #
+from models.vacation_time import VacationTime #
 from utils.datetime_helpers import format_utc_datetime
 
 router = APIRouter()
@@ -143,6 +144,30 @@ class DailySummaryResponse(BaseModel):
     total_hours_today: float
     total_earnings_today: float
     message: Optional[str] = None
+
+# --- Vacation Time Models ---
+
+class VacationTimeEntry(BaseModel):
+    id: int
+    date: date
+    hours: float
+    vacation_type: str
+    notes: Optional[str] = None
+    created_at: datetime
+    # Financial calculations
+    hourly_wage: Optional[float] = None
+    vacation_pay: Optional[float] = None
+
+    @field_serializer('created_at')
+    def serialize_created_at(self, dt: datetime) -> str:
+        """Ensure created_at is formatted as UTC with Z suffix"""
+        return format_utc_datetime(dt)
+
+class UserVacationSummaryResponse(BaseModel):
+    total_vacation_hours: float
+    total_vacation_pay: float
+    vacation_entries: List[VacationTimeEntry]
+    message: str
 
 # --- Helper Functions ---
 
@@ -1216,3 +1241,66 @@ async def debug_weekly_breakdown_punches(
         "punches": punch_data,
         "daily_calculations": daily_calculations
     }
+
+@router.get("/vacation", response_model=UserVacationSummaryResponse)
+async def get_user_vacation_time(
+    session: Session = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+):
+    """Get user's vacation time entries with optional date filtering"""
+    user_id = current_user["uid"]
+    
+    # Build query
+    query = select(VacationTime).where(VacationTime.employee_id == user_id)
+    
+    # Apply date filters if provided
+    if start_date:
+        query = query.where(VacationTime.date >= start_date)
+    
+    if end_date:
+        query = query.where(VacationTime.date <= end_date)
+    
+    # Execute query
+    vacation_entries = session.exec(
+        query.order_by(VacationTime.date.desc())
+    ).all()
+    
+    # Get user's hourly wage from Firebase
+    user_profile_ref = firestore_db.collection("users").document(user_id)
+    user_profile_doc = user_profile_ref.get()
+    hourly_wage = 0.0
+    
+    if user_profile_doc.exists:
+        user_data = user_profile_doc.to_dict()
+        hourly_wage = user_data.get("hourlyWage", 0.0)
+        hourly_wage = float(hourly_wage) if hourly_wage else 0.0
+    
+    # Calculate totals and format entries
+    total_hours = 0.0
+    total_pay = 0.0
+    formatted_entries = []
+    
+    for entry in vacation_entries:
+        vacation_pay = entry.hours * hourly_wage
+        total_hours += entry.hours
+        total_pay += vacation_pay
+        
+        formatted_entries.append(VacationTimeEntry(
+            id=entry.id,
+            date=entry.date,
+            hours=entry.hours,
+            vacation_type=entry.vacation_type.value,
+            notes=entry.notes,
+            created_at=entry.created_at,
+            hourly_wage=hourly_wage,
+            vacation_pay=round(vacation_pay, 2)
+        ))
+    
+    return UserVacationSummaryResponse(
+        total_vacation_hours=total_hours,
+        total_vacation_pay=round(total_pay, 2),
+        vacation_entries=formatted_entries,
+        message=f"Found {len(vacation_entries)} vacation entries totaling {total_hours} hours worth ${round(total_pay, 2)}"
+    )

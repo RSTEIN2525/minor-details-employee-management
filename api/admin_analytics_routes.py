@@ -8,6 +8,7 @@ from core.deps import require_admin_role, get_current_user
 from core.firebase import db as firestore_db
 from models.time_log import TimeLog, PunchType
 from models.shop import Shop
+from models.vacation_time import VacationTime
 from collections import defaultdict
 from utils.datetime_helpers import format_utc_datetime
 
@@ -89,6 +90,7 @@ class WeekSummary(BaseModel):
     regular_hours: float
     overtime_hours: float
     total_pay: float
+    vacation_hours: float = 0.0
     is_current_week: bool
 
 class TodaysSummary(BaseModel):
@@ -97,6 +99,7 @@ class TodaysSummary(BaseModel):
     regular_hours: float
     overtime_hours: float
     total_pay: float
+    vacation_hours: float = 0.0
     is_currently_clocked_in: bool
 
 class EmployeeDetailResponse(BaseModel):
@@ -278,6 +281,17 @@ async def is_employee_currently_active(session: Session, employee_id: str, deale
         return True, ts
     else:
         return False, None
+
+async def calculate_vacation_hours(session: Session, employee_id: str, start_date: date, end_date: date) -> float:
+    """Calculate total vacation hours for an employee within a date range."""
+    vacation_entries = session.exec(
+        select(VacationTime)
+        .where(VacationTime.employee_id == employee_id)
+        .where(VacationTime.date >= start_date)
+        .where(VacationTime.date <= end_date)
+    ).all()
+    
+    return sum(entry.hours for entry in vacation_entries)
 
 # --- API Endpoints ---
 
@@ -1092,6 +1106,11 @@ async def get_employee_details(
     todays_regular, todays_overtime = calculate_regular_and_overtime_hours(todays_hours)
     todays_pay = calculate_pay_with_overtime(todays_regular, todays_overtime, hourly_wage)
 
+    # Calculate vacation hours for each period
+    prev_week_vacation_hours = await calculate_vacation_hours(session, employee_id, prev_week_start, prev_week_end)
+    current_week_vacation_hours = await calculate_vacation_hours(session, employee_id, current_week_start, current_week_end)
+    todays_vacation_hours = await calculate_vacation_hours(session, employee_id, today, today)
+
     # Create week summaries
     week_summaries = [
         WeekSummary(
@@ -1101,6 +1120,7 @@ async def get_employee_details(
             regular_hours=round(prev_week_regular, 2),
             overtime_hours=round(prev_week_overtime, 2),
             total_pay=round(prev_week_pay, 2),
+            vacation_hours=round(prev_week_vacation_hours, 2),
             is_current_week=False
         ),
         WeekSummary(
@@ -1110,6 +1130,7 @@ async def get_employee_details(
             regular_hours=round(current_week_regular, 2),
             overtime_hours=round(current_week_overtime, 2),
             total_pay=round(current_week_pay, 2),
+            vacation_hours=round(current_week_vacation_hours, 2),
             is_current_week=True
         )
     ]
@@ -1129,6 +1150,7 @@ async def get_employee_details(
             regular_hours=round(todays_regular, 2),
             overtime_hours=round(todays_overtime, 2),
             total_pay=round(todays_pay, 2),
+            vacation_hours=round(todays_vacation_hours, 2),
             is_currently_clocked_in=is_currently_clocked_in
         ),
         two_week_total_pay=round(two_week_total_pay, 2)

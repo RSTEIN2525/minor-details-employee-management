@@ -7,6 +7,8 @@ import models.shop
 import models.clock_request_log # Ensure this model is known by SQLModel for table creation
 import models.admin_time_change # New model for tracking admin time changes
 import models.device_photo # New model for device photos stored in database
+import models.vacation_time # New model for vacation time tracking
+import models.shift_change # Ensure this model is known by SQLModel for table creation
 from db.session import engine
 from contextlib import asynccontextmanager
 from api.time_routes import router as time_router
@@ -20,6 +22,7 @@ from api.admin_clock_request_routes import router as admin_clock_request_router
 from api.admin_analytics_routes import router as admin_analytics_router
 from api.admin_time_routes import router as admin_time_router
 from api.admin_injury_routes import router as admin_injury_router
+from api.admin_vacation_routes import router as admin_vacation_router
 from api.shop_routes import router as shop_router
 import logging # Add this import
 import os
@@ -84,4 +87,5 @@ app.include_router(admin_clock_request_router, prefix="/admin/clock-requests", t
 app.include_router(admin_analytics_router, prefix="/admin/analytics", tags=["Admin", "Labor Analytics"])
 app.include_router(admin_time_router, prefix="/admin/time", tags=["Admin", "Direct Time Management"])
 app.include_router(admin_injury_router, prefix="/admin/injury", tags=["Admin", "Injury Reports"])
+app.include_router(admin_vacation_router, prefix="/admin/vacation", tags=["Admin", "Vacation Management"])
 app.include_router(shop_router, prefix="/shops", tags=["Shops", "Geofence"])
