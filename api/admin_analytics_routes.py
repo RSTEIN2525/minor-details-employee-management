@@ -262,6 +262,22 @@ class QuickLaborPreview(BaseModel):
         """Ensure timestamp is formatted as UTC with Z suffix"""
         return format_utc_datetime(dt)
 
+# All Dealerships Labor Cost Model
+class DealershipLaborCost(BaseModel):
+    dealership_id: str
+    total_labor_cost_today: float
+
+class AllDealershipsLaborCostResponse(BaseModel):
+    analysis_date: str  # ISO date string
+    total_company_labor_cost: float
+    dealerships: List[DealershipLaborCost]
+    analysis_time: datetime
+    
+    @field_serializer('analysis_time')
+    def serialize_analysis_time(self, dt: datetime) -> str:
+        """Ensure timestamp is formatted as UTC with Z suffix"""
+        return format_utc_datetime(dt)
+
 # --- Helper Functions ---
 
 async def get_user_details(user_id: str) -> Dict[str, Any]:
@@ -2010,4 +2026,124 @@ async def get_labor_preview(
         current_hourly_burn_rate=current_burn_rate,
         average_cost_per_employee_today=average_cost_per_employee,
         projected_daily_cost=projected_daily_cost
+    )
+
+@router.get("/all-dealerships/labor-costs-today", response_model=AllDealershipsLaborCostResponse)
+async def get_all_dealerships_labor_costs_today(
+    session: Session = Depends(get_session),
+    admin_user: dict = Depends(require_admin_role)
+):
+    """
+    Get today's total labor costs for ALL dealerships.
+    
+    Super lightweight endpoint that returns just the money spent on labor today
+    for each dealership. Perfect for company-wide dashboard overview.
+    
+    Returns:
+    - Each dealership's total labor cost today (work + vacation)
+    - Company-wide total
+    - Current timestamp
+    """
+    print(f"\n--- Getting labor costs for all dealerships ---")
+    
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    start_of_today = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
+    end_of_today = datetime.combine(today, datetime.max.time()).replace(tzinfo=timezone.utc)
+    
+    # Get all dealerships
+    dealerships_ref = firestore_db.collection("dealerships").stream()
+    dealership_ids = [doc.id for doc in dealerships_ref]
+    
+    print(f"Found {len(dealership_ids)} dealerships to analyze")
+    
+    # Get all employees with their wages (do this once)
+    users_ref = firestore_db.collection("users").where("role", "==", "employee").stream()
+    employee_wages = {}
+    for doc in users_ref:
+        user_data = doc.to_dict()
+        employee_id = doc.id
+        hourly_wage = float(user_data.get("hourlyWage", 0.0)) if user_data.get("hourlyWage") else 0.0
+        employee_wages[employee_id] = hourly_wage
+    
+    # Get all time logs for today (all dealerships)
+    all_today_logs = session.exec(
+        select(TimeLog)
+        .where(TimeLog.timestamp >= start_of_today)
+        .where(TimeLog.timestamp <= end_of_today)
+        .order_by(TimeLog.timestamp.asc())
+    ).all()
+    
+    # Get all vacation for today (all dealerships)
+    all_vacation_today = session.exec(
+        select(VacationTime)
+        .where(VacationTime.date == today)
+    ).all()
+    
+    print(f"Found {len(all_today_logs)} total time logs and {len(all_vacation_today)} vacation entries for today")
+    
+    # Group data by dealership
+    dealership_logs = {}
+    dealership_vacation = {}
+    
+    for log in all_today_logs:
+        if log.dealership_id not in dealership_logs:
+            dealership_logs[log.dealership_id] = []
+        dealership_logs[log.dealership_id].append(log)
+    
+    for vacation in all_vacation_today:
+        if vacation.dealership_id not in dealership_vacation:
+            dealership_vacation[vacation.dealership_id] = []
+        dealership_vacation[vacation.dealership_id].append(vacation)
+    
+    # Calculate costs for each dealership
+    dealership_costs = []
+    total_company_cost = 0.0
+    
+    for dealership_id in dealership_ids:
+        dealership_total_cost = 0.0
+        
+        # Calculate work costs
+        logs = dealership_logs.get(dealership_id, [])
+        if logs:
+            # Group by employee
+            employee_logs = {}
+            for log in logs:
+                if log.employee_id not in employee_logs:
+                    employee_logs[log.employee_id] = []
+                employee_logs[log.employee_id].append(log)
+            
+            # Calculate cost for each employee
+            for employee_id, emp_logs in employee_logs.items():
+                hourly_wage = employee_wages.get(employee_id, 0.0)
+                hours_worked = calculate_hours_from_logs(emp_logs, now)
+                regular_hours, overtime_hours = calculate_regular_and_overtime_hours(hours_worked)
+                cost = calculate_pay_with_overtime(regular_hours, overtime_hours, hourly_wage)
+                dealership_total_cost += cost
+        
+        # Calculate vacation costs
+        vacations = dealership_vacation.get(dealership_id, [])
+        for vacation in vacations:
+            hourly_wage = employee_wages.get(vacation.employee_id, 0.0)
+            vacation_cost = vacation.hours * hourly_wage
+            dealership_total_cost += vacation_cost
+        
+        dealership_costs.append(DealershipLaborCost(
+            dealership_id=dealership_id,
+            total_labor_cost_today=dealership_total_cost
+        ))
+        total_company_cost += dealership_total_cost
+        
+        print(f"Dealership {dealership_id}: ${dealership_total_cost:.2f}")
+    
+    # Sort by cost (highest first)
+    dealership_costs.sort(key=lambda x: x.total_labor_cost_today, reverse=True)
+    
+    print(f"Total company labor cost today: ${total_company_cost:.2f}")
+    
+    return AllDealershipsLaborCostResponse(
+        analysis_date=today.isoformat(),
+        total_company_labor_cost=total_company_cost,
+        dealerships=dealership_costs,
+        analysis_time=now
     )
