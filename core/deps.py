@@ -105,8 +105,13 @@ async def get_current_user(
         print(f"⚠️ NO DEVICE ID: X-Device-Id header not provided by client for user {uid}")
 
     # 4) Extract their shops list
-    raw = profile.get("dealerships", "")  # Firestore field name
-    dealerships = [s.strip() for s in raw.split(",") if s.strip()]
+    # Get the raw strings from both Firestore fields
+    raw_dealerships = profile.get("dealerships", "")
+    raw_time_clock_dealerships = profile.get("timeClockDealerships", "")
+
+    # Combine the strings, then split, strip, and find unique values
+    combined_raw = raw_dealerships + "," + raw_time_clock_dealerships
+    dealerships = list(set(s.strip() for s in combined_raw.split(",") if s.strip()))
 
     # Extract Critical Information
     name = profile.get("displayName", "")
