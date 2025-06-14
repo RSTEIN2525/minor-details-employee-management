@@ -11,6 +11,7 @@ from models.shop import Shop
 from models.vacation_time import VacationTime
 from collections import defaultdict
 from utils.datetime_helpers import format_utc_datetime
+from utils.breaks import apply_unpaid_break
 
 router = APIRouter()
 
@@ -341,14 +342,16 @@ async def calculate_todays_hours_and_status(session: Session, employee_id: str) 
         if clock.punch_type == PunchType.CLOCK_IN:
             clock_in_time = ts
         elif clock.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-            duration_hours = (ts - clock_in_time).total_seconds() / 3600
-            total_hours += duration_hours
+            raw_hours = (ts - clock_in_time).total_seconds() / 3600
+            paid_hours = apply_unpaid_break(raw_hours)
+            total_hours += paid_hours
             clock_in_time = None
     
     # If still clocked in, add time until now and set status
     if clock_in_time:
-        duration_hours = (now - clock_in_time).total_seconds() / 3600
-        total_hours += duration_hours
+        raw_hours = (now - clock_in_time).total_seconds() / 3600
+        paid_hours = apply_unpaid_break(raw_hours)
+        total_hours += paid_hours
         is_currently_clocked_in = True
     
     return total_hours, is_currently_clocked_in
@@ -382,16 +385,18 @@ async def calculate_weekly_hours(session: Session, employee_id: str) -> float:
             clock_in_time = punch_ts
         elif punch.punch_type == PunchType.CLOCK_OUT and clock_in_time:
             # clock_in_time is already UTC aware from previous assignment or loop
-            duration = (punch_ts - clock_in_time).total_seconds() / 3600
-            total_hours += duration
+            raw_hours = (punch_ts - clock_in_time).total_seconds() / 3600
+            paid_hours = apply_unpaid_break(raw_hours)
+            total_hours += paid_hours
             clock_in_time = None
     
     # If still clocked in, add time until now
     if clock_in_time:
         # clock_in_time is already UTC aware
         now = datetime.now(timezone.utc)
-        duration = (now - clock_in_time).total_seconds() / 3600
-        total_hours += duration
+        raw_hours = (now - clock_in_time).total_seconds() / 3600
+        paid_hours = apply_unpaid_break(raw_hours)
+        total_hours += paid_hours
     
     return total_hours
 
@@ -514,12 +519,13 @@ async def get_enhanced_daily_labor_spend(
                     clock_in_time = log_ts
                     employee_had_activity = True
                 elif log.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-                    duration_hours = (log_ts - clock_in_time).total_seconds() / 3600
-                    spend = duration_hours * hourly_wage
+                    raw_hours = (log_ts - clock_in_time).total_seconds() / 3600
+                    paid_hours = apply_unpaid_break(raw_hours)
+                    spend = paid_hours * hourly_wage
                     
                     # Add to dealership totals
                     dealership_labor_spend += spend
-                    dealership_hours += duration_hours
+                    dealership_hours += paid_hours
                     
                     # Add to hourly breakdown
                     shift_start_hour = clock_in_time.hour
@@ -548,12 +554,13 @@ async def get_enhanced_daily_labor_spend(
                 end_time = min(now, end_of_day)
                 
                 if end_time > clock_in_time:
-                    duration_hours = (end_time - clock_in_time).total_seconds() / 3600
-                    spend = duration_hours * hourly_wage
+                    raw_hours = (end_time - clock_in_time).total_seconds() / 3600
+                    paid_hours = apply_unpaid_break(raw_hours)
+                    spend = paid_hours * hourly_wage
                     
                     # Add to dealership totals
                     dealership_labor_spend += spend
-                    dealership_hours += duration_hours
+                    dealership_hours += paid_hours
                     
                     # Add to hourly breakdown for active shift
                     shift_start_hour = clock_in_time.hour
@@ -677,16 +684,17 @@ async def get_daily_labor_spend(
                     employee_had_activity = True
                 elif log.punch_type == PunchType.CLOCK_OUT and clock_in_time:
                     # clock_in_time is already UTC aware
-                    duration_hours = (log_ts - clock_in_time).total_seconds() / 3600
-                    spend = duration_hours * hourly_wage
+                    raw_hours = (log_ts - clock_in_time).total_seconds() / 3600
+                    paid_hours = apply_unpaid_break(raw_hours)
+                    spend = paid_hours * hourly_wage
                     
                     # Add to totals
                     total_labor_spend += spend
-                    total_hours += duration_hours
+                    total_hours += paid_hours
                     
                     # Add to dealership breakdown
                     dealership_breakdown[dealership_id]["spend"] += spend
-                    dealership_breakdown[dealership_id]["hours"] += duration_hours
+                    dealership_breakdown[dealership_id]["hours"] += paid_hours
                     
                     # Add to hourly breakdown
                     # For each hour of the shift, distribute the labor spend proportionally
@@ -718,16 +726,17 @@ async def get_daily_labor_spend(
                 end_time = min(now, end_of_day)
                 
                 if end_time > clock_in_time:
-                    duration_hours = (end_time - clock_in_time).total_seconds() / 3600
-                    spend = duration_hours * hourly_wage
+                    raw_hours = (end_time - clock_in_time).total_seconds() / 3600
+                    paid_hours = apply_unpaid_break(raw_hours)
+                    spend = paid_hours * hourly_wage
                     
                     # Add to totals
                     total_labor_spend += spend
-                    total_hours += duration_hours
+                    total_hours += paid_hours
                     
                     # Add to dealership breakdown
                     dealership_breakdown[dealership_id]["spend"] += spend
-                    dealership_breakdown[dealership_id]["hours"] += duration_hours
+                    dealership_breakdown[dealership_id]["hours"] += paid_hours
                     
                     # Add to hourly breakdown for active shift
                     shift_start_hour = clock_in_time.hour
@@ -836,9 +845,10 @@ async def get_dealership_labor_spend(
                 clock_in_time = log_ts
             elif log.punch_type == PunchType.CLOCK_OUT and clock_in_time:
                 # clock_in_time is already UTC aware
-                duration_hours = (log_ts - clock_in_time).total_seconds() / 3600
-                total_labor_spend += duration_hours * hourly_wage
-                total_hours += duration_hours
+                raw_hours = (log_ts - clock_in_time).total_seconds() / 3600
+                paid_hours = apply_unpaid_break(raw_hours)
+                total_labor_spend += paid_hours * hourly_wage
+                total_hours += paid_hours
                 clock_in_time = None
         
         # Handle active shifts (if employee is still clocked in at this dealership)
@@ -848,9 +858,10 @@ async def get_dealership_labor_spend(
             end_time = min(now, end_of_day)
             
             if end_time > clock_in_time:
-                duration_hours = (end_time - clock_in_time).total_seconds() / 3600
-                total_labor_spend += duration_hours * hourly_wage
-                total_hours += duration_hours
+                raw_hours = (end_time - clock_in_time).total_seconds() / 3600
+                paid_hours = apply_unpaid_break(raw_hours)
+                total_labor_spend += paid_hours * hourly_wage
+                total_hours += paid_hours
     
     return DealershipLaborSpend(
         dealership_id=dealership_id,
@@ -945,18 +956,21 @@ async def get_active_employees_by_dealership(
                 if punch.punch_type == PunchType.CLOCK_IN:
                     current_shift_clock_in_time = punch_ts
                 elif punch.punch_type == PunchType.CLOCK_OUT and current_shift_clock_in_time:
-                    duration_hours = (punch_ts - current_shift_clock_in_time).total_seconds() / 3600
-                    today_labor_spend += duration_hours * hourly_wage
+                    raw_hours = (punch_ts - current_shift_clock_in_time).total_seconds() / 3600
+                    paid_hours = apply_unpaid_break(raw_hours)
+                    today_labor_spend += paid_hours * hourly_wage
                     current_shift_clock_in_time = None
             
             # Add current open shift (if the active clock-in was today)
             if current_shift_clock_in_time:
-                duration_hours = (now - current_shift_clock_in_time).total_seconds() / 3600
-                today_labor_spend += duration_hours * hourly_wage
+                raw_hours = (now - current_shift_clock_in_time).total_seconds() / 3600
+                paid_hours = apply_unpaid_break(raw_hours)
+                today_labor_spend += paid_hours * hourly_wage
             elif most_recent_clock_in_ts >= start_of_day:
                 # The active clock-in was today but not captured in today's clocks (edge case)
-                duration_hours = (now - most_recent_clock_in_ts).total_seconds() / 3600
-                today_labor_spend += duration_hours * hourly_wage
+                raw_hours = (now - most_recent_clock_in_ts).total_seconds() / 3600
+                paid_hours = apply_unpaid_break(raw_hours)
+                today_labor_spend += paid_hours * hourly_wage
             
             total_labor_spend_today += today_labor_spend
             total_current_hourly_rate += hourly_wage
@@ -1089,17 +1103,18 @@ async def get_weekly_labor_spend(
                     clock_in_time = log_ts
                 elif log.punch_type == PunchType.CLOCK_OUT and clock_in_time:
                     # clock_in_time is already UTC aware
-                    duration_hours = (log_ts - clock_in_time).total_seconds() / 3600
+                    raw_hours = (log_ts - clock_in_time).total_seconds() / 3600
+                    paid_hours = apply_unpaid_break(raw_hours)
                     
                     # Apply overtime rate for hours > 40 in the week
                     # This is a simplified approach; in a real system you'd track
                     # cumulative hours throughout the week more precisely
                     if employee_logs[employee_id].index(log) > 8:  # Rough approximation of 40 hours
-                        total_labor_spend += duration_hours * hourly_wage * 1.5
+                        total_labor_spend += paid_hours * hourly_wage * 1.5
                     else:
-                        total_labor_spend += duration_hours * hourly_wage
+                        total_labor_spend += paid_hours * hourly_wage
                         
-                    total_hours += duration_hours
+                    total_hours += paid_hours
                     clock_in_time = None
         
         dealership_labor_spend.append(
@@ -1203,14 +1218,16 @@ async def get_employee_details(
         if clock.punch_type == PunchType.CLOCK_IN:
             clock_in_time = ts
         elif clock.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-            duration_hours = (ts - clock_in_time).total_seconds() / 3600
-            current_week_hours += duration_hours
+            raw_hours = (ts - clock_in_time).total_seconds() / 3600
+            paid_hours = apply_unpaid_break(raw_hours)
+            current_week_hours += paid_hours
             clock_in_time = None
     
     # If still clocked in, add time until now
     if clock_in_time:
-        duration_hours = (now - clock_in_time).total_seconds() / 3600
-        current_week_hours += duration_hours
+        raw_hours = (now - clock_in_time).total_seconds() / 3600
+        paid_hours = apply_unpaid_break(raw_hours)
+        current_week_hours += paid_hours
     
     current_week_pay = current_week_hours * hourly_wage
     
@@ -1237,8 +1254,9 @@ async def get_employee_details(
         if clock.punch_type == PunchType.CLOCK_IN:
             clock_in_time = ts
         elif clock.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-            duration_hours = (ts - clock_in_time).total_seconds() / 3600
-            prev_week_hours += duration_hours
+            raw_hours = (ts - clock_in_time).total_seconds() / 3600
+            paid_hours = apply_unpaid_break(raw_hours)
+            prev_week_hours += paid_hours
             clock_in_time = None
     
     prev_week_pay = prev_week_hours * hourly_wage
@@ -1420,20 +1438,22 @@ async def get_all_employees_details(
             if clock.punch_type == PunchType.CLOCK_IN:
                 clock_in_time = ts
             elif clock.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-                duration_hours = (ts - clock_in_time).total_seconds() / 3600
+                raw_hours = (ts - clock_in_time).total_seconds() / 3600
+                paid_hours = apply_unpaid_break(raw_hours)
                 
                 # Determine which week this duration belongs to
                 if current_week_start_dt <= ts <= current_week_end_dt:
-                    current_week_hours += duration_hours
+                    current_week_hours += paid_hours
                 elif prev_week_start_dt <= ts <= prev_week_end_dt:
-                    prev_week_hours += duration_hours
+                    prev_week_hours += paid_hours
                 
                 clock_in_time = None
         
         # If still clocked in during current week
         if clock_in_time and current_week_start_dt <= clock_in_time <= current_week_end_dt:
-            duration_hours = (now - clock_in_time).total_seconds() / 3600
-            current_week_hours += duration_hours
+            raw_hours = (now - clock_in_time).total_seconds() / 3600
+            paid_hours = apply_unpaid_break(raw_hours)
+            current_week_hours += paid_hours
         
         current_week_pay = current_week_hours * hourly_wage
         prev_week_pay = prev_week_hours * hourly_wage
@@ -1583,16 +1603,18 @@ async def get_dealership_employee_hours_breakdown(
             if log.punch_type == PunchType.CLOCK_IN:
                 clock_in_time = log_ts
             elif log.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-                duration_hours = (log_ts - clock_in_time).total_seconds() / 3600
-                total_hours_worked += duration_hours
+                raw_hours = (log_ts - clock_in_time).total_seconds() / 3600
+                paid_hours = apply_unpaid_break(raw_hours)
+                total_hours_worked += paid_hours
                 clock_in_time = None
         
         # If still clocked in within our date range
         if clock_in_time and clock_in_time <= end_datetime:
             # Calculate duration until end of period or current time (whichever is earlier)
             end_time = min(now, end_datetime)
-            duration_hours = (end_time - clock_in_time).total_seconds() / 3600
-            total_hours_worked += duration_hours
+            raw_hours = (end_time - clock_in_time).total_seconds() / 3600
+            paid_hours = apply_unpaid_break(raw_hours)
+            total_hours_worked += paid_hours
         
         # Calculate regular vs overtime hours
         regular_hours, overtime_hours = calculate_regular_and_overtime_hours(total_hours_worked)
@@ -1911,14 +1933,16 @@ def calculate_hours_from_logs(logs: List[TimeLog], current_time: datetime) -> fl
         if log.punch_type == PunchType.CLOCK_IN:
             clock_in_time = log_ts
         elif log.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-            duration_hours = (log_ts - clock_in_time).total_seconds() / 3600
-            total_hours += duration_hours
+            raw_hours = (log_ts - clock_in_time).total_seconds() / 3600
+            paid_hours = apply_unpaid_break(raw_hours)
+            total_hours += paid_hours
             clock_in_time = None
     
     # If still clocked in, add time until current_time
     if clock_in_time:
-        duration_hours = (current_time - clock_in_time).total_seconds() / 3600
-        total_hours += duration_hours
+        raw_hours = (current_time - clock_in_time).total_seconds() / 3600
+        paid_hours = apply_unpaid_break(raw_hours)
+        total_hours += paid_hours
     
     return total_hours
 
