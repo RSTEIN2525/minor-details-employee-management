@@ -1681,6 +1681,27 @@ async def get_comprehensive_labor_spend(
     all_employees = {}
     for doc in users_ref:
         user_data = doc.to_dict()
+        # --- Dealership assignment check ---
+        # Parse "dealerships" field
+        raw_dealerships = user_data.get("dealerships", "")
+        if isinstance(raw_dealerships, list):
+            employee_dealerships = [str(d).strip() for d in raw_dealerships]
+        else:
+            employee_dealerships = [s.strip() for s in str(raw_dealerships).split(",") if s.strip()]
+
+        # Parse optional "timeClockDealerships" field (same format)
+        raw_tc_dealers = user_data.get("timeClockDealerships", "")
+        if isinstance(raw_tc_dealers, list):
+            time_clock_dealerships = [str(d).strip() for d in raw_tc_dealers]
+        else:
+            time_clock_dealerships = [s.strip() for s in str(raw_tc_dealers).split(",") if s.strip()]
+
+        combined_dealerships = set(employee_dealerships) | set(time_clock_dealerships)
+
+        # Skip employees not assigned to this dealership
+        if dealership_id not in combined_dealerships:
+            continue
+
         employee_id = doc.id
         all_employees[employee_id] = {
             "name": user_data.get("displayName", "Unknown"),
