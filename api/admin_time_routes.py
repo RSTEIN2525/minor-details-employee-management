@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
 from typing import List, Optional
 from datetime import datetime, timezone, time, date
-import pytz
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from models.time_log import TimeLog, PunchType
 from models.admin_time_change import AdminTimeChange, AdminTimeChangeAction
@@ -41,6 +41,15 @@ class AdminClockDeleteRequestPayload(BaseModel):
     clock_out_timelog_id: int
     reason: str
 
+# --- NEW: Single Clock Edit Payload ---
+class AdminSingleClockEditRequestPayload(BaseModel):
+    employee_id: str
+    timelog_id: int            # ID of the clock punch (either clock-in or clock-out)
+    day_of_punch: date         # Date of the punch
+    new_time: str              # HH:MM format (Eastern)
+    dealership_id: str         # Dealership ID for the punch (can stay the same or change)
+    reason: str
+
 # --- Helper function to combine date and time string --- 
 def combine_date_time_str(punch_date: date, time_str: str) -> datetime:
     """
@@ -49,15 +58,17 @@ def combine_date_time_str(punch_date: date, time_str: str) -> datetime:
     try:
         parsed_time = time.fromisoformat(time_str) # Expects HH:MM or HH:MM:SS
         
-        # Create datetime object in EST/EDT timezone
-        eastern = pytz.timezone('US/Eastern')
-        dt_naive = datetime.combine(punch_date, parsed_time)
-        
-        # Localize to Eastern timezone (handles EST/EDT automatically)
-        dt_eastern = eastern.localize(dt_naive)
+        # Create datetime object in Eastern timezone (handles EST/EDT).
+        # Use canonical name; fall back to legacy alias if necessary.
+        try:
+            eastern = ZoneInfo('America/New_York')
+        except ZoneInfoNotFoundError:
+            eastern = ZoneInfo('US/Eastern')
+        # Build aware datetime directly with Eastern tzinfo
+        dt_eastern = datetime.combine(punch_date, parsed_time, tzinfo=eastern)
         
         # Convert to UTC for database storage
-        dt_utc = dt_eastern.astimezone(pytz.UTC)
+        dt_utc = dt_eastern.astimezone(timezone.utc)
         
         return dt_utc
         
@@ -324,6 +335,98 @@ def admin_direct_clock_edit(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
             detail=f"An unexpected error occurred while editing clock entry: {str(e)}"
         )
+
+@router.post("/direct-single-clock-edit")
+def admin_direct_single_clock_edit(
+    payload: AdminSingleClockEditRequestPayload,
+    session: Session = Depends(get_session),
+    admin: dict = Depends(require_admin_role),
+):
+    """
+    Admin endpoint to edit a **single** existing clock punch (either CLOCK_IN or CLOCK_OUT).
+
+    Example use-cases:
+    • Change an 8:23 AM CLOCK_IN to 8:45 AM.
+    • Change a 9:00 PM CLOCK_OUT to 8:15 PM.
+    """
+    # Validate admin permissions
+    validate_employee_permissions(admin, payload.employee_id)
+
+    # Parse new timestamp
+    new_timestamp = combine_date_time_str(payload.day_of_punch, payload.new_time)
+
+    admin_uid = admin.get("uid", "unknown_admin")
+
+    # Fetch the punch to edit
+    punch = session.get(TimeLog, payload.timelog_id)
+    if not punch:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"TimeLog ID {payload.timelog_id} not found")
+
+    if punch.employee_id != payload.employee_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="TimeLog does not belong to specified employee")
+
+    # Store originals for response/logging
+    original_timestamp = punch.timestamp
+    original_dealership = punch.dealership_id
+
+    try:
+        # Update punch
+        punch.timestamp = new_timestamp
+        punch.dealership_id = payload.dealership_id
+        punch.admin_notes = payload.reason
+        punch.admin_modifier_id = admin_uid
+        session.add(punch)
+        session.commit()
+        session.refresh(punch)
+
+        # Log admin change
+        change_kwargs = dict(
+            admin_id=admin_uid,
+            employee_id=payload.employee_id,
+            action=AdminTimeChangeAction.EDIT,
+            reason=payload.reason,
+            dealership_id=payload.dealership_id,
+            punch_date=payload.day_of_punch.isoformat(),
+        )
+
+        if punch.punch_type == PunchType.CLOCK_IN:
+            change_kwargs.update(
+                clock_in_id=punch.id,
+                start_time=new_timestamp,
+                original_start_time=original_timestamp,
+            )
+        else:
+            change_kwargs.update(
+                clock_out_id=punch.id,
+                end_time=new_timestamp,
+                original_end_time=original_timestamp,
+            )
+
+        admin_change = AdminTimeChange(**change_kwargs)
+        session.add(admin_change)
+        session.commit()
+
+        return {
+            "success": True,
+            "message": "Punch updated successfully",
+            "timelog_id": punch.id,
+            "employee_id": payload.employee_id,
+            "punch_type": punch.punch_type,
+            "original_timestamp": format_utc_datetime(original_timestamp),
+            "new_timestamp": format_utc_datetime(new_timestamp),
+            "original_dealership": original_dealership,
+            "new_dealership": payload.dealership_id,
+            "reason": payload.reason,
+            "edited_by_admin": admin_uid,
+        }
+
+    except HTTPException as e:
+        session.rollback()
+        raise e
+    except Exception as e:
+        session.rollback()
+        print(f"Error during single clock edit: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected error while editing punch")
 
 # --- Helper endpoint for frontend to get employee's recent punches ---
 
