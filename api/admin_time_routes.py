@@ -50,6 +50,21 @@ class AdminSingleClockEditRequestPayload(BaseModel):
     dealership_id: str         # Dealership ID for the punch (can stay the same or change)
     reason: str
 
+# --- NEW: Single Clock Create Payload ---
+class AdminSingleClockCreateRequestPayload(BaseModel):
+    employee_id: str
+    day_of_punch: date  # Date of the punch
+    time: str           # HH:MM format (Eastern)
+    punch_type: PunchType  # Either PunchType.CLOCK_IN or PunchType.CLOCK_OUT
+    dealership_id: str
+    reason: str
+
+# --- NEW: Single Clock Delete Payload ---
+class AdminSingleClockDeleteRequestPayload(BaseModel):
+    employee_id: str
+    timelog_id: int          # ID of the clock punch to delete
+    reason: str
+
 # --- Helper function to combine date and time string --- 
 def combine_date_time_str(punch_date: date, time_str: str) -> datetime:
     """
@@ -427,6 +442,143 @@ def admin_direct_single_clock_edit(
         session.rollback()
         print(f"Error during single clock edit: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected error while editing punch")
+
+@router.post("/direct-single-clock-creation")
+def admin_direct_single_clock_creation(
+    payload: AdminSingleClockCreateRequestPayload,
+    session: Session = Depends(get_session),
+    admin: dict = Depends(require_admin_role),
+):
+    """
+    Admin endpoint to create a **single** clock punch (either CLOCK_IN or CLOCK_OUT).
+
+    The admin must specify the punch_type so the system knows whether this is a clock-in or clock-out.
+    """
+    # Validate admin permissions
+    validate_employee_permissions(admin, payload.employee_id)
+
+    # Parse timestamp
+    new_timestamp = combine_date_time_str(payload.day_of_punch, payload.time)
+
+    admin_uid = admin.get("uid", "unknown_admin")
+
+    try:
+        # Create the punch
+        new_punch = TimeLog(
+            employee_id=payload.employee_id,
+            dealership_id=payload.dealership_id,
+            punch_type=payload.punch_type,
+            timestamp=new_timestamp,
+            admin_notes=payload.reason,
+            admin_modifier_id=admin_uid,
+        )
+        session.add(new_punch)
+        session.commit()
+        session.refresh(new_punch)
+
+        # Log admin action
+        change_kwargs = dict(
+            admin_id=admin_uid,
+            employee_id=payload.employee_id,
+            action=AdminTimeChangeAction.CREATE,
+            reason=payload.reason,
+            dealership_id=payload.dealership_id,
+            punch_date=payload.day_of_punch.isoformat(),
+        )
+        if payload.punch_type == PunchType.CLOCK_IN:
+            change_kwargs.update(clock_in_id=new_punch.id, start_time=new_timestamp)
+        else:
+            change_kwargs.update(clock_out_id=new_punch.id, end_time=new_timestamp)
+
+        admin_change = AdminTimeChange(**change_kwargs)
+        session.add(admin_change)
+        session.commit()
+
+        return {
+            "success": True,
+            "message": "Punch created successfully",
+            "timelog_id": new_punch.id,
+            "employee_id": payload.employee_id,
+            "punch_type": payload.punch_type,
+            "timestamp": format_utc_datetime(new_timestamp),
+            "dealership_id": payload.dealership_id,
+            "reason": payload.reason,
+            "created_by_admin": admin_uid,
+        }
+
+    except Exception as e:
+        session.rollback()
+        print(f"Error during single clock creation: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected error while creating punch")
+
+@router.post("/direct-single-clock-delete")
+def admin_direct_single_clock_delete(
+    payload: AdminSingleClockDeleteRequestPayload,
+    session: Session = Depends(get_session),
+    admin: dict = Depends(require_admin_role),
+):
+    """
+    Admin endpoint to delete a **single** clock punch (either CLOCK_IN or CLOCK_OUT).
+    """
+    # Validate admin permissions
+    validate_employee_permissions(admin, payload.employee_id)
+
+    admin_uid = admin.get("uid", "unknown_admin")
+
+    # Fetch the punch
+    punch = session.get(TimeLog, payload.timelog_id)
+    if not punch:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"TimeLog ID {payload.timelog_id} not found")
+
+    if punch.employee_id != payload.employee_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="TimeLog does not belong to specified employee")
+
+    punch_type = punch.punch_type
+    punch_timestamp = punch.timestamp
+    dealership_id = punch.dealership_id
+    punch_date = punch.timestamp.date().isoformat()
+
+    try:
+        # Log admin action BEFORE deletion
+        change_kwargs = dict(
+            admin_id=admin_uid,
+            employee_id=payload.employee_id,
+            action=AdminTimeChangeAction.DELETE,
+            reason=payload.reason,
+            dealership_id=dealership_id,
+            punch_date=punch_date,
+        )
+        if punch_type == PunchType.CLOCK_IN:
+            change_kwargs.update(clock_in_id=punch.id, start_time=punch_timestamp)
+        else:
+            change_kwargs.update(clock_out_id=punch.id, end_time=punch_timestamp)
+
+        admin_change = AdminTimeChange(**change_kwargs)
+        session.add(admin_change)
+
+        # Delete the punch
+        session.delete(punch)
+        session.commit()
+
+        return {
+            "success": True,
+            "message": "Punch deleted successfully",
+            "deleted_timelog_id": payload.timelog_id,
+            "employee_id": payload.employee_id,
+            "punch_type": punch_type,
+            "timestamp": format_utc_datetime(punch_timestamp),
+            "dealership_id": dealership_id,
+            "reason": payload.reason,
+            "deleted_by_admin": admin_uid,
+        }
+
+    except HTTPException as e:
+        session.rollback()
+        raise e
+    except Exception as e:
+        session.rollback()
+        print(f"Error during single clock delete: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected error while deleting punch")
 
 # --- Helper endpoint for frontend to get employee's recent punches ---
 
