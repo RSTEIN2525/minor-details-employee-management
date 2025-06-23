@@ -8,12 +8,8 @@ from sqlalchemy import pool
 from alembic import context
 
 from sqlmodel import SQLModel
-from models.time_log import TimeLog
-from models.shift_change import ShiftChange
-import models.admin_time_change
-import models.clock_request_log
-import models.device_photo
-import models.shop
+# Import the models package to ensure all models are registered with SQLModel's metadata
+import models
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
