@@ -45,5 +45,8 @@ class AdminTimeChange(SQLModel, table=True):
     original_start_time: Optional[datetime] = None
     original_end_time: Optional[datetime] = None
     
+    # For dealership changes
+    original_dealership_id: Optional[str] = Field(default=None)
+    
     # Date of the punch being affected
     punch_date: Optional[str] = None  # YYYY-MM-DD format 

@@ -65,6 +65,13 @@ class AdminSingleClockDeleteRequestPayload(BaseModel):
     timelog_id: int          # ID of the clock punch to delete
     reason: str
 
+# --- NEW: Change Punch Dealership Payload ---
+class AdminChangePunchDealershipRequestPayload(BaseModel):
+    employee_id: str
+    timelog_id: int
+    new_dealership_id: str
+    reason: str
+
 # --- Helper function to combine date and time string --- 
 def combine_date_time_str(punch_date: date, time_str: str) -> datetime:
     """
@@ -579,6 +586,81 @@ def admin_direct_single_clock_delete(
         session.rollback()
         print(f"Error during single clock delete: {e}")
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected error while deleting punch")
+
+@router.post("/direct-change-punch-dealership")
+def admin_direct_change_punch_dealership(
+    payload: AdminChangePunchDealershipRequestPayload,
+    session: Session = Depends(get_session),
+    admin: dict = Depends(require_admin_role),
+):
+    """
+    Admin endpoint to change the dealership for a single existing clock punch.
+    """
+    # Validate admin permissions
+    validate_employee_permissions(admin, payload.employee_id)
+
+    admin_uid = admin.get("uid", "unknown_admin")
+
+    # Fetch the punch
+    punch = session.get(TimeLog, payload.timelog_id)
+    if not punch:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"TimeLog ID {payload.timelog_id} not found")
+
+    if punch.employee_id != payload.employee_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="TimeLog does not belong to specified employee")
+
+    original_dealership_id = punch.dealership_id
+
+    # Avoid unnecessary updates
+    if original_dealership_id == payload.new_dealership_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="New dealership is the same as the current one.")
+
+    try:
+        # Update the punch
+        punch.dealership_id = payload.new_dealership_id
+        punch.admin_notes = payload.reason
+        punch.admin_modifier_id = admin_uid
+        session.add(punch)
+
+        # Log the admin action
+        change_kwargs = dict(
+            admin_id=admin_uid,
+            employee_id=payload.employee_id,
+            action=AdminTimeChangeAction.EDIT,
+            reason=payload.reason,
+            dealership_id=payload.new_dealership_id,
+            original_dealership_id=original_dealership_id,
+            punch_date=punch.timestamp.date().isoformat()
+        )
+        if punch.punch_type == PunchType.CLOCK_IN:
+            change_kwargs.update(clock_in_id=punch.id, start_time=punch.timestamp)
+        else:
+            change_kwargs.update(clock_out_id=punch.id, end_time=punch.timestamp)
+
+        admin_change = AdminTimeChange(**change_kwargs)
+        session.add(admin_change)
+
+        session.commit()
+        session.refresh(punch)
+
+        return {
+            "success": True,
+            "message": "Punch dealership updated successfully",
+            "timelog_id": punch.id,
+            "employee_id": punch.employee_id,
+            "original_dealership_id": original_dealership_id,
+            "new_dealership_id": punch.dealership_id,
+            "reason": payload.reason,
+            "edited_by_admin": admin_uid
+        }
+
+    except HTTPException as e:
+        session.rollback()
+        raise e
+    except Exception as e:
+        session.rollback()
+        print(f"Error during punch dealership change: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected error while changing punch dealership")
 
 # --- Helper endpoint for frontend to get employee's recent punches ---
 
