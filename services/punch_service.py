@@ -22,6 +22,10 @@ class PunchService:
         safety_signature: Optional[str] = None,
     ):
 
+        # Capture the time of the request for consistency
+        request_time = datetime.now(timezone.utc)
+        response_message = None
+
         # 0) Must supply location
         if latitude is None or longitude is None:
             raise HTTPException(
@@ -78,20 +82,28 @@ class PunchService:
 
         # Punch Order Validation
         if last_punch:
-
-            # If you're last punch equals this attempted punch
             if last_punch.punch_type == punch_type:
-
-                # Return Error Response Code
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,  # 409 Conflict is suitable for state errors
-                    detail=f"Cannot {punch_type.value.replace('_', ' ')} twice in a row.",
-                )
+                # If trying to clock in while already clocked in, auto clock-out the previous shift
+                if punch_type == PunchType.CLOCK_IN:
+                    auto_clock_out = TimeLog(
+                        employee_id=employee_id,
+                        dealership_id=last_punch.dealership_id,
+                        punch_type=PunchType.CLOCK_OUT,
+                        timestamp=request_time,
+                        admin_notes="Auto clock-out due to new clock-in.",
+                        # No location data or injury report for an auto-generated punch
+                    )
+                    session.add(auto_clock_out)
+                    response_message = "Automatically clocked out previous shift."
+                # Otherwise, it's a double clock-out, which is an error
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="Cannot clock out twice in a row.",
+                    )
         else:
             # No Previous Punch Exists; There Must CLOCK_IN First
             if punch_type == PunchType.CLOCK_OUT:
-
-                # Return Error Response Code
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,  # 409 Conflict
                     detail="Cannot clock out before clocking in.",
@@ -104,7 +116,7 @@ class PunchService:
             punch_type=punch_type,
             latitude=latitude,
             longitude=longitude,
-            timestamp=datetime.now(timezone.utc),
+            timestamp=request_time, # Use consistent request time
             injured_at_work=injured_at_work if punch_type == PunchType.CLOCK_OUT else None,
             safety_signature=safety_signature.strip() if punch_type == PunchType.CLOCK_OUT and safety_signature else None,
         )
@@ -119,4 +131,8 @@ class PunchService:
         session.refresh(punch)
 
         # JSON Response back to Call
-        return {"status": "success", "data": punch}
+        response = {"status": "success", "data": punch}
+        if response_message:
+            response["message"] = response_message
+            
+        return response
