@@ -3,6 +3,7 @@ from sqlmodel import Session, select, func
 from pydantic import BaseModel, field_serializer
 from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime, date, timedelta, timezone
+from zoneinfo import ZoneInfo
 from db.session import get_session
 from core.deps import require_admin_role, get_current_user
 from core.firebase import db as firestore_db
@@ -1361,7 +1362,7 @@ async def get_all_employees_details(
     prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(tzinfo=timezone.utc)
     
     # Get all employees from Firestore
-    users_ref = firestore_db.collection("users").where("role", "==", "employee").stream()
+    users_ref = firestore_db.collection("users").where("role", "in", ["employee", "clockOnlyEmployee"]).stream()
     employees_data = {}
     employee_ids = []
     
@@ -1663,6 +1664,7 @@ async def get_dealership_employee_hours_breakdown(
 @router.get("/dealership/{dealership_id}/comprehensive-labor-spend", response_model=ComprehensiveLaborSpendResponse)
 async def get_comprehensive_labor_spend(
     dealership_id: str,
+    target_date: Optional[date] = None,
     session: Session = Depends(get_session),
     admin_user: dict = Depends(require_admin_role)
 ):
@@ -1683,23 +1685,30 @@ async def get_comprehensive_labor_spend(
     
     # Current time and date setup
     now = datetime.now(timezone.utc)
-    today = now.date()
     
-    # Date boundaries for today
-    start_of_today = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
-    end_of_today = datetime.combine(today, datetime.max.time()).replace(tzinfo=timezone.utc)
+    # If a target date is not provided, default to the current date in US/Eastern timezone
+    # to better align with user expectations.
+    if target_date:
+        analysis_date = target_date
+    else:
+        analysis_date = datetime.now(ZoneInfo("America/New_York")).date()
+
+    # Define the boundaries for the analysis date. All calculations will be based on this day.
+    analysis_tz = ZoneInfo("America/New_York")
+    start_of_analysis_day = datetime.combine(analysis_date, datetime.min.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
+    end_of_analysis_day = datetime.combine(analysis_date, datetime.max.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
     
-    # Current week boundaries (Monday to Sunday)
-    current_week_start = today - timedelta(days=today.weekday())
+    # Current week boundaries (Monday to Sunday) based on the analysis date
+    current_week_start = analysis_date - timedelta(days=analysis_date.weekday())
     current_week_end = current_week_start + timedelta(days=6)
-    start_of_week = datetime.combine(current_week_start, datetime.min.time()).replace(tzinfo=timezone.utc)
-    end_of_week = datetime.combine(current_week_end, datetime.max.time()).replace(tzinfo=timezone.utc)
-    
-    print(f"Analysis period - Today: {start_of_today} to {end_of_today}")
-    print(f"Analysis period - Week: {start_of_week} to {end_of_week}")
+    start_of_week = datetime.combine(current_week_start, datetime.min.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
+    end_of_week = datetime.combine(current_week_end, datetime.max.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
+
+    print(f"Analysis period (UTC) - Day: {start_of_analysis_day} to {end_of_analysis_day}")
+    print(f"Analysis period (UTC) - Week: {start_of_week} to {end_of_week}")
     
     # Get ALL employees from Firestore (not just those who clocked in)
-    users_ref = firestore_db.collection("users").where("role", "==", "employee").stream()
+    users_ref = firestore_db.collection("users").where("role", "in", ["employee", "clockOnlyEmployee"]).stream()
     all_employees = {}
     for doc in users_ref:
         user_data = doc.to_dict()
@@ -1736,8 +1745,8 @@ async def get_comprehensive_labor_spend(
     today_logs = session.exec(
         select(TimeLog)
         .where(TimeLog.dealership_id == dealership_id)
-        .where(TimeLog.timestamp >= start_of_today)
-        .where(TimeLog.timestamp <= end_of_today)
+        .where(TimeLog.timestamp >= start_of_analysis_day)
+        .where(TimeLog.timestamp <= end_of_analysis_day)
         .order_by(TimeLog.timestamp.asc())
     ).all()
     
@@ -1755,7 +1764,7 @@ async def get_comprehensive_labor_spend(
     vacation_today = session.exec(
         select(VacationTime)
         .where(VacationTime.dealership_id == dealership_id)
-        .where(VacationTime.date == today)
+        .where(VacationTime.date == analysis_date)
     ).all()
     
     vacation_this_week = session.exec(
@@ -1770,7 +1779,7 @@ async def get_comprehensive_labor_spend(
     # Initialize summary
     summary = DealershipLaborSpendSummary(
         dealership_id=dealership_id,
-        analysis_date=today.isoformat(),
+        analysis_date=analysis_date.isoformat(),
         analysis_timestamp=now
     )
     
@@ -1848,10 +1857,16 @@ async def get_comprehensive_labor_spend(
         summary.todays_total_vacation_cost += detail.todays_vacation_cost
         summary.todays_regular_hours += detail.todays_regular_hours
         summary.todays_overtime_hours += detail.todays_overtime_hours
-        summary.weekly_total_hours += detail.weekly_total_hours
+        
+        # Weekly totals are based on the full work week containing the analysis_date
+        employee_week_vacation = [v for v in vacation_this_week if v.employee_id == employee_id]
+        weekly_vacation_hours = sum(v.hours for v in employee_week_vacation)
+        weekly_vacation_cost = weekly_vacation_hours * hourly_wage
+
+        summary.weekly_total_hours += detail.weekly_total_hours + weekly_vacation_hours
         summary.weekly_regular_hours += detail.weekly_regular_hours
         summary.weekly_overtime_hours += detail.weekly_overtime_hours
-        summary.weekly_total_cost += detail.weekly_labor_cost
+        summary.weekly_total_cost += detail.weekly_labor_cost + weekly_vacation_cost
         
         if is_active:
             summary.current_hourly_labor_rate += hourly_wage
@@ -1973,7 +1988,7 @@ async def get_labor_preview(
     end_of_today = datetime.combine(today, datetime.max.time()).replace(tzinfo=timezone.utc)
     
     # Get all employees with their wages
-    users_ref = firestore_db.collection("users").where("role", "==", "employee").stream()
+    users_ref = firestore_db.collection("users").where("role", "in", ["employee", "clockOnlyEmployee"]).stream()
     employee_wages = {}
     for doc in users_ref:
         user_data = doc.to_dict()
@@ -2103,7 +2118,7 @@ async def get_all_dealerships_labor_costs_today(
     print(f"Found {len(dealership_ids)} dealerships to analyze")
     
     # Get all employees with their wages (do this once)
-    users_ref = firestore_db.collection("users").where("role", "==", "employee").stream()
+    users_ref = firestore_db.collection("users").where("role", "in", ["employee", "clockOnlyEmployee"]).stream()
     employee_wages = {}
     for doc in users_ref:
         user_data = doc.to_dict()

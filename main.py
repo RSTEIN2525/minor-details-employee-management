@@ -23,7 +23,9 @@ from api.admin_analytics_routes import router as admin_analytics_router
 from api.admin_time_routes import router as admin_time_router
 from api.admin_injury_routes import router as admin_injury_router
 from api.admin_vacation_routes import router as admin_vacation_router
+from api.admin_financial_routes import router as admin_financial_router
 from api.shop_routes import router as shop_router
+from api.vapi_handler import router as vapi_router
 import logging # Add this import
 import os
 from dotenv import load_dotenv
@@ -88,4 +90,6 @@ app.include_router(admin_analytics_router, prefix="/admin/analytics", tags=["Adm
 app.include_router(admin_time_router, prefix="/admin/time", tags=["Admin", "Direct Time Management"])
 app.include_router(admin_injury_router, prefix="/admin/injury", tags=["Admin", "Injury Reports"])
 app.include_router(admin_vacation_router, prefix="/admin/vacation", tags=["Admin", "Vacation Management"])
+app.include_router(admin_financial_router, prefix="/admin/financial", tags=["Admin", "Financial Analytics"])
 app.include_router(shop_router, prefix="/shops", tags=["Shops", "Geofence"])
+app.include_router(vapi_router, prefix="/api", tags=["Vapi", "Webhook"])

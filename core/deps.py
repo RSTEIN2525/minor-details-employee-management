@@ -3,6 +3,7 @@ from typing import Annotated  # Use typing.Annotated for Python 3.9+
 
 from firebase_admin import auth as firebase_auth, firestore
 from core.firebase import verify_id_token, db as firestore_client
+from db.session import get_session
 
 # Specific exception for device trust issues
 DEVICE_TRUST_EXCEPTION = HTTPException(
@@ -194,4 +195,57 @@ async def require_admin_role(
     
     # Passes Check Endpoint
     return current_user
+
+# Alias for backward compatibility
+require_user = get_current_user_basic_auth
+
+# Function to verify admin role from token (for Vapi webhook)
+def require_admin_role_from_token(token: str) -> dict:
+    """Verify admin role from a Firebase token string"""
+    try:
+        decoded = verify_id_token(token)
+        uid = decoded.get("uid")
+        if not uid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, 
+                detail="Token did not contain uid"
+            )
+        
+        # Fetch the Firestore user profile
+        doc_ref = firestore_client.collection("users").document(uid)
+        snapshot = doc_ref.get()
+        if not snapshot.exists:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User profile not found in Firestore",
+            )
+        profile = snapshot.to_dict()
+        
+        # Check admin role
+        user_role = profile.get("role", "")
+        if user_role not in ADMIN_ROLES:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User doesn't have sufficient privileges for this action",
+            )
+        
+        # Extract profile information
+        raw_dealerships = profile.get("dealerships", "")
+        dealerships = [s.strip() for s in raw_dealerships.split(",") if s.strip()]
+        
+        return {
+            "uid": uid,
+            "name": profile.get("displayName", ""),
+            "email": profile.get("email", ""),
+            "dealerships": dealerships,
+            "role": user_role,
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
     
