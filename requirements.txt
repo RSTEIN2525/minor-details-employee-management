@@ -28,6 +28,7 @@ idna==3.10
 markdown-it-py==3.0.0
 mdurl==0.1.2
 msgpack==1.1.0
+openai==0.28.1
 proto-plus==1.26.1
 protobuf==6.31.0rc1
 psycopg2-binary==2.9.10
