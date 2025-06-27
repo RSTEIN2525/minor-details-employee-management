@@ -1209,26 +1209,8 @@ async def get_employee_details(
         .order_by(TimeLog.timestamp.asc())
     ).all()
     
-    # Calculate hours for current week
-    clock_in_time = None
-    for clock in current_week_clocks:
-        ts = clock.timestamp
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-            
-        if clock.punch_type == PunchType.CLOCK_IN:
-            clock_in_time = ts
-        elif clock.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-            raw_hours = (ts - clock_in_time).total_seconds() / 3600
-            paid_hours = apply_unpaid_break(raw_hours)
-            current_week_hours += paid_hours
-            clock_in_time = None
-    
-    # If still clocked in, add time until now
-    if clock_in_time:
-        raw_hours = (now - clock_in_time).total_seconds() / 3600
-        paid_hours = apply_unpaid_break(raw_hours)
-        current_week_hours += paid_hours
+    # Calculate hours for current week using helper (handles implicit clock-outs)
+    current_week_hours = calculate_hours_from_logs(current_week_clocks, now)
     
     current_week_pay = current_week_hours * hourly_wage
     
@@ -1245,20 +1227,8 @@ async def get_employee_details(
         .order_by(TimeLog.timestamp.asc())
     ).all()
     
-    # Calculate hours for previous week
-    clock_in_time = None
-    for clock in prev_week_clocks:
-        ts = clock.timestamp
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-            
-        if clock.punch_type == PunchType.CLOCK_IN:
-            clock_in_time = ts
-        elif clock.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-            raw_hours = (ts - clock_in_time).total_seconds() / 3600
-            paid_hours = apply_unpaid_break(raw_hours)
-            prev_week_hours += paid_hours
-            clock_in_time = None
+    # Calculate hours for previous week using helper (handles implicit clock-outs)
+    prev_week_hours = calculate_hours_from_logs(prev_week_clocks, now)
     
     prev_week_pay = prev_week_hours * hourly_wage
     
@@ -1427,34 +1397,12 @@ async def get_all_employees_details(
         current_week_hours = 0.0
         prev_week_hours = 0.0
         
-        # Process all clocks chronologically for accurate pairing
-        sorted_clocks = sorted(employee_clock_list, key=lambda x: x.timestamp)
-        clock_in_time = None
-        
-        for clock in sorted_clocks:
-            ts = clock.timestamp
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-                
-            if clock.punch_type == PunchType.CLOCK_IN:
-                clock_in_time = ts
-            elif clock.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-                raw_hours = (ts - clock_in_time).total_seconds() / 3600
-                paid_hours = apply_unpaid_break(raw_hours)
-                
-                # Determine which week this duration belongs to
-                if current_week_start_dt <= ts <= current_week_end_dt:
-                    current_week_hours += paid_hours
-                elif prev_week_start_dt <= ts <= prev_week_end_dt:
-                    prev_week_hours += paid_hours
-                
-                clock_in_time = None
-        
-        # If still clocked in during current week
-        if clock_in_time and current_week_start_dt <= clock_in_time <= current_week_end_dt:
-            raw_hours = (now - clock_in_time).total_seconds() / 3600
-            paid_hours = apply_unpaid_break(raw_hours)
-            current_week_hours += paid_hours
+        # Calculate hours using shared helper for consistency
+        current_week_clocks = [c for c in employee_clock_list if current_week_start_dt <= c.timestamp <= current_week_end_dt]
+        prev_week_clocks = [c for c in employee_clock_list if prev_week_start_dt <= c.timestamp <= prev_week_end_dt]
+
+        current_week_hours = calculate_hours_from_logs(current_week_clocks, now)
+        prev_week_hours = calculate_hours_from_logs(prev_week_clocks, now)
         
         current_week_pay = current_week_hours * hourly_wage
         prev_week_pay = prev_week_hours * hourly_wage
@@ -1470,6 +1418,11 @@ async def get_all_employees_details(
         todays_hours, is_currently_clocked_in = await calculate_todays_hours_and_status(session, employee_id)
         todays_regular, todays_overtime = calculate_regular_and_overtime_hours(todays_hours)
         todays_pay = calculate_pay_with_overtime(todays_regular, todays_overtime, hourly_wage)
+
+        # Calculate vacation hours for each period
+        prev_week_vacation_hours = await calculate_vacation_hours(session, employee_id, prev_week_start, prev_week_end)
+        current_week_vacation_hours = await calculate_vacation_hours(session, employee_id, current_week_start, current_week_end)
+        todays_vacation_hours = await calculate_vacation_hours(session, employee_id, today, today)
 
         # Create week summaries
         week_summaries = [
@@ -1589,33 +1542,9 @@ async def get_dealership_employee_hours_breakdown(
         # Check if employee is currently active at this dealership
         is_currently_active, _ = await is_employee_currently_active(session, employee_id, dealership_id)
         
-        # Calculate total hours worked by this employee
+        # Calculate total hours worked by this employee using helper
         logs = employee_logs[employee_id]
-        sorted_logs = sorted(logs, key=lambda x: x.timestamp)
-        
-        total_hours_worked = 0.0
-        clock_in_time: Optional[datetime] = None
-        
-        for log in sorted_logs:
-            log_ts = log.timestamp
-            if log_ts.tzinfo is None:
-                log_ts = log_ts.replace(tzinfo=timezone.utc)
-
-            if log.punch_type == PunchType.CLOCK_IN:
-                clock_in_time = log_ts
-            elif log.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-                raw_hours = (log_ts - clock_in_time).total_seconds() / 3600
-                paid_hours = apply_unpaid_break(raw_hours)
-                total_hours_worked += paid_hours
-                clock_in_time = None
-        
-        # If still clocked in within our date range
-        if clock_in_time and clock_in_time <= end_datetime:
-            # Calculate duration until end of period or current time (whichever is earlier)
-            end_time = min(now, end_datetime)
-            raw_hours = (end_time - clock_in_time).total_seconds() / 3600
-            paid_hours = apply_unpaid_break(raw_hours)
-            total_hours_worked += paid_hours
+        total_hours_worked = calculate_hours_from_logs(logs, now)
         
         # Calculate regular vs overtime hours
         regular_hours, overtime_hours = calculate_regular_and_overtime_hours(total_hours_worked)
@@ -1946,6 +1875,12 @@ def calculate_hours_from_logs(logs: List[TimeLog], current_time: datetime) -> fl
             log_ts = log_ts.replace(tzinfo=timezone.utc)
         
         if log.punch_type == PunchType.CLOCK_IN:
+            # If there's already an open shift, close it at the moment of this new CLOCK_IN
+            if clock_in_time is not None:
+                raw_hours = (log_ts - clock_in_time).total_seconds() / 3600
+                paid_hours = apply_unpaid_break(raw_hours)
+                total_hours += paid_hours
+            # Start new shift window
             clock_in_time = log_ts
         elif log.punch_type == PunchType.CLOCK_OUT and clock_in_time:
             raw_hours = (log_ts - clock_in_time).total_seconds() / 3600
