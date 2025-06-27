@@ -4,6 +4,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, HTTPException, Header, Request
 from pydantic import BaseModel
 import json
+import httpx
 from sqlmodel import Session
 
 # Import the functions we want to call directly
@@ -97,6 +98,7 @@ router = APIRouter()
 # Environment variables
 VAPI_SECRET_TOKEN = os.getenv("VAPI_SECRET_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+VAPI_TOKEN_GENERATOR_URL = "https://get-vapi-token-507748767742.us-east4.run.app"
 
 # Initialize OpenAI client
 try:
@@ -108,15 +110,32 @@ except ImportError:
     OPENAI_AVAILABLE = False
     openai = None
 
-# Pydantic models for request validation
-class WorkflowParameters(BaseModel):
-    action: str  # e.g., "get_employee_details", "get_dealership_status"
-    user_input: str  # The spoken text from user
-    token: str  # Auth token passed from VAPI
+async def generate_vapi_token() -> Optional[str]:
+    """Generate a fresh auth token from the VAPI token service"""
+    logger.warning("🔄 VAPI_TOKEN_GENERATION: Starting token generation process")
+    try:
+        async with httpx.AsyncClient() as client:
+            logger.warning(f"🔄 VAPI_TOKEN_GENERATION: Making POST request to {VAPI_TOKEN_GENERATOR_URL}")
+            response = await client.post(VAPI_TOKEN_GENERATOR_URL)
+            response.raise_for_status()
+            token_data = response.json()
+            token = token_data.get("authToken")
+            if token:
+                logger.warning(f"✅ VAPI_TOKEN_GENERATION: Successfully generated token (length: {len(token)})")
+                return token
+            else:
+                logger.error("❌ VAPI_TOKEN_GENERATION: Response missing authToken field")
+                return None
+    except Exception as e:
+        logger.error(f"❌ VAPI_TOKEN_GENERATION: Error generating token: {str(e)}")
+        return None
 
+# Pydantic models for request validation
 class VapiWorkflow(BaseModel):
     type: str
-    workflow: Optional[WorkflowParameters] = None
+    action: Optional[str] = None  # e.g., "smart", "get_employee_details", "get_dealership_status"
+    user_input: Optional[str] = None  # The spoken text from user
+    token: Optional[str] = None  # Auth token (optional - will be auto-generated if not provided)
 
 # Response model for workflow results
 class WorkflowResult(BaseModel):
@@ -140,53 +159,70 @@ CACHE_TTL = 3600  # 1 hour
 
 def fallback_action_detection(user_input: str) -> Optional[str]:
     """Simple keyword-based action detection when OpenAI isn't available"""
+    logger.warning(f"🔄 ACTION_DETECTION_FALLBACK: Processing input: '{user_input}'")
     user_lower = user_input.lower()
     
     # Financial keywords
     if any(word in user_lower for word in ["financial", "revenue", "profit", "money", "cost"]):
         if any(word in user_lower for word in ["company", "total", "all"]):
+            logger.warning("✅ ACTION_DETECTION_FALLBACK: Detected company financial action")
             return "get_company_financial_summary"
         else:
+            logger.warning("✅ ACTION_DETECTION_FALLBACK: Detected dealership financial action")
             return "get_dealership_financial"
     
     # Labor keywords
     if any(word in user_lower for word in ["labor", "working", "active", "employees"]):
         if any(word in user_lower for word in ["all", "everyone", "company"]):
+            logger.warning("✅ ACTION_DETECTION_FALLBACK: Detected all active employees action")
             return "get_all_active_employees"
         else:
+            logger.warning("✅ ACTION_DETECTION_FALLBACK: Detected dealership employees action")
             return "get_dealership_employees"
     
     # Employee keywords
     if any(word in user_lower for word in ["employee", "worker", "details", "performance"]):
+        logger.warning("✅ ACTION_DETECTION_FALLBACK: Detected employee details action")
         return "get_employee_details"
     
     # Default to company overview
+    logger.warning("✅ ACTION_DETECTION_FALLBACK: Using default company financial summary")
     return "get_company_financial_summary"
 
 def fallback_entity_matching(user_input: str, candidates: List[Dict], match_type: str) -> Optional[Dict]:
     """Simple name matching when OpenAI isn't available"""
+    logger.warning(f"🔄 ENTITY_MATCHING_FALLBACK: Matching '{user_input}' against {len(candidates)} {match_type} candidates")
     user_lower = user_input.lower()
     
     # Try exact name match first
     for candidate in candidates:
         name = candidate["name"].lower()
         if name in user_lower or any(part in user_lower for part in name.split()):
+            logger.warning(f"✅ ENTITY_MATCHING_FALLBACK: Found exact match: {candidate['name']} (ID: {candidate['id']})")
             return candidate
     
     # If no match, return first candidate as fallback
-    return candidates[0] if candidates else None
+    if candidates:
+        logger.warning(f"⚠️ ENTITY_MATCHING_FALLBACK: No exact match, using first candidate: {candidates[0]['name']} (ID: {candidates[0]['id']})")
+        return candidates[0]
+    
+    logger.warning("❌ ENTITY_MATCHING_FALLBACK: No candidates available")
+    return None
 
 async def get_all_employees_cached():
     """Get all employees with caching"""
     import time
     current_time = time.time()
     
+    logger.warning(f"🔍 EMPLOYEE_CACHE: Checking cache (timestamp: {_employee_cache['timestamp']}, TTL: {CACHE_TTL})")
+    
     if (_employee_cache["data"] is None or 
         current_time - _employee_cache["timestamp"] > CACHE_TTL):
         
-        logger.info("Refreshing employee cache...")
+        logger.warning("🔄 EMPLOYEE_CACHE: Cache expired or empty, refreshing employee cache...")
         try:
             # Get all employees from Firestore
+            logger.warning("🔄 EMPLOYEE_CACHE: Querying Firestore for employees")
             users_ref = firestore_db.collection("users").where(
                 "role", "in", ["employee", "clockOnlyEmployee", "minorDetailsManager", "minorDetailsSupervisor"]
             ).stream()
@@ -202,11 +238,13 @@ async def get_all_employees_cached():
             
             _employee_cache["data"] = employees
             _employee_cache["timestamp"] = current_time
-            logger.info(f"Cached {len(employees)} employees")
+            logger.warning(f"✅ EMPLOYEE_CACHE: Successfully cached {len(employees)} employees")
             
         except Exception as e:
-            logger.error(f"Error fetching employees: {str(e)}")
+            logger.error(f"❌ EMPLOYEE_CACHE: Error fetching employees: {str(e)}")
             return []
+    else:
+        logger.warning(f"✅ EMPLOYEE_CACHE: Using cached data ({len(_employee_cache['data'] or [])} employees)")
     
     return _employee_cache["data"]
 
@@ -215,30 +253,48 @@ async def get_all_dealerships_cached():
     import time
     current_time = time.time()
     
+    logger.warning(f"🔍 DEALERSHIP_CACHE: Checking cache (timestamp: {_dealership_cache['timestamp']}, TTL: {CACHE_TTL})")
+    
     if (_dealership_cache["data"] is None or 
         current_time - _dealership_cache["timestamp"] > CACHE_TTL):
         
-        logger.info("Refreshing dealership cache...")
+        logger.warning("🔄 DEALERSHIP_CACHE: Cache expired or empty, refreshing dealership cache...")
         try:
             admin_user = {"role": "admin"}
-            dealerships = await list_all_dealerships(admin_user=admin_user)
+            logger.warning("🔄 DEALERSHIP_CACHE: Calling list_all_dealerships API")
+            dealerships_models = await list_all_dealerships(admin_user=admin_user)
+            
+            logger.warning(f"🔄 DEALERSHIP_CACHE: Converting {len(dealerships_models)} Pydantic models to dictionaries")
+            # Convert Pydantic models to dictionaries for entity matching
+            dealerships = []
+            for dealership_model in dealerships_models:
+                dealerships.append({
+                    "id": dealership_model.id,
+                    "name": dealership_model.name or dealership_model.id
+                })
             
             _dealership_cache["data"] = dealerships
             _dealership_cache["timestamp"] = current_time
-            logger.info(f"Cached {len(dealerships)} dealerships")
+            logger.warning(f"✅ DEALERSHIP_CACHE: Successfully cached {len(dealerships)} dealerships")
             
         except Exception as e:
-            logger.error(f"Error fetching dealerships: {str(e)}")
+            logger.error(f"❌ DEALERSHIP_CACHE: Error fetching dealerships: {str(e)}")
             return []
+    else:
+        logger.warning(f"✅ DEALERSHIP_CACHE: Using cached data ({len(_dealership_cache['data'] or [])} dealerships)")
     
     return _dealership_cache["data"]
 
 async def determine_action_with_llm(user_input: str) -> Optional[str]:
     """Use OpenAI to determine what action the user wants to perform"""
+    logger.warning(f"🔄 ACTION_DETECTION_LLM: Processing input: '{user_input}'")
+    
     if not OPENAI_AVAILABLE:
+        logger.warning("⚠️ ACTION_DETECTION_LLM: OpenAI not available, using fallback")
         return fallback_action_detection(user_input)
     
     try:
+        logger.warning("🔄 ACTION_DETECTION_LLM: Making OpenAI API call")
         response = openai.ChatCompletion.create(
             model="gpt-4.1",
             messages=[
@@ -303,20 +359,28 @@ Respond with ONLY the action name, nothing else."""
         )
         
         action = response.choices[0].message.content.strip()
-        logger.info(f"LLM determined action: {action}")
+        logger.warning(f"✅ ACTION_DETECTION_LLM: OpenAI determined action: {action}")
         return action
         
     except Exception as e:
-        logger.error(f"Error using OpenAI for action detection: {str(e)}")
+        logger.error(f"❌ ACTION_DETECTION_LLM: Error using OpenAI: {str(e)}")
+        logger.warning("🔄 ACTION_DETECTION_LLM: Falling back to keyword detection")
         return fallback_action_detection(user_input)
 
 async def find_best_match_with_llm(user_input: str, candidates: List[Dict], match_type: str) -> Optional[Dict]:
     """Use OpenAI to find the best matching employee or dealership"""
+    logger.warning(f"🔄 ENTITY_MATCHING_LLM: Matching '{user_input}' against {len(candidates)} {match_type} candidates")
+    
     if not OPENAI_AVAILABLE or not candidates:
+        if not OPENAI_AVAILABLE:
+            logger.warning("⚠️ ENTITY_MATCHING_LLM: OpenAI not available, using fallback")
+        else:
+            logger.warning("⚠️ ENTITY_MATCHING_LLM: No candidates provided, using fallback")
         return fallback_entity_matching(user_input, candidates, match_type)
     
     try:
         candidates_text = "\n".join([f"ID: {c['id']}, Name: {c['name']}" for c in candidates])
+        logger.warning(f"🔄 ENTITY_MATCHING_LLM: Making OpenAI API call for {match_type} matching")
         
         response = openai.ChatCompletion.create(
             model="gpt-4.1",
@@ -343,137 +407,167 @@ Respond with ONLY the ID of the best match, nothing else. If no good match, resp
         )
         
         match_id = response.choices[0].message.content.strip()
+        logger.warning(f"🔄 ENTITY_MATCHING_LLM: OpenAI returned match ID: {match_id}")
         
         if match_id == "NONE":
+            logger.warning("⚠️ ENTITY_MATCHING_LLM: OpenAI found no good match")
             return None
             
         # Find the candidate with matching ID
         for candidate in candidates:
             if candidate["id"] == match_id:
-                logger.info(f"LLM matched '{user_input}' to {match_type}: {candidate['name']}")
+                logger.warning(f"✅ ENTITY_MATCHING_LLM: Successfully matched '{user_input}' to {match_type}: {candidate['name']} (ID: {candidate['id']})")
                 return candidate
         
         # Fallback to simple matching if LLM returned invalid ID
+        logger.warning(f"⚠️ ENTITY_MATCHING_LLM: Invalid ID returned ({match_id}), using fallback")
         return fallback_entity_matching(user_input, candidates, match_type)
         
     except Exception as e:
-        logger.error(f"Error using OpenAI for entity matching: {str(e)}")
+        logger.error(f"❌ ENTITY_MATCHING_LLM: Error using OpenAI: {str(e)}")
+        logger.warning("🔄 ENTITY_MATCHING_LLM: Falling back to keyword matching")
         return fallback_entity_matching(user_input, candidates, match_type)
 
 async def handle_company_wide_workflow(action: str, user_input: str, token: str) -> WorkflowResult:
     """Handle company-wide workflows"""
+    logger.warning(f"🏢 COMPANY_WORKFLOW: Starting company-wide workflow - Action: {action}")
+    
     try:
+        logger.warning("🔐 COMPANY_WORKFLOW: Validating admin token")
         admin_user = require_admin_role_from_token(token)
         session = next(get_session())
         
         try:
             # Financial Analytics
             if action == "get_company_financial_summary":
+                logger.warning("📊 COMPANY_WORKFLOW: Calling get_company_financial_summary_today")
                 result = await get_company_financial_summary_today(session=session, admin=admin_user)
                 message = "Retrieved company financial summary for today"
                 endpoint = "get_company_financial_summary_today"
             elif action == "get_company_revenue":
+                logger.warning("💰 COMPANY_WORKFLOW: Calling get_company_revenue_total_today")
                 result = await get_company_revenue_total_today(session=session, admin=admin_user)
                 message = "Retrieved total company revenue for today"
                 endpoint = "get_company_revenue_total_today"
             elif action == "get_company_profit":
+                logger.warning("📈 COMPANY_WORKFLOW: Calling get_company_profit_total_today")
                 result = await get_company_profit_total_today(session=session, admin=admin_user)
                 message = "Retrieved company profit/loss for today"
                 endpoint = "get_company_profit_total_today"
             elif action == "get_all_dealerships_financial":
+                logger.warning("🏢 COMPANY_WORKFLOW: Calling get_all_dealerships_financial_summary")
                 result = await get_all_dealerships_financial_summary(session=session, admin=admin_user)
                 message = "Retrieved financial summary for all dealerships"
                 endpoint = "get_all_dealerships_financial_summary"
             elif action == "get_top_financial_performers":
+                logger.warning("🏆 COMPANY_WORKFLOW: Calling get_top_performers_today")
                 result = await get_top_performers_today(session=session, admin=admin_user)
                 message = "Retrieved top performing dealerships"
                 endpoint = "get_top_performers_today"
             
             # Labor Analytics
             elif action == "get_all_dealerships_labor_costs":
+                logger.warning("💼 COMPANY_WORKFLOW: Calling get_all_dealerships_labor_costs_today")
                 result = await get_all_dealerships_labor_costs_today(session=session, admin_user=admin_user)
                 message = "Retrieved labor costs for all dealerships"
                 endpoint = "get_all_dealerships_labor_costs_today"
             elif action == "get_enhanced_daily_labor":
+                logger.warning("📊 COMPANY_WORKFLOW: Calling get_enhanced_daily_labor_spend")
                 result = await get_enhanced_daily_labor_spend(session=session, admin_user=admin_user)
                 message = "Retrieved enhanced daily labor analysis"
                 endpoint = "get_enhanced_daily_labor_spend"
             elif action == "get_weekly_labor":
+                logger.warning("📅 COMPANY_WORKFLOW: Calling get_weekly_labor_spend")
                 result = await get_weekly_labor_spend(session=session, admin_user=admin_user)
                 message = "Retrieved weekly labor trends"
                 endpoint = "get_weekly_labor_spend"
             elif action == "get_all_active_employees":
+                logger.warning("👥 COMPANY_WORKFLOW: Calling get_all_active_employees")
                 result = await get_all_active_employees(session=session, admin_user=admin_user)
                 message = "Retrieved all active employees"
                 endpoint = "get_all_active_employees"
             
             # Employee Management
             elif action == "get_all_employees_details":
+                logger.warning("👤 COMPANY_WORKFLOW: Calling get_all_employees_details")
                 result = await get_all_employees_details(session=session, admin_user=admin_user)
                 message = "Retrieved details for all employees"
                 endpoint = "get_all_employees_details"
             elif action == "get_all_users":
+                logger.warning("👥 COMPANY_WORKFLOW: Calling list_all_users_for_admin")
                 result = await list_all_users_for_admin(admin_user=admin_user)
                 message = "Retrieved list of all users"
                 endpoint = "list_all_users_for_admin"
             elif action == "get_all_user_wages":
+                logger.warning("💰 COMPANY_WORKFLOW: Calling list_all_user_wages_for_admin")
                 result = await list_all_user_wages_for_admin(admin_user=admin_user)
                 message = "Retrieved wage information for all employees"
                 endpoint = "list_all_user_wages_for_admin"
             
             # Time Management
             elif action == "get_recent_global_entries":
+                logger.warning("⏰ COMPANY_WORKFLOW: Calling get_recent_global_entries")
                 result = await get_recent_global_entries(session=session, admin_user=admin_user)
                 message = "Retrieved recent time entries across all employees"
                 endpoint = "get_recent_global_entries"
             
             # Vacation Management
             elif action == "get_all_vacation_entries":
+                logger.warning("🏖️ COMPANY_WORKFLOW: Calling get_vacation_entries")
                 result = await get_vacation_entries(session=session, admin_user=admin_user)
                 message = "Retrieved all vacation entries"
                 endpoint = "get_vacation_entries"
             elif action == "get_recent_activity":
+                logger.warning("📋 COMPANY_WORKFLOW: Calling get_recent_combined_activity")
                 result = await get_recent_combined_activity(session=session, admin_user=admin_user)
                 message = "Retrieved recent admin activity"
                 endpoint = "get_recent_combined_activity"
             elif action == "get_vacation_types":
+                logger.warning("🏖️ COMPANY_WORKFLOW: Calling get_vacation_types")
                 result = await get_vacation_types(session=session, admin_user=admin_user)
                 message = "Retrieved available vacation types"
                 endpoint = "get_vacation_types"
             
             # Clock Requests
             elif action == "get_clock_requests":
+                logger.warning("⏰ COMPANY_WORKFLOW: Calling get_all_clock_requests")
                 result = await get_all_clock_requests(session=session, admin_user=admin_user)
                 message = "Retrieved all clock change requests"
                 endpoint = "get_all_clock_requests"
             
             # Device Management
             elif action == "get_pending_devices":
+                logger.warning("📱 COMPANY_WORKFLOW: Calling list_pending_device_requests")
                 result = await list_pending_device_requests(admin_user=admin_user)
                 message = "Retrieved pending device approval requests"
                 endpoint = "list_pending_device_requests"
             elif action == "get_approved_devices":
+                logger.warning("✅ COMPANY_WORKFLOW: Calling list_approved_device_requests")
                 result = await list_approved_device_requests(admin_user=admin_user)
                 message = "Retrieved recently approved devices"
                 endpoint = "list_approved_device_requests"
             
             # Shop/Location Management
             elif action == "get_all_shops":
+                logger.warning("🏪 COMPANY_WORKFLOW: Calling list_all_shops")
                 result = await list_all_shops(admin_user=admin_user)
                 message = "Retrieved all business locations"
                 endpoint = "list_all_shops"
             elif action == "get_all_dealerships":
+                logger.warning("🏢 COMPANY_WORKFLOW: Calling list_all_dealerships")
                 result = await list_all_dealerships(admin_user=admin_user)
                 message = "Retrieved all dealerships"
                 endpoint = "list_all_dealerships"
             
             # Safety & Injury Reporting
             elif action == "get_injury_reports":
+                logger.warning("🚨 COMPANY_WORKFLOW: Calling get_injury_reports")
                 result = await get_injury_reports(session=session, admin_user=admin_user)
                 message = "Retrieved workplace injury reports"
                 endpoint = "get_injury_reports"
             
             else:
+                logger.error(f"❌ COMPANY_WORKFLOW: Unknown action: {action}")
                 return WorkflowResult(
                     success=False, 
                     message=f"Unknown company-wide action: {action}",
@@ -481,6 +575,7 @@ async def handle_company_wide_workflow(action: str, user_input: str, token: str)
                     endpoint_called="none"
                 )
             
+            logger.warning(f"✅ COMPANY_WORKFLOW: Successfully completed {endpoint}")
             return WorkflowResult(
                 success=True, 
                 data=result, 
@@ -491,9 +586,10 @@ async def handle_company_wide_workflow(action: str, user_input: str, token: str)
             
         finally:
             session.close()
+            logger.warning("🔐 COMPANY_WORKFLOW: Database session closed")
             
     except Exception as e:
-        logger.error(f"Error in company-wide workflow: {str(e)}")
+        logger.error(f"❌ COMPANY_WORKFLOW: Error in workflow: {str(e)}")
         return WorkflowResult(
             success=False, 
             message=f"Error retrieving company data: {str(e)}",
@@ -506,40 +602,51 @@ async def handle_employee_specific_workflow(action: str, employee: Dict, user_in
     employee_id = employee["id"]
     employee_name = employee["name"]
     
+    logger.warning(f"👤 EMPLOYEE_WORKFLOW: Starting employee workflow - Action: {action}, Employee: {employee_name} (ID: {employee_id})")
+    
     try:
+        logger.warning("🔐 EMPLOYEE_WORKFLOW: Validating admin token")
         admin_user = require_admin_role_from_token(token)
         session = next(get_session())
         
         try:
             if action == "get_employee_details":
+                logger.warning(f"📊 EMPLOYEE_WORKFLOW: Calling get_employee_details for {employee_name}")
                 result = await get_employee_details(employee_id=employee_id, session=session, admin_user=admin_user)
                 message = f"Retrieved details for {employee_name}"
                 endpoint = "get_employee_details"
             elif action == "get_employee_wage":
+                logger.warning(f"💰 EMPLOYEE_WORKFLOW: Calling get_user_wage for {employee_name}")
                 result = await get_user_wage(user_id=employee_id, admin_user=admin_user)
                 message = f"Retrieved wage for {employee_name}"
                 endpoint = "get_user_wage"
             elif action == "get_employee_recent_punches":
+                logger.warning(f"⏰ EMPLOYEE_WORKFLOW: Calling get_employee_recent_punches for {employee_name}")
                 result = await get_employee_recent_punches(employee_id=employee_id, session=session, admin_user=admin_user)
                 message = f"Retrieved recent punches for {employee_name}"
                 endpoint = "get_employee_recent_punches"
             elif action == "get_employee_admin_changes":
+                logger.warning(f"📋 EMPLOYEE_WORKFLOW: Calling get_employee_admin_changes for {employee_name}")
                 result = await get_employee_admin_changes(employee_id=employee_id, session=session, admin_user=admin_user)
                 message = f"Retrieved admin changes for {employee_name}"
                 endpoint = "get_employee_admin_changes"
             elif action == "get_employee_vacation":
+                logger.warning(f"🏖️ EMPLOYEE_WORKFLOW: Calling get_employee_vacation_entries for {employee_name}")
                 result = await get_employee_vacation_entries(employee_id=employee_id, session=session, admin_user=admin_user)
                 message = f"Retrieved vacation history for {employee_name}"
                 endpoint = "get_employee_vacation_entries"
             elif action == "get_employee_devices":
+                logger.warning(f"📱 EMPLOYEE_WORKFLOW: Calling get_user_approved_devices for {employee_name}")
                 result = await get_user_approved_devices(user_id=employee_id, admin_user=admin_user)
                 message = f"Retrieved devices for {employee_name}"
                 endpoint = "get_user_approved_devices"
             elif action == "get_employee_injuries":
+                logger.warning(f"🚨 EMPLOYEE_WORKFLOW: Calling get_employee_injury_reports for {employee_name}")
                 result = await get_employee_injury_reports(employee_id=employee_id, session=session, admin_user=admin_user)
                 message = f"Retrieved injury history for {employee_name}"
                 endpoint = "get_employee_injury_reports"
             elif action == "update_employee_wage":
+                logger.warning(f"❌ EMPLOYEE_WORKFLOW: Wage update not supported in workflow for {employee_name}")
                 return WorkflowResult(
                     success=False, 
                     message="Wage updates require wage amount parameter. Use the direct API endpoint.",
@@ -547,6 +654,7 @@ async def handle_employee_specific_workflow(action: str, employee: Dict, user_in
                     endpoint_called="none"
                 )
             else:
+                logger.error(f"❌ EMPLOYEE_WORKFLOW: Unknown action: {action}")
                 return WorkflowResult(
                     success=False, 
                     message=f"Unknown employee action: {action}",
@@ -554,6 +662,7 @@ async def handle_employee_specific_workflow(action: str, employee: Dict, user_in
                     endpoint_called="none"
                 )
             
+            logger.warning(f"✅ EMPLOYEE_WORKFLOW: Successfully completed {endpoint} for {employee_name}")
             return WorkflowResult(
                 success=True, 
                 data=result, 
@@ -564,9 +673,10 @@ async def handle_employee_specific_workflow(action: str, employee: Dict, user_in
             
         finally:
             session.close()
+            logger.warning("🔐 EMPLOYEE_WORKFLOW: Database session closed")
             
     except Exception as e:
-        logger.error(f"Error in employee workflow: {str(e)}")
+        logger.error(f"❌ EMPLOYEE_WORKFLOW: Error in workflow for {employee_name}: {str(e)}")
         return WorkflowResult(
             success=False, 
             message=f"Error retrieving employee data: {str(e)}",
@@ -579,44 +689,56 @@ async def handle_dealership_specific_workflow(action: str, dealership: Dict, use
     dealership_id = dealership["id"]
     dealership_name = dealership["name"]
     
+    logger.warning(f"🏪 DEALERSHIP_WORKFLOW: Starting dealership workflow - Action: {action}, Dealership: {dealership_name} (ID: {dealership_id})")
+    
     try:
+        logger.warning("🔐 DEALERSHIP_WORKFLOW: Validating admin token")
         admin_user = require_admin_role_from_token(token)
         session = next(get_session())
         
         try:
             if action == "get_dealership_financial":
+                logger.warning(f"📊 DEALERSHIP_WORKFLOW: Calling get_dealership_financial_summary for {dealership_name}")
                 result = await get_dealership_financial_summary(dealership_id=dealership_id, session=session, admin=admin_user)
                 message = f"Retrieved financial summary for {dealership_name}"
                 endpoint = "get_dealership_financial_summary"
             elif action == "get_dealership_detailed_breakdown":
+                logger.warning(f"📈 DEALERSHIP_WORKFLOW: Calling get_dealership_detailed_breakdown for {dealership_name}")
                 result = await get_dealership_detailed_breakdown(dealership_id=dealership_id, session=session, admin=admin_user)
                 message = f"Retrieved detailed financial breakdown for {dealership_name}"
                 endpoint = "get_dealership_detailed_breakdown"
             elif action == "get_dealership_labor":
+                logger.warning(f"💼 DEALERSHIP_WORKFLOW: Calling get_dealership_labor_spend for {dealership_name}")
                 result = await get_dealership_labor_spend(dealership_id=dealership_id, session=session, admin_user=admin_user)
                 message = f"Retrieved labor costs for {dealership_name}"
                 endpoint = "get_dealership_labor_spend"
             elif action == "get_dealership_comprehensive_labor":
+                logger.warning(f"📊 DEALERSHIP_WORKFLOW: Calling get_comprehensive_labor_spend for {dealership_name}")
                 result = await get_comprehensive_labor_spend(dealership_id=dealership_id, session=session, admin_user=admin_user)
                 message = f"Retrieved comprehensive labor analysis for {dealership_name}"
                 endpoint = "get_comprehensive_labor_spend"
             elif action == "get_dealership_labor_preview":
+                logger.warning(f"👀 DEALERSHIP_WORKFLOW: Calling get_labor_preview for {dealership_name}")
                 result = await get_labor_preview(dealership_id=dealership_id, session=session, admin_user=admin_user)
                 message = f"Retrieved labor cost preview for {dealership_name}"
                 endpoint = "get_labor_preview"
             elif action == "get_dealership_active_employees":
+                logger.warning(f"👥 DEALERSHIP_WORKFLOW: Calling get_active_employees_by_dealership for {dealership_name}")
                 result = await get_active_employees_by_dealership(dealership_id=dealership_id, session=session, admin_user=admin_user)
                 message = f"Retrieved active employees at {dealership_name}"
                 endpoint = "get_active_employees_by_dealership"
             elif action == "get_dealership_employee_hours":
+                logger.warning(f"⏰ DEALERSHIP_WORKFLOW: Calling get_dealership_employee_hours_breakdown for {dealership_name}")
                 result = await get_dealership_employee_hours_breakdown(dealership_id=dealership_id, session=session, admin_user=admin_user)
                 message = f"Retrieved employee hours breakdown for {dealership_name}"
                 endpoint = "get_dealership_employee_hours_breakdown"
             elif action == "get_dealership_injury_stats":
+                logger.warning(f"🚨 DEALERSHIP_WORKFLOW: Calling get_dealership_injury_summary for {dealership_name}")
                 result = await get_dealership_injury_summary(dealership_id=dealership_id, session=session, admin_user=admin_user)
                 message = f"Retrieved injury statistics for {dealership_name}"
                 endpoint = "get_dealership_injury_summary"
             else:
+                logger.error(f"❌ DEALERSHIP_WORKFLOW: Unknown action: {action}")
                 return WorkflowResult(
                     success=False, 
                     message=f"Unknown dealership action: {action}",
@@ -624,6 +746,7 @@ async def handle_dealership_specific_workflow(action: str, dealership: Dict, use
                     endpoint_called="none"
                 )
             
+            logger.warning(f"✅ DEALERSHIP_WORKFLOW: Successfully completed {endpoint} for {dealership_name}")
             return WorkflowResult(
                 success=True, 
                 data=result, 
@@ -634,9 +757,10 @@ async def handle_dealership_specific_workflow(action: str, dealership: Dict, use
             
         finally:
             session.close()
+            logger.warning("🔐 DEALERSHIP_WORKFLOW: Database session closed")
             
     except Exception as e:
-        logger.error(f"Error in dealership workflow: {str(e)}")
+        logger.error(f"❌ DEALERSHIP_WORKFLOW: Error in workflow for {dealership_name}: {str(e)}")
         return WorkflowResult(
             success=False, 
             message=f"Error retrieving dealership data: {str(e)}",
@@ -652,6 +776,18 @@ async def handle_vapi_webhook(
     """
     🚀 COMPREHENSIVE EXECUTIVE WORKFLOW HANDLER with Endpoint Tracking
     
+    Expects FLAT JSON structure (no nesting allowed in VAPI):
+    {
+        "type": "workflow",
+        "action": "smart", 
+        "user_input": "Get company financial summary"
+    }
+    
+    🔑 AUTH TOKEN AUTO-GENERATION:
+    - Token is now OPTIONAL in the payload
+    - If no token provided, automatically generates one from: https://get-vapi-token-507748767742.us-east4.run.app
+    - Users no longer need to manually provide authentication tokens
+    
     NOW INCLUDES endpoint_called and action_detected in all responses!
     
     Examples of response format:
@@ -664,32 +800,68 @@ async def handle_vapi_webhook(
     }
     """
     
+    logger.warning("🚀 VAPI_WEBHOOK: Incoming webhook request received")
+    
     # 1. Authenticate the webhook request from Vapi
+    logger.warning("🔐 VAPI_WEBHOOK: Validating x-vapi-secret header")
     if not x_vapi_secret or x_vapi_secret != VAPI_SECRET_TOKEN:
+        logger.error("❌ VAPI_WEBHOOK: Authentication failed - Invalid or missing x-vapi-secret header")
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing x-vapi-secret header")
 
-    # 2. Process only "workflow" messages
-    if message.type != "workflow" or not message.workflow:
+    # Debug: Print the incoming payload
+    logger.warning(f"🔍 VAPI_WEBHOOK: Payload received: {message.model_dump()}")
+    print(f"🔍 VAPI Webhook Payload: {message.model_dump()}")
+
+    # 2. Process only "workflow" messages with required fields
+    if message.type != "workflow":
+        logger.warning(f"⚠️ VAPI_WEBHOOK: Non-workflow message type received: {message.type}")
         return VapiResponse(
             success=False, 
             message="Request processed. No workflow action taken.",
             action_detected="none",
             endpoint_called="none"
         )
-
-    workflow = message.workflow
-    action = workflow.action
-    user_input = workflow.user_input
-    token = workflow.token
     
-    logger.info(f"Processing workflow: {action} with input: '{user_input}'")
+    if not message.action or not message.user_input:
+        logger.error("❌ VAPI_WEBHOOK: Missing required fields (action or user_input)")
+        return VapiResponse(
+            success=False, 
+            message="Missing required fields: action and user_input are required.",
+            action_detected="none",
+            endpoint_called="none"
+        )
+
+    action = message.action
+    user_input = message.user_input
+    
+    logger.warning(f"📝 VAPI_WEBHOOK: Processing workflow - Action: '{action}', Input: '{user_input}'")
+    
+    # Generate token if not provided
+    token = message.token
+    if not token:
+        logger.warning("🔄 VAPI_WEBHOOK: No token provided, generating new auth token...")
+        token = await generate_vapi_token()
+        if not token:
+            logger.error("❌ VAPI_WEBHOOK: Failed to generate authentication token")
+            return VapiResponse(
+                success=False,
+                message="Failed to generate authentication token. Please try again.",
+                action_detected="none",
+                endpoint_called="none"
+            )
+    else:
+        logger.warning("✅ VAPI_WEBHOOK: Using provided token")
+
+    logger.warning(f"🎯 VAPI_WEBHOOK: Starting workflow processing with action: {action}, input: '{user_input}'")
 
     # 3. Route to smart workflow handler
     try:
         # Always use smart auto-detection workflow for best results
+        logger.warning("🧠 VAPI_WORKFLOW: Starting intelligent action detection")
         determined_action = await determine_action_with_llm(user_input)
         
         if not determined_action:
+            logger.error("❌ VAPI_WORKFLOW: Action detection failed - no action determined")
             return VapiResponse(
                 success=False,
                 data=None,
@@ -698,6 +870,8 @@ async def handle_vapi_webhook(
                 endpoint_called="none"
             )
         
+        logger.warning(f"✅ VAPI_WORKFLOW: Action determined: {determined_action}")
+
         # === COMPANY-WIDE ACTIONS ===
         if determined_action in [
             "get_company_financial_summary", "get_company_revenue", "get_company_profit",
@@ -708,6 +882,7 @@ async def handle_vapi_webhook(
             "get_clock_requests", "get_pending_devices", "get_approved_devices",
             "get_all_shops", "get_all_dealerships", "get_injury_reports"
         ]:
+            logger.warning(f"🏢 VAPI_WORKFLOW: Routing to company-wide workflow: {determined_action}")
             workflow_result = await handle_company_wide_workflow(determined_action, user_input, token)
         
         # === EMPLOYEE-SPECIFIC ACTIONS ===
@@ -716,8 +891,10 @@ async def handle_vapi_webhook(
             "get_employee_admin_changes", "get_employee_vacation", "get_employee_devices",
             "get_employee_injuries", "update_employee_wage"
         ]:
+            logger.warning(f"👤 VAPI_WORKFLOW: Routing to employee-specific workflow: {determined_action}")
             employees = await get_all_employees_cached()
             if not employees:
+                logger.error("❌ VAPI_WORKFLOW: No employees found in system")
                 return VapiResponse(
                     success=False,
                     data=None,
@@ -726,8 +903,10 @@ async def handle_vapi_webhook(
                     endpoint_called="none"
                 )
             
+            logger.warning(f"🔍 VAPI_WORKFLOW: Finding employee match for: '{user_input}'")
             employee = await find_best_match_with_llm(user_input, employees, "employee")
             if not employee:
+                logger.error(f"❌ VAPI_WORKFLOW: Could not identify employee from input: '{user_input}'")
                 return VapiResponse(
                     success=False,
                     data=None,
@@ -736,6 +915,7 @@ async def handle_vapi_webhook(
                     endpoint_called="none"
                 )
             
+            logger.warning(f"✅ VAPI_WORKFLOW: Employee matched: {employee['name']} (ID: {employee['id']})")
             workflow_result = await handle_employee_specific_workflow(determined_action, employee, user_input, token)
         
         # === DEALERSHIP-SPECIFIC ACTIONS ===
@@ -744,8 +924,10 @@ async def handle_vapi_webhook(
             "get_dealership_comprehensive_labor", "get_dealership_labor_preview", "get_dealership_active_employees",
             "get_dealership_employee_hours", "get_dealership_injury_stats"
         ]:
+            logger.warning(f"🏪 VAPI_WORKFLOW: Routing to dealership-specific workflow: {determined_action}")
             dealerships = await get_all_dealerships_cached()
             if not dealerships:
+                logger.error("❌ VAPI_WORKFLOW: No dealerships found in system")
                 return VapiResponse(
                     success=False,
                     data=None,
@@ -754,8 +936,10 @@ async def handle_vapi_webhook(
                     endpoint_called="none"
                 )
             
+            logger.warning(f"🔍 VAPI_WORKFLOW: Finding dealership match for: '{user_input}'")
             dealership = await find_best_match_with_llm(user_input, dealerships, "dealership")
             if not dealership:
+                logger.error(f"❌ VAPI_WORKFLOW: Could not identify dealership from input: '{user_input}'")
                 return VapiResponse(
                     success=False,
                     data=None,
@@ -764,10 +948,11 @@ async def handle_vapi_webhook(
                     endpoint_called="none"
                 )
             
+            logger.warning(f"✅ VAPI_WORKFLOW: Dealership matched: {dealership['name']} (ID: {dealership['id']})")
             workflow_result = await handle_dealership_specific_workflow(determined_action, dealership, user_input, token)
         
         else:
-            logger.warning(f"Could not classify action. Raw input: {user_input}")
+            logger.error(f"❌ VAPI_WORKFLOW: Unknown action classification: {determined_action}")
             return VapiResponse(
                 success=False,
                 data=None,
@@ -777,6 +962,7 @@ async def handle_vapi_webhook(
             )
         
         # Return the workflow result with endpoint information
+        logger.warning(f"✅ VAPI_WEBHOOK: Workflow completed successfully - Action: {workflow_result.action_detected}, Endpoint: {workflow_result.endpoint_called}")
         return VapiResponse(
             success=workflow_result.success,
             data=workflow_result.data,
@@ -786,7 +972,7 @@ async def handle_vapi_webhook(
         )
         
     except Exception as e:
-        logger.error(f"Error processing workflow: {str(e)}")
+        logger.error(f"❌ VAPI_WEBHOOK: Critical error processing workflow: {str(e)}")
         return VapiResponse(
             success=False,
             data=None,

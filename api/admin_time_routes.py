@@ -469,6 +469,21 @@ def admin_direct_single_clock_creation(
 
     admin_uid = admin.get("uid", "unknown_admin")
 
+    # Check for existing punch at the same timestamp with same type and dealership
+    existing_punch = session.exec(
+        select(TimeLog)
+        .where(TimeLog.employee_id == payload.employee_id)
+        .where(TimeLog.timestamp == new_timestamp)
+        .where(TimeLog.punch_type == payload.punch_type)
+        .where(TimeLog.dealership_id == payload.dealership_id)
+    ).first()
+    
+    if existing_punch:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A {payload.punch_type.value} punch already exists for {payload.employee_id} at {format_utc_datetime(new_timestamp)} at {payload.dealership_id}"
+        )
+
     try:
         # Create the punch
         new_punch = TimeLog(
@@ -516,7 +531,10 @@ def admin_direct_single_clock_creation(
     except Exception as e:
         session.rollback()
         print(f"Error during single clock creation: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected error while creating punch")
+        print(f"Error type: {type(e)}")
+        import traceback
+        print(f"Full traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Unexpected error while creating punch: {str(e)}")
 
 @router.post("/direct-single-clock-delete")
 def admin_direct_single_clock_delete(

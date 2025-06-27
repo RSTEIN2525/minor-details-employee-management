@@ -24,6 +24,7 @@ grpcio==1.72.0rc1
 grpcio-status==1.72.0rc1
 h11==0.14.0
 httplib2==0.22.0
+httpx==0.28.1
 idna==3.10
 markdown-it-py==3.0.0
 mdurl==0.1.2
