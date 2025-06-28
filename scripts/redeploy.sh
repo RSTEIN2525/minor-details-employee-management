@@ -26,14 +26,19 @@ echo "Step 2/3: Pushing Docker image to GCR..."
 docker push gcr.io/minordetails-1aff3/employee-management-backend:latest
 echo "Docker image pushed to GCR successfully."
 
-# Step 3 (README Step 4): Deploy to Google Cloud Run
-echo "Step 3/3: Deploying to Google Cloud Run..."
+# Step 3 (README Step 4): Deploy to Google Cloud Run with High Performance Settings
+echo "Step 3/3: Deploying to Google Cloud Run with high performance settings..."
 gcloud run deploy employee-management-backend \
     --image gcr.io/minordetails-1aff3/employee-management-backend:latest \
     --platform managed \
     --region us-central1 \
     --allow-unauthenticated \
     --add-cloudsql-instances minordetails-1aff3:us-east4:minor-details-clock-in-out-db \
+    --memory 4Gi \
+    --cpu 2 \
+    --timeout 900 \
+    --concurrency 80 \
+    --max-instances 10 \
     --set-env-vars INSTANCE_CONNECTION_NAME=minordetails-1aff3:us-east4:minor-details-clock-in-out-db,DB_NAME=postgres,DB_USER=postgres,DB_PASSWORD=';(Ets?MBFK`^D`\>',VAPI_SECRET_TOKEN='kE7!pZ$r@N3qA*sV9bF2gH#jW1mX$yZ',INTERNAL_API_BASE_URL=https://employee-management-backend-507748767742.us-central1.run.app,OPENAI_API_KEY="$OPENAI_API_KEY" \
     --quiet
 echo "Deployment to Google Cloud Run successful."
