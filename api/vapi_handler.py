@@ -6,6 +6,8 @@ from pydantic import BaseModel
 import json
 import httpx
 from sqlmodel import Session
+from datetime import datetime, date
+import pytz
 
 # Import the functions we want to call directly
 from api.admin_analytics_routes import (
@@ -100,6 +102,10 @@ VAPI_SECRET_TOKEN = os.getenv("VAPI_SECRET_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 VAPI_TOKEN_GENERATOR_URL = "https://get-vapi-token-507748767742.us-east4.run.app"
 
+# External API endpoints
+INVOICE_REPORT_URL = "https://us-central1-minordetails-1aff3.cloudfunctions.net/generateInvoiceReportHTTP"
+PROFIT_LOSS_REPORT_URL = "https://us-central1-minordetails-1aff3.cloudfunctions.net/generateProfitLossReportHTTP"
+
 # Initialize OpenAI client
 try:
     import openai
@@ -112,22 +118,25 @@ except ImportError:
 
 async def generate_vapi_token() -> Optional[str]:
     """Generate a fresh auth token from the VAPI token service"""
-    logger.warning("🔄 VAPI_TOKEN_GENERATION: Starting token generation process")
+    logger.warning("[VAPI] 🔄 TOKEN_GENERATION: Starting token generation process")
+    logger.warning(f"[VAPI] 🔄 TOKEN_GENERATION: Using service URL: {VAPI_TOKEN_GENERATOR_URL}")
     try:
         async with httpx.AsyncClient() as client:
-            logger.warning(f"🔄 VAPI_TOKEN_GENERATION: Making POST request to {VAPI_TOKEN_GENERATOR_URL}")
+            logger.warning(f"[VAPI] 🔄 TOKEN_GENERATION: Making POST request to token service")
             response = await client.post(VAPI_TOKEN_GENERATOR_URL)
             response.raise_for_status()
             token_data = response.json()
             token = token_data.get("authToken")
             if token:
-                logger.warning(f"✅ VAPI_TOKEN_GENERATION: Successfully generated token (length: {len(token)})")
+                logger.warning(f"[VAPI] ✅ TOKEN_GENERATION: Successfully generated token (length: {len(token)})")
+                logger.warning(f"[VAPI] 🔑 TOKEN_GENERATION: Token prefix: {token[:20]}...")
                 return token
             else:
-                logger.error("❌ VAPI_TOKEN_GENERATION: Response missing authToken field")
+                logger.error("[VAPI] ❌ TOKEN_GENERATION: Response missing authToken field")
+                logger.error(f"[VAPI] ❌ TOKEN_GENERATION: Response data: {token_data}")
                 return None
     except Exception as e:
-        logger.error(f"❌ VAPI_TOKEN_GENERATION: Error generating token: {str(e)}")
+        logger.error(f"[VAPI] ❌ TOKEN_GENERATION: Error generating token: {str(e)}")
         return None
 
 # Pydantic models for request validation
@@ -157,56 +166,84 @@ _employee_cache = {"data": None, "timestamp": 0}
 _dealership_cache = {"data": None, "timestamp": 0}
 CACHE_TTL = 3600  # 1 hour
 
+def get_today_date() -> str:
+    """Get today's date in YYYY-MM-DD format using EST timezone"""
+    est = pytz.timezone('US/Eastern')
+    today_est = datetime.now(est).strftime("%Y-%m-%d")
+    logger.warning(f"[VAPI] 📅 Date Helper: Generated today's date in EST: {today_est}")
+    return today_est
+
 def fallback_action_detection(user_input: str) -> Optional[str]:
     """Simple keyword-based action detection when OpenAI isn't available"""
-    logger.warning(f"🔄 ACTION_DETECTION_FALLBACK: Processing input: '{user_input}'")
+    logger.warning(f"[VAPI] 🔄 ACTION_DETECTION_FALLBACK: Processing input: '{user_input}'")
     user_lower = user_input.lower()
     
-    # Financial keywords
-    if any(word in user_lower for word in ["financial", "revenue", "profit", "money", "cost"]):
+    # Revenue keywords - prioritize external APIs
+    if any(word in user_lower for word in ["revenue", "money", "income", "sales", "made", "earned"]):
+        if any(word in user_lower for word in ["today", "daily", "this day"]):
+            if any(word in user_lower for word in ["company", "total", "all", "overall"]):
+                logger.warning("[VAPI] ✅ ACTION_DETECTION_FALLBACK: Detected company daily revenue action")
+                return "get_company_daily_revenue"
+            else:
+                logger.warning("[VAPI] ✅ ACTION_DETECTION_FALLBACK: Detected dealership daily revenue action")
+                return "get_dealership_daily_revenue"
+        elif any(word in user_lower for word in ["company", "total", "all", "overall"]):
+            logger.warning("[VAPI] ✅ ACTION_DETECTION_FALLBACK: Detected company revenue action")
+            return "get_company_revenue_report"
+        else:
+            logger.warning("[VAPI] ✅ ACTION_DETECTION_FALLBACK: Detected dealership revenue action")
+            return "get_dealership_revenue_report"
+    
+    # P&L keywords
+    if any(word in user_lower for word in ["profit", "loss", "p&l", "pnl", "profitability"]):
+        logger.warning("[VAPI] ✅ ACTION_DETECTION_FALLBACK: Detected P&L action")
+        return "get_company_profit_loss"
+    
+    # Financial keywords (fallback to old endpoints)
+    if any(word in user_lower for word in ["financial", "cost"]):
         if any(word in user_lower for word in ["company", "total", "all"]):
-            logger.warning("✅ ACTION_DETECTION_FALLBACK: Detected company financial action")
+            logger.warning("[VAPI] ✅ ACTION_DETECTION_FALLBACK: Detected company financial action")
             return "get_company_financial_summary"
         else:
-            logger.warning("✅ ACTION_DETECTION_FALLBACK: Detected dealership financial action")
+            logger.warning("[VAPI] ✅ ACTION_DETECTION_FALLBACK: Detected dealership financial action")
             return "get_dealership_financial"
     
     # Labor keywords
     if any(word in user_lower for word in ["labor", "working", "active", "employees"]):
         if any(word in user_lower for word in ["all", "everyone", "company"]):
-            logger.warning("✅ ACTION_DETECTION_FALLBACK: Detected all active employees action")
+            logger.warning("[VAPI] ✅ ACTION_DETECTION_FALLBACK: Detected all active employees action")
             return "get_all_active_employees"
         else:
-            logger.warning("✅ ACTION_DETECTION_FALLBACK: Detected dealership employees action")
+            logger.warning("[VAPI] ✅ ACTION_DETECTION_FALLBACK: Detected dealership employees action")
             return "get_dealership_employees"
     
     # Employee keywords
     if any(word in user_lower for word in ["employee", "worker", "details", "performance"]):
-        logger.warning("✅ ACTION_DETECTION_FALLBACK: Detected employee details action")
+        logger.warning("[VAPI] ✅ ACTION_DETECTION_FALLBACK: Detected employee details action")
         return "get_employee_details"
     
     # Default to company overview
-    logger.warning("✅ ACTION_DETECTION_FALLBACK: Using default company financial summary")
+    logger.warning("[VAPI] ✅ ACTION_DETECTION_FALLBACK: Using default company financial summary")
     return "get_company_financial_summary"
 
 def fallback_entity_matching(user_input: str, candidates: List[Dict], match_type: str) -> Optional[Dict]:
     """Simple name matching when OpenAI isn't available"""
-    logger.warning(f"🔄 ENTITY_MATCHING_FALLBACK: Matching '{user_input}' against {len(candidates)} {match_type} candidates")
+    logger.warning(f"[VAPI] 🔄 ENTITY_MATCHING_FALLBACK: Matching '{user_input}' against {len(candidates)} {match_type} candidates")
     user_lower = user_input.lower()
     
     # Try exact name match first
     for candidate in candidates:
         name = candidate["name"].lower()
         if name in user_lower or any(part in user_lower for part in name.split()):
-            logger.warning(f"✅ ENTITY_MATCHING_FALLBACK: Found exact match: {candidate['name']} (ID: {candidate['id']})")
+            logger.warning(f"[VAPI] ✅ ENTITY_MATCHING_FALLBACK: Found exact match: {candidate['name']} (ID: {candidate['id']})")
             return candidate
     
     # If no match, return first candidate as fallback
     if candidates:
-        logger.warning(f"⚠️ ENTITY_MATCHING_FALLBACK: No exact match, using first candidate: {candidates[0]['name']} (ID: {candidates[0]['id']})")
+        logger.warning(f"[VAPI] ⚠️ ENTITY_MATCHING_FALLBACK: No exact match, using first candidate: {candidates[0]['name']} (ID: {candidates[0]['id']})")
         return candidates[0]
     
-    logger.warning("❌ ENTITY_MATCHING_FALLBACK: No candidates available")
+    logger.warning("[VAPI] ❌ ENTITY_MATCHING_FALLBACK: No candidates available")
     return None
 
 async def get_all_employees_cached():
@@ -214,15 +251,15 @@ async def get_all_employees_cached():
     import time
     current_time = time.time()
     
-    logger.warning(f"🔍 EMPLOYEE_CACHE: Checking cache (timestamp: {_employee_cache['timestamp']}, TTL: {CACHE_TTL})")
+    logger.warning(f"[VAPI] 🔍 EMPLOYEE_CACHE: Checking cache (timestamp: {_employee_cache['timestamp']}, TTL: {CACHE_TTL})")
     
     if (_employee_cache["data"] is None or 
         current_time - _employee_cache["timestamp"] > CACHE_TTL):
         
-        logger.warning("🔄 EMPLOYEE_CACHE: Cache expired or empty, refreshing employee cache...")
+        logger.warning("[VAPI] 🔄 EMPLOYEE_CACHE: Cache expired or empty, refreshing employee cache...")
         try:
             # Get all employees from Firestore
-            logger.warning("🔄 EMPLOYEE_CACHE: Querying Firestore for employees")
+            logger.warning("[VAPI] 🔄 EMPLOYEE_CACHE: Querying Firestore for employees")
             users_ref = firestore_db.collection("users").where(
                 "role", "in", ["employee", "clockOnlyEmployee", "minorDetailsManager", "minorDetailsSupervisor"]
             ).stream()
@@ -238,13 +275,13 @@ async def get_all_employees_cached():
             
             _employee_cache["data"] = employees
             _employee_cache["timestamp"] = current_time
-            logger.warning(f"✅ EMPLOYEE_CACHE: Successfully cached {len(employees)} employees")
+            logger.warning(f"[VAPI] ✅ EMPLOYEE_CACHE: Successfully cached {len(employees)} employees")
             
         except Exception as e:
-            logger.error(f"❌ EMPLOYEE_CACHE: Error fetching employees: {str(e)}")
+            logger.error(f"[VAPI] ❌ EMPLOYEE_CACHE: Error fetching employees: {str(e)}")
             return []
     else:
-        logger.warning(f"✅ EMPLOYEE_CACHE: Using cached data ({len(_employee_cache['data'] or [])} employees)")
+        logger.warning(f"[VAPI] ✅ EMPLOYEE_CACHE: Using cached data ({len(_employee_cache['data'] or [])} employees)")
     
     return _employee_cache["data"]
 
@@ -253,18 +290,18 @@ async def get_all_dealerships_cached():
     import time
     current_time = time.time()
     
-    logger.warning(f"🔍 DEALERSHIP_CACHE: Checking cache (timestamp: {_dealership_cache['timestamp']}, TTL: {CACHE_TTL})")
+    logger.warning(f"[VAPI] 🔍 DEALERSHIP_CACHE: Checking cache (timestamp: {_dealership_cache['timestamp']}, TTL: {CACHE_TTL})")
     
     if (_dealership_cache["data"] is None or 
         current_time - _dealership_cache["timestamp"] > CACHE_TTL):
         
-        logger.warning("🔄 DEALERSHIP_CACHE: Cache expired or empty, refreshing dealership cache...")
+        logger.warning("[VAPI] 🔄 DEALERSHIP_CACHE: Cache expired or empty, refreshing dealership cache...")
         try:
             admin_user = {"role": "admin"}
-            logger.warning("🔄 DEALERSHIP_CACHE: Calling list_all_dealerships API")
+            logger.warning("[VAPI] 🔄 DEALERSHIP_CACHE: Calling list_all_dealerships API")
             dealerships_models = await list_all_dealerships(admin_user=admin_user)
             
-            logger.warning(f"🔄 DEALERSHIP_CACHE: Converting {len(dealerships_models)} Pydantic models to dictionaries")
+            logger.warning(f"[VAPI] 🔄 DEALERSHIP_CACHE: Converting {len(dealerships_models)} Pydantic models to dictionaries")
             # Convert Pydantic models to dictionaries for entity matching
             dealerships = []
             for dealership_model in dealerships_models:
@@ -275,26 +312,26 @@ async def get_all_dealerships_cached():
             
             _dealership_cache["data"] = dealerships
             _dealership_cache["timestamp"] = current_time
-            logger.warning(f"✅ DEALERSHIP_CACHE: Successfully cached {len(dealerships)} dealerships")
+            logger.warning(f"[VAPI] ✅ DEALERSHIP_CACHE: Successfully cached {len(dealerships)} dealerships")
             
         except Exception as e:
-            logger.error(f"❌ DEALERSHIP_CACHE: Error fetching dealerships: {str(e)}")
+            logger.error(f"[VAPI] ❌ DEALERSHIP_CACHE: Error fetching dealerships: {str(e)}")
             return []
     else:
-        logger.warning(f"✅ DEALERSHIP_CACHE: Using cached data ({len(_dealership_cache['data'] or [])} dealerships)")
+        logger.warning(f"[VAPI] ✅ DEALERSHIP_CACHE: Using cached data ({len(_dealership_cache['data'] or [])} dealerships)")
     
     return _dealership_cache["data"]
 
 async def determine_action_with_llm(user_input: str) -> Optional[str]:
     """Use OpenAI to determine what action the user wants to perform"""
-    logger.warning(f"🔄 ACTION_DETECTION_LLM: Processing input: '{user_input}'")
+    logger.warning(f"[VAPI] 🔄 ACTION_DETECTION_LLM: Processing input: '{user_input}'")
     
     if not OPENAI_AVAILABLE:
-        logger.warning("⚠️ ACTION_DETECTION_LLM: OpenAI not available, using fallback")
+        logger.warning("[VAPI] ⚠️ ACTION_DETECTION_LLM: OpenAI not available, using fallback")
         return fallback_action_detection(user_input)
     
     try:
-        logger.warning("🔄 ACTION_DETECTION_LLM: Making OpenAI API call")
+        logger.warning("[VAPI] 🔄 ACTION_DETECTION_LLM: Making OpenAI API call")
         response = openai.ChatCompletion.create(
             model="gpt-4.1",
             messages=[
@@ -304,10 +341,15 @@ async def determine_action_with_llm(user_input: str) -> Optional[str]:
 
 AVAILABLE ACTIONS:
 
-COMPANY-WIDE ACTIONS:
-- get_company_financial_summary: Company revenue, profit, financial overview
-- get_company_revenue: Total company revenue
-- get_company_profit: Company profit/loss
+REVENUE & P&L ACTIONS (PRIORITY - USE THESE FOR REVENUE/MONEY/SALES QUESTIONS):
+- get_dealership_daily_revenue: Daily revenue for a specific dealership
+- get_dealership_revenue_report: Revenue report for a dealership over date range
+- get_company_daily_revenue: Company-wide daily revenue (P&L for today)
+- get_company_revenue_report: Company revenue over date range
+- get_company_profit_loss: Company profit & loss report
+
+COMPANY-WIDE ACTIONS (NON-REVENUE):
+- get_company_financial_summary: Company financial overview (costs, not revenue)
 - get_all_dealerships_financial: Financial summary for all dealerships
 - get_top_financial_performers: Top performing dealerships
 - get_all_dealerships_labor_costs: Labor costs across all dealerships
@@ -337,8 +379,8 @@ EMPLOYEE-SPECIFIC ACTIONS:
 - get_employee_devices: Employee's approved devices
 - get_employee_injuries: Employee injury history
 
-DEALERSHIP-SPECIFIC ACTIONS:
-- get_dealership_financial: Dealership financial summary
+DEALERSHIP-SPECIFIC ACTIONS (NON-REVENUE):
+- get_dealership_financial: Dealership financial summary (costs, not revenue)
 - get_dealership_detailed_breakdown: Detailed financial breakdown for dealership
 - get_dealership_labor: Dealership labor costs
 - get_dealership_comprehensive_labor: Comprehensive labor analysis for dealership
@@ -346,6 +388,12 @@ DEALERSHIP-SPECIFIC ACTIONS:
 - get_dealership_active_employees: Active employees at specific dealership
 - get_dealership_employee_hours: Employee hours breakdown for dealership
 - get_dealership_injury_stats: Dealership injury statistics
+
+IMPORTANT: 
+- For revenue, sales, money made, income questions → use revenue/P&L actions
+- For cost, expense, labor questions → use financial actions
+- For "today" or "daily" questions → use daily variants
+- For P&L, profit, loss questions → use get_company_profit_loss
 
 Respond with ONLY the action name, nothing else."""
                 },
@@ -359,28 +407,28 @@ Respond with ONLY the action name, nothing else."""
         )
         
         action = response.choices[0].message.content.strip()
-        logger.warning(f"✅ ACTION_DETECTION_LLM: OpenAI determined action: {action}")
+        logger.warning(f"[VAPI] ✅ ACTION_DETECTION_LLM: OpenAI determined action: {action}")
         return action
         
     except Exception as e:
-        logger.error(f"❌ ACTION_DETECTION_LLM: Error using OpenAI: {str(e)}")
-        logger.warning("🔄 ACTION_DETECTION_LLM: Falling back to keyword detection")
+        logger.error(f"[VAPI] ❌ ACTION_DETECTION_LLM: Error using OpenAI: {str(e)}")
+        logger.warning("[VAPI] 🔄 ACTION_DETECTION_LLM: Falling back to keyword detection")
         return fallback_action_detection(user_input)
 
 async def find_best_match_with_llm(user_input: str, candidates: List[Dict], match_type: str) -> Optional[Dict]:
     """Use OpenAI to find the best matching employee or dealership"""
-    logger.warning(f"🔄 ENTITY_MATCHING_LLM: Matching '{user_input}' against {len(candidates)} {match_type} candidates")
+    logger.warning(f"[VAPI] 🔄 ENTITY_MATCHING_LLM: Matching '{user_input}' against {len(candidates)} {match_type} candidates")
     
     if not OPENAI_AVAILABLE or not candidates:
         if not OPENAI_AVAILABLE:
-            logger.warning("⚠️ ENTITY_MATCHING_LLM: OpenAI not available, using fallback")
+            logger.warning("[VAPI] ⚠️ ENTITY_MATCHING_LLM: OpenAI not available, using fallback")
         else:
-            logger.warning("⚠️ ENTITY_MATCHING_LLM: No candidates provided, using fallback")
+            logger.warning("[VAPI] ⚠️ ENTITY_MATCHING_LLM: No candidates provided, using fallback")
         return fallback_entity_matching(user_input, candidates, match_type)
     
     try:
         candidates_text = "\n".join([f"ID: {c['id']}, Name: {c['name']}" for c in candidates])
-        logger.warning(f"🔄 ENTITY_MATCHING_LLM: Making OpenAI API call for {match_type} matching")
+        logger.warning(f"[VAPI] 🔄 ENTITY_MATCHING_LLM: Making OpenAI API call for {match_type} matching")
         
         response = openai.ChatCompletion.create(
             model="gpt-4.1",
@@ -407,39 +455,258 @@ Respond with ONLY the ID of the best match, nothing else. If no good match, resp
         )
         
         match_id = response.choices[0].message.content.strip()
-        logger.warning(f"🔄 ENTITY_MATCHING_LLM: OpenAI returned match ID: {match_id}")
+        logger.warning(f"[VAPI] 🔄 ENTITY_MATCHING_LLM: OpenAI returned match ID: {match_id}")
         
         if match_id == "NONE":
-            logger.warning("⚠️ ENTITY_MATCHING_LLM: OpenAI found no good match")
+            logger.warning("[VAPI] ⚠️ ENTITY_MATCHING_LLM: OpenAI found no good match")
             return None
             
         # Find the candidate with matching ID
         for candidate in candidates:
             if candidate["id"] == match_id:
-                logger.warning(f"✅ ENTITY_MATCHING_LLM: Successfully matched '{user_input}' to {match_type}: {candidate['name']} (ID: {candidate['id']})")
+                logger.warning(f"[VAPI] ✅ ENTITY_MATCHING_LLM: Successfully matched '{user_input}' to {match_type}: {candidate['name']} (ID: {candidate['id']})")
                 return candidate
         
         # Fallback to simple matching if LLM returned invalid ID
-        logger.warning(f"⚠️ ENTITY_MATCHING_LLM: Invalid ID returned ({match_id}), using fallback")
+        logger.warning(f"[VAPI] ⚠️ ENTITY_MATCHING_LLM: Invalid ID returned ({match_id}), using fallback")
         return fallback_entity_matching(user_input, candidates, match_type)
         
     except Exception as e:
-        logger.error(f"❌ ENTITY_MATCHING_LLM: Error using OpenAI: {str(e)}")
-        logger.warning("🔄 ENTITY_MATCHING_LLM: Falling back to keyword matching")
+        logger.error(f"[VAPI] ❌ ENTITY_MATCHING_LLM: Error using OpenAI: {str(e)}")
+        logger.warning("[VAPI] 🔄 ENTITY_MATCHING_LLM: Falling back to keyword matching")
         return fallback_entity_matching(user_input, candidates, match_type)
+
+async def call_external_invoice_report(dealership_name: str, start_date: str, end_date: str, token: str) -> Dict[str, Any]:
+    """Call external invoice report API for dealership revenue data"""
+    logger.warning(f"[VAPI] 📊 EXTERNAL_API: Calling invoice report for {dealership_name} from {start_date} to {end_date}")
+    
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "dealership": dealership_name,
+        "startDate": start_date,
+        "endDate": end_date,
+        "includeServiceWashData": True,
+        "includePhotosData": True,
+        "includeLotPrepData": True,
+        "role": "owner"
+    }
+    
+    logger.warning(f"[VAPI] 📤 EXTERNAL_API: Sending payload: {json.dumps(payload, indent=2)}")
+    logger.warning(f"[VAPI] 📤 EXTERNAL_API: Using headers: {headers}")
+    
+    try:
+        # Increase timeout for invoice API - financial calculations may take longer
+        timeout_seconds = 90.0
+        logger.warning(f"[VAPI] ⏱️ EXTERNAL_API: Using timeout: {timeout_seconds} seconds")
+        
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            logger.warning(f"[VAPI] 🔄 EXTERNAL_API: Making POST request to {INVOICE_REPORT_URL}")
+            
+            # Track request timing for debugging
+            import time
+            start_time = time.time()
+            
+            response = await client.post(INVOICE_REPORT_URL, headers=headers, json=payload)
+            
+            end_time = time.time()
+            duration = end_time - start_time
+            logger.warning(f"[VAPI] ⏱️ EXTERNAL_API: Request completed in {duration:.2f} seconds")
+            
+            logger.warning(f"[VAPI] 📥 EXTERNAL_API: Response status: {response.status_code}")
+            logger.warning(f"[VAPI] 📥 EXTERNAL_API: Response headers: {dict(response.headers)}")
+            
+            # Log response content for debugging
+            try:
+                response_text = response.text
+                logger.warning(f"[VAPI] 📥 EXTERNAL_API: Response body: {response_text}")
+            except Exception as text_error:
+                logger.warning(f"[VAPI] ⚠️ EXTERNAL_API: Could not read response text: {str(text_error)}")
+                
+            response.raise_for_status()
+            result = response.json()
+            logger.warning(f"[VAPI] ✅ EXTERNAL_API: Successfully retrieved invoice report for {dealership_name}")
+            return result
+    except httpx.HTTPStatusError as http_error:
+        logger.error(f"[VAPI] ❌ EXTERNAL_API: HTTP Error {http_error.response.status_code}: {http_error.response.text}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Invoice API returned {http_error.response.status_code}: {http_error.response.text}"
+        )
+    except httpx.TimeoutException:
+        logger.error(f"[VAPI] ❌ EXTERNAL_API: Timeout calling invoice report API")
+        raise HTTPException(status_code=500, detail="Invoice API request timed out")
+    except Exception as e:
+        logger.error(f"[VAPI] ❌ EXTERNAL_API: Error calling invoice report API: {str(e)}")
+        logger.error(f"[VAPI] ❌ EXTERNAL_API: Error type: {type(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch invoice report: {str(e)}")
+
+async def call_external_daily_report(dealership_name: str, target_date: str, token: str) -> Dict[str, Any]:
+    """Call external daily report API for single day dealership revenue"""
+    logger.warning(f"[VAPI] 📊 EXTERNAL_API: Calling daily report for {dealership_name} on {target_date}")
+    
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "dealership": dealership_name,
+        "startDate": target_date,
+        "endDate": target_date,
+        "role": "owner",
+        "userDepartment": "All",
+        "canSeeGrandTotal": True
+    }
+    
+    logger.warning(f"[VAPI] 📤 EXTERNAL_API: Sending payload: {json.dumps(payload, indent=2)}")
+    logger.warning(f"[VAPI] 📤 EXTERNAL_API: Using headers: {headers}")
+    
+    try:
+        # Increase timeout for daily report API - financial calculations may take longer
+        timeout_seconds = 90.0
+        logger.warning(f"[VAPI] ⏱️ EXTERNAL_API: Using timeout: {timeout_seconds} seconds")
+        
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            logger.warning(f"[VAPI] 🔄 EXTERNAL_API: Making POST request to {INVOICE_REPORT_URL}")
+            
+            # Track request timing for debugging
+            import time
+            start_time = time.time()
+            
+            response = await client.post(INVOICE_REPORT_URL, headers=headers, json=payload)
+            
+            end_time = time.time()
+            duration = end_time - start_time
+            logger.warning(f"[VAPI] ⏱️ EXTERNAL_API: Request completed in {duration:.2f} seconds")
+            
+            logger.warning(f"[VAPI] 📥 EXTERNAL_API: Response status: {response.status_code}")
+            logger.warning(f"[VAPI] 📥 EXTERNAL_API: Response headers: {dict(response.headers)}")
+            
+            # Log response content for debugging
+            try:
+                response_text = response.text
+                logger.warning(f"[VAPI] 📥 EXTERNAL_API: Response body: {response_text}")
+            except Exception as text_error:
+                logger.warning(f"[VAPI] ⚠️ EXTERNAL_API: Could not read response text: {str(text_error)}")
+                
+            response.raise_for_status()
+            result = response.json()
+            logger.warning(f"[VAPI] ✅ EXTERNAL_API: Successfully retrieved daily report for {dealership_name}")
+            return result
+    except httpx.HTTPStatusError as http_error:
+        logger.error(f"[VAPI] ❌ EXTERNAL_API: HTTP Error {http_error.response.status_code}: {http_error.response.text}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Daily Report API returned {http_error.response.status_code}: {http_error.response.text}"
+        )
+    except httpx.TimeoutException:
+        logger.error(f"[VAPI] ❌ EXTERNAL_API: Timeout calling daily report API")
+        raise HTTPException(status_code=500, detail="Daily Report API request timed out")
+    except Exception as e:
+        logger.error(f"[VAPI] ❌ EXTERNAL_API: Error calling daily report API: {str(e)}")
+        logger.error(f"[VAPI] ❌ EXTERNAL_API: Error type: {type(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch daily report: {str(e)}")
+
+async def call_external_profit_loss_report(target_date: str, token: str) -> Dict[str, Any]:
+    """Call external profit/loss report API for company P&L"""
+    logger.warning(f"[VAPI] 📊 EXTERNAL_API: Calling P&L report for {target_date}")
+    
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "startDate": target_date,
+        "endDate": target_date
+    }
+    
+    logger.warning(f"[VAPI] 📤 EXTERNAL_API: Sending payload: {json.dumps(payload, indent=2)}")
+    logger.warning(f"[VAPI] 📤 EXTERNAL_API: Using headers: {headers}")
+    
+    try:
+        # Increase timeout for P&L API - complex financial calculations may take longer
+        timeout_seconds = 90.0
+        logger.warning(f"[VAPI] ⏱️ EXTERNAL_API: Using timeout: {timeout_seconds} seconds")
+        
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            logger.warning(f"[VAPI] 🔄 EXTERNAL_API: Making POST request to {PROFIT_LOSS_REPORT_URL}")
+            
+            # Track request timing for debugging
+            import time
+            start_time = time.time()
+            
+            response = await client.post(PROFIT_LOSS_REPORT_URL, headers=headers, json=payload)
+            
+            end_time = time.time()
+            duration = end_time - start_time
+            logger.warning(f"[VAPI] ⏱️ EXTERNAL_API: Request completed in {duration:.2f} seconds")
+            
+            logger.warning(f"[VAPI] 📥 EXTERNAL_API: Response status: {response.status_code}")
+            logger.warning(f"[VAPI] 📥 EXTERNAL_API: Response headers: {dict(response.headers)}")
+            
+            # Log response content for debugging
+            try:
+                response_text = response.text
+                logger.warning(f"[VAPI] 📥 EXTERNAL_API: Response body: {response_text}")
+            except Exception as text_error:
+                logger.warning(f"[VAPI] ⚠️ EXTERNAL_API: Could not read response text: {str(text_error)}")
+            
+            response.raise_for_status()
+            result = response.json()
+            logger.warning(f"[VAPI] ✅ EXTERNAL_API: Successfully retrieved P&L report for {target_date}")
+            return result
+    except httpx.HTTPStatusError as http_error:
+        logger.error(f"[VAPI] ❌ EXTERNAL_API: HTTP Error {http_error.response.status_code}: {http_error.response.text}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"P&L API returned {http_error.response.status_code}: {http_error.response.text}"
+        )
+    except httpx.TimeoutException:
+        logger.error(f"[VAPI] ❌ EXTERNAL_API: Timeout calling P&L report API")
+        raise HTTPException(status_code=500, detail="P&L API request timed out")
+    except Exception as e:
+        logger.error(f"[VAPI] ❌ EXTERNAL_API: Error calling P&L report API: {str(e)}")
+        logger.error(f"[VAPI] ❌ EXTERNAL_API: Error type: {type(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch P&L report: {str(e)}")
 
 async def handle_company_wide_workflow(action: str, user_input: str, token: str) -> WorkflowResult:
     """Handle company-wide workflows"""
-    logger.warning(f"🏢 COMPANY_WORKFLOW: Starting company-wide workflow - Action: {action}")
+    logger.warning(f"[VAPI] 🏢 COMPANY_WORKFLOW: Starting company-wide workflow - Action: {action}")
+    logger.warning(f"[VAPI] 🏢 COMPANY_WORKFLOW: User input: '{user_input}'")
     
     try:
-        logger.warning("🔐 COMPANY_WORKFLOW: Validating admin token")
+        logger.warning("[VAPI] 🔐 COMPANY_WORKFLOW: Validating admin token")
         admin_user = require_admin_role_from_token(token)
         session = next(get_session())
         
         try:
+            # REVENUE & P&L ACTIONS (External APIs)
+            if action == "get_company_daily_revenue":
+                logger.warning("[VAPI] 💰 COMPANY_WORKFLOW: Calling external P&L report for today")
+                today = get_today_date()
+                result = await call_external_profit_loss_report(today, token)
+                message = "Retrieved company daily revenue and P&L for today"
+                endpoint = "external_profit_loss_report"
+            elif action == "get_company_revenue_report":
+                logger.warning("[VAPI] 💰 COMPANY_WORKFLOW: Calling external P&L report (using today as default)")
+                today = get_today_date()
+                result = await call_external_profit_loss_report(today, token)
+                message = "Retrieved company revenue report"
+                endpoint = "external_profit_loss_report"
+            elif action == "get_company_profit_loss":
+                logger.warning("[VAPI] 📊 COMPANY_WORKFLOW: Calling external P&L report")
+                today = get_today_date()
+                result = await call_external_profit_loss_report(today, token)
+                message = "Retrieved company profit & loss report"
+                endpoint = "external_profit_loss_report"
+            
             # Financial Analytics
-            if action == "get_company_financial_summary":
+            elif action == "get_company_financial_summary":
                 logger.warning("📊 COMPANY_WORKFLOW: Calling get_company_financial_summary_today")
                 result = await get_company_financial_summary_today(session=session, admin=admin_user)
                 message = "Retrieved company financial summary for today"
@@ -472,8 +739,10 @@ async def handle_company_wide_workflow(action: str, user_input: str, token: str)
                 message = "Retrieved labor costs for all dealerships"
                 endpoint = "get_all_dealerships_labor_costs_today"
             elif action == "get_enhanced_daily_labor":
-                logger.warning("📊 COMPANY_WORKFLOW: Calling get_enhanced_daily_labor_spend")
-                result = await get_enhanced_daily_labor_spend(session=session, admin_user=admin_user)
+                logger.warning("[VAPI] 📊 COMPANY_WORKFLOW: Calling get_enhanced_daily_labor_spend")
+                today = get_today_date()
+                logger.warning(f"[VAPI] 📊 COMPANY_WORKFLOW: Using target date: {today}")
+                result = await get_enhanced_daily_labor_spend(session=session, admin_user=admin_user, target_date=today)
                 message = "Retrieved enhanced daily labor analysis"
                 endpoint = "get_enhanced_daily_labor_spend"
             elif action == "get_weekly_labor":
@@ -575,7 +844,8 @@ async def handle_company_wide_workflow(action: str, user_input: str, token: str)
                     endpoint_called="none"
                 )
             
-            logger.warning(f"✅ COMPANY_WORKFLOW: Successfully completed {endpoint}")
+            logger.warning(f"[VAPI] ✅ COMPANY_WORKFLOW: Successfully completed {endpoint}")
+            logger.warning(f"[VAPI] 📊 COMPANY_WORKFLOW: Response summary - Endpoint: {endpoint}, Action: {action}")
             return WorkflowResult(
                 success=True, 
                 data=result, 
@@ -586,10 +856,10 @@ async def handle_company_wide_workflow(action: str, user_input: str, token: str)
             
         finally:
             session.close()
-            logger.warning("🔐 COMPANY_WORKFLOW: Database session closed")
+            logger.warning("[VAPI] 🔐 COMPANY_WORKFLOW: Database session closed")
             
     except Exception as e:
-        logger.error(f"❌ COMPANY_WORKFLOW: Error in workflow: {str(e)}")
+        logger.error(f"[VAPI] ❌ COMPANY_WORKFLOW: Error in workflow: {str(e)}")
         return WorkflowResult(
             success=False, 
             message=f"Error retrieving company data: {str(e)}",
@@ -689,15 +959,32 @@ async def handle_dealership_specific_workflow(action: str, dealership: Dict, use
     dealership_id = dealership["id"]
     dealership_name = dealership["name"]
     
-    logger.warning(f"🏪 DEALERSHIP_WORKFLOW: Starting dealership workflow - Action: {action}, Dealership: {dealership_name} (ID: {dealership_id})")
+    logger.warning(f"[VAPI] 🏪 DEALERSHIP_WORKFLOW: Starting dealership workflow - Action: {action}, Dealership: {dealership_name} (ID: {dealership_id})")
+    logger.warning(f"[VAPI] 🏪 DEALERSHIP_WORKFLOW: User input: '{user_input}'")
     
     try:
-        logger.warning("🔐 DEALERSHIP_WORKFLOW: Validating admin token")
+        logger.warning("[VAPI] 🔐 DEALERSHIP_WORKFLOW: Validating admin token")
         admin_user = require_admin_role_from_token(token)
         session = next(get_session())
         
         try:
-            if action == "get_dealership_financial":
+            # REVENUE ACTIONS (External APIs)
+            if action == "get_dealership_daily_revenue":
+                logger.warning(f"[VAPI] 💰 DEALERSHIP_WORKFLOW: Calling external daily report for {dealership_name}")
+                today = get_today_date()
+                result = await call_external_daily_report(dealership_name, today, token)
+                message = f"Retrieved daily revenue for {dealership_name}"
+                endpoint = "external_daily_report"
+            elif action == "get_dealership_revenue_report":
+                logger.warning(f"[VAPI] 📊 DEALERSHIP_WORKFLOW: Calling external invoice report for {dealership_name}")
+                today = get_today_date()
+                # For now, use today as both start and end date. Could be enhanced to parse date ranges from user input
+                result = await call_external_invoice_report(dealership_name, today, today, token)
+                message = f"Retrieved revenue report for {dealership_name}"
+                endpoint = "external_invoice_report"
+            
+            # FINANCIAL ACTIONS (Internal APIs)
+            elif action == "get_dealership_financial":
                 logger.warning(f"📊 DEALERSHIP_WORKFLOW: Calling get_dealership_financial_summary for {dealership_name}")
                 result = await get_dealership_financial_summary(dealership_id=dealership_id, session=session, admin=admin_user)
                 message = f"Retrieved financial summary for {dealership_name}"
@@ -800,21 +1087,27 @@ async def handle_vapi_webhook(
     }
     """
     
-    logger.warning("🚀 VAPI_WEBHOOK: Incoming webhook request received")
+    logger.warning("[VAPI] 🚀 WEBHOOK: === INCOMING VAPI REQUEST ===")
+    logger.warning("[VAPI] 🚀 WEBHOOK: Webhook request received from VAPI")
     
     # 1. Authenticate the webhook request from Vapi
-    logger.warning("🔐 VAPI_WEBHOOK: Validating x-vapi-secret header")
+    logger.warning("[VAPI] 🔐 WEBHOOK: Validating x-vapi-secret header")
     if not x_vapi_secret or x_vapi_secret != VAPI_SECRET_TOKEN:
-        logger.error("❌ VAPI_WEBHOOK: Authentication failed - Invalid or missing x-vapi-secret header")
+        logger.error("[VAPI] ❌ WEBHOOK: Authentication failed - Invalid or missing x-vapi-secret header")
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing x-vapi-secret header")
+    logger.warning("[VAPI] ✅ WEBHOOK: Authentication successful")
 
     # Debug: Print the incoming payload
-    logger.warning(f"🔍 VAPI_WEBHOOK: Payload received: {message.model_dump()}")
-    print(f"🔍 VAPI Webhook Payload: {message.model_dump()}")
+    logger.warning(f"[VAPI] 📋 WEBHOOK: Raw payload received: {message.model_dump()}")
+    logger.warning(f"[VAPI] 📋 WEBHOOK: Message type: {message.type}")
+    logger.warning(f"[VAPI] 📋 WEBHOOK: Action: {message.action}")
+    logger.warning(f"[VAPI] 📋 WEBHOOK: User input: '{message.user_input}'")
+    logger.warning(f"[VAPI] 📋 WEBHOOK: Token provided: {'Yes' if message.token else 'No'}")
 
     # 2. Process only "workflow" messages with required fields
     if message.type != "workflow":
-        logger.warning(f"⚠️ VAPI_WEBHOOK: Non-workflow message type received: {message.type}")
+        logger.warning(f"[VAPI] ⚠️ WEBHOOK: Non-workflow message type received: {message.type}")
+        logger.warning("[VAPI] 🚫 WEBHOOK: Skipping processing - not a workflow message")
         return VapiResponse(
             success=False, 
             message="Request processed. No workflow action taken.",
@@ -823,7 +1116,7 @@ async def handle_vapi_webhook(
         )
     
     if not message.action or not message.user_input:
-        logger.error("❌ VAPI_WEBHOOK: Missing required fields (action or user_input)")
+        logger.error("[VAPI] ❌ WEBHOOK: Missing required fields (action or user_input)")
         return VapiResponse(
             success=False, 
             message="Missing required fields: action and user_input are required.",
@@ -834,34 +1127,37 @@ async def handle_vapi_webhook(
     action = message.action
     user_input = message.user_input
     
-    logger.warning(f"📝 VAPI_WEBHOOK: Processing workflow - Action: '{action}', Input: '{user_input}'")
+    logger.warning(f"[VAPI] ✅ WEBHOOK: Valid workflow message received")
+    logger.warning(f"[VAPI] 📝 WEBHOOK: Processing workflow - Action: '{action}', Input: '{user_input}'")
     
     # Generate token if not provided
     token = message.token
     if not token:
-        logger.warning("🔄 VAPI_WEBHOOK: No token provided, generating new auth token...")
+        logger.warning("[VAPI] 🔄 WEBHOOK: No token provided, generating new auth token...")
         token = await generate_vapi_token()
         if not token:
-            logger.error("❌ VAPI_WEBHOOK: Failed to generate authentication token")
+            logger.error("[VAPI] ❌ WEBHOOK: Failed to generate authentication token")
             return VapiResponse(
                 success=False,
                 message="Failed to generate authentication token. Please try again.",
                 action_detected="none",
                 endpoint_called="none"
             )
+        logger.warning("[VAPI] ✅ WEBHOOK: Successfully generated new auth token")
     else:
-        logger.warning("✅ VAPI_WEBHOOK: Using provided token")
+        logger.warning("[VAPI] ✅ WEBHOOK: Using provided token")
 
-    logger.warning(f"🎯 VAPI_WEBHOOK: Starting workflow processing with action: {action}, input: '{user_input}'")
+    logger.warning(f"[VAPI] 🎯 WEBHOOK: Starting intelligent workflow processing...")
+    logger.warning(f"[VAPI] 🎯 WEBHOOK: Input analysis - Action: '{action}', User says: '{user_input}'")
 
     # 3. Route to smart workflow handler
     try:
         # Always use smart auto-detection workflow for best results
-        logger.warning("🧠 VAPI_WORKFLOW: Starting intelligent action detection")
+        logger.warning("[VAPI] 🧠 WORKFLOW: Starting intelligent action detection")
         determined_action = await determine_action_with_llm(user_input)
         
         if not determined_action:
-            logger.error("❌ VAPI_WORKFLOW: Action detection failed - no action determined")
+            logger.error("[VAPI] ❌ WORKFLOW: Action detection failed - no action determined")
             return VapiResponse(
                 success=False,
                 data=None,
@@ -870,10 +1166,12 @@ async def handle_vapi_webhook(
                 endpoint_called="none"
             )
         
-        logger.warning(f"✅ VAPI_WORKFLOW: Action determined: {determined_action}")
+        logger.warning(f"[VAPI] ✅ WORKFLOW: Action determined: {determined_action}")
+        logger.warning(f"[VAPI] 🎯 WORKFLOW: AI Decision - '{user_input}' → '{determined_action}'")
 
         # === COMPANY-WIDE ACTIONS ===
         if determined_action in [
+            "get_company_daily_revenue", "get_company_revenue_report", "get_company_profit_loss",
             "get_company_financial_summary", "get_company_revenue", "get_company_profit",
             "get_all_dealerships_financial", "get_top_financial_performers",
             "get_all_dealerships_labor_costs", "get_enhanced_daily_labor", "get_weekly_labor",
@@ -882,7 +1180,7 @@ async def handle_vapi_webhook(
             "get_clock_requests", "get_pending_devices", "get_approved_devices",
             "get_all_shops", "get_all_dealerships", "get_injury_reports"
         ]:
-            logger.warning(f"🏢 VAPI_WORKFLOW: Routing to company-wide workflow: {determined_action}")
+            logger.warning(f"[VAPI] 🏢 WORKFLOW: Routing to company-wide workflow: {determined_action}")
             workflow_result = await handle_company_wide_workflow(determined_action, user_input, token)
         
         # === EMPLOYEE-SPECIFIC ACTIONS ===
@@ -891,10 +1189,10 @@ async def handle_vapi_webhook(
             "get_employee_admin_changes", "get_employee_vacation", "get_employee_devices",
             "get_employee_injuries", "update_employee_wage"
         ]:
-            logger.warning(f"👤 VAPI_WORKFLOW: Routing to employee-specific workflow: {determined_action}")
+            logger.warning(f"[VAPI] 👤 WORKFLOW: Routing to employee-specific workflow: {determined_action}")
             employees = await get_all_employees_cached()
             if not employees:
-                logger.error("❌ VAPI_WORKFLOW: No employees found in system")
+                logger.error("[VAPI] ❌ WORKFLOW: No employees found in system")
                 return VapiResponse(
                     success=False,
                     data=None,
@@ -903,10 +1201,10 @@ async def handle_vapi_webhook(
                     endpoint_called="none"
                 )
             
-            logger.warning(f"🔍 VAPI_WORKFLOW: Finding employee match for: '{user_input}'")
+            logger.warning(f"[VAPI] 🔍 WORKFLOW: Finding employee match for: '{user_input}'")
             employee = await find_best_match_with_llm(user_input, employees, "employee")
             if not employee:
-                logger.error(f"❌ VAPI_WORKFLOW: Could not identify employee from input: '{user_input}'")
+                logger.error(f"[VAPI] ❌ WORKFLOW: Could not identify employee from input: '{user_input}'")
                 return VapiResponse(
                     success=False,
                     data=None,
@@ -915,19 +1213,20 @@ async def handle_vapi_webhook(
                     endpoint_called="none"
                 )
             
-            logger.warning(f"✅ VAPI_WORKFLOW: Employee matched: {employee['name']} (ID: {employee['id']})")
+            logger.warning(f"[VAPI] ✅ WORKFLOW: Employee matched: {employee['name']} (ID: {employee['id']})")
             workflow_result = await handle_employee_specific_workflow(determined_action, employee, user_input, token)
         
         # === DEALERSHIP-SPECIFIC ACTIONS ===
         elif determined_action in [
+            "get_dealership_daily_revenue", "get_dealership_revenue_report",
             "get_dealership_financial", "get_dealership_detailed_breakdown", "get_dealership_labor",
             "get_dealership_comprehensive_labor", "get_dealership_labor_preview", "get_dealership_active_employees",
             "get_dealership_employee_hours", "get_dealership_injury_stats"
         ]:
-            logger.warning(f"🏪 VAPI_WORKFLOW: Routing to dealership-specific workflow: {determined_action}")
+            logger.warning(f"[VAPI] 🏪 WORKFLOW: Routing to dealership-specific workflow: {determined_action}")
             dealerships = await get_all_dealerships_cached()
             if not dealerships:
-                logger.error("❌ VAPI_WORKFLOW: No dealerships found in system")
+                logger.error("[VAPI] ❌ WORKFLOW: No dealerships found in system")
                 return VapiResponse(
                     success=False,
                     data=None,
@@ -936,10 +1235,10 @@ async def handle_vapi_webhook(
                     endpoint_called="none"
                 )
             
-            logger.warning(f"🔍 VAPI_WORKFLOW: Finding dealership match for: '{user_input}'")
+            logger.warning(f"[VAPI] 🔍 WORKFLOW: Finding dealership match for: '{user_input}'")
             dealership = await find_best_match_with_llm(user_input, dealerships, "dealership")
             if not dealership:
-                logger.error(f"❌ VAPI_WORKFLOW: Could not identify dealership from input: '{user_input}'")
+                logger.error(f"[VAPI] ❌ WORKFLOW: Could not identify dealership from input: '{user_input}'")
                 return VapiResponse(
                     success=False,
                     data=None,
@@ -948,11 +1247,11 @@ async def handle_vapi_webhook(
                     endpoint_called="none"
                 )
             
-            logger.warning(f"✅ VAPI_WORKFLOW: Dealership matched: {dealership['name']} (ID: {dealership['id']})")
+            logger.warning(f"[VAPI] ✅ WORKFLOW: Dealership matched: {dealership['name']} (ID: {dealership['id']})")
             workflow_result = await handle_dealership_specific_workflow(determined_action, dealership, user_input, token)
         
         else:
-            logger.error(f"❌ VAPI_WORKFLOW: Unknown action classification: {determined_action}")
+            logger.error(f"[VAPI] ❌ WORKFLOW: Unknown action classification: {determined_action}")
             return VapiResponse(
                 success=False,
                 data=None,
@@ -962,7 +1261,8 @@ async def handle_vapi_webhook(
             )
         
         # Return the workflow result with endpoint information
-        logger.warning(f"✅ VAPI_WEBHOOK: Workflow completed successfully - Action: {workflow_result.action_detected}, Endpoint: {workflow_result.endpoint_called}")
+        logger.warning(f"[VAPI] ✅ WEBHOOK: Workflow completed successfully - Action: {workflow_result.action_detected}, Endpoint: {workflow_result.endpoint_called}")
+        logger.warning(f"[VAPI] 🎉 WEBHOOK: === FINAL RESPONSE === Success: {workflow_result.success}, Message: '{workflow_result.message}'")
         return VapiResponse(
             success=workflow_result.success,
             data=workflow_result.data,
@@ -972,7 +1272,8 @@ async def handle_vapi_webhook(
         )
         
     except Exception as e:
-        logger.error(f"❌ VAPI_WEBHOOK: Critical error processing workflow: {str(e)}")
+        logger.error(f"[VAPI] ❌ WEBHOOK: Critical error processing workflow: {str(e)}")
+        logger.error(f"[VAPI] 💥 WEBHOOK: === ERROR RESPONSE === {str(e)}")
         return VapiResponse(
             success=False,
             data=None,
