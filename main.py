@@ -9,6 +9,7 @@ import models.admin_time_change # New model for tracking admin time changes
 import models.device_photo # New model for device photos stored in database
 import models.vacation_time # New model for vacation time tracking
 import models.shift_change # Ensure this model is known by SQLModel for table creation
+import models.employee_schedule # New model for employee scheduling system
 from db.session import engine
 from contextlib import asynccontextmanager
 from api.time_routes import router as time_router
@@ -24,6 +25,7 @@ from api.admin_time_routes import router as admin_time_router
 from api.admin_injury_routes import router as admin_injury_router
 from api.admin_vacation_routes import router as admin_vacation_router
 from api.admin_financial_routes import router as admin_financial_router
+from api.admin_scheduling_routes import router as admin_scheduling_router
 from api.shop_routes import router as shop_router
 from api.vapi_handler import router as vapi_router
 import logging # Add this import
@@ -91,5 +93,6 @@ app.include_router(admin_time_router, prefix="/admin/time", tags=["Admin", "Dire
 app.include_router(admin_injury_router, prefix="/admin/injury", tags=["Admin", "Injury Reports"])
 app.include_router(admin_vacation_router, prefix="/admin/vacation", tags=["Admin", "Vacation Management"])
 app.include_router(admin_financial_router, prefix="/admin/financial", tags=["Admin", "Financial Analytics"])
+app.include_router(admin_scheduling_router, prefix="/admin/scheduling", tags=["Admin", "Employee Scheduling"])
 app.include_router(shop_router, prefix="/shops", tags=["Shops", "Geofence"])
 app.include_router(vapi_router, prefix="/api", tags=["Vapi", "Webhook"])

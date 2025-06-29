@@ -2,13 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
 from pydantic import BaseModel, ConfigDict, field_serializer
 from typing import List, Optional
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone, date, time
 from db.session import get_session #
 from core.deps import get_current_user #
 from core.firebase import db as firestore_db #
 from models.time_log import TimeLog, PunchType #
 from models.vacation_time import VacationTime #
 from utils.datetime_helpers import format_utc_datetime
+from models.employee_schedule import EmployeeScheduledShift, ShiftStatus
 
 router = APIRouter()
 
@@ -168,6 +169,14 @@ class UserVacationSummaryResponse(BaseModel):
     total_vacation_pay: float
     vacation_entries: List[VacationTimeEntry]
     message: str
+
+class UpcomingShiftResponse(BaseModel):
+    dealership_name: str
+    shift_date: date
+    start_time: time
+    end_time: time
+    status: ShiftStatus
+    notes: Optional[str] = None
 
 # --- Helper Functions ---
 
@@ -1302,5 +1311,50 @@ async def get_user_vacation_time(
         total_vacation_hours=total_hours,
         total_vacation_pay=round(total_pay, 2),
         vacation_entries=formatted_entries,
-        message=f"Found {len(vacation_entries)} vacation entries totaling {total_hours} hours worth ${round(total_pay, 2)}"
+        message=f"Found {len(formatted_entries)} vacation entries."
     )
+
+@router.get("/user/upcoming-shifts", response_model=List[UpcomingShiftResponse])
+async def get_upcoming_shifts(
+    session: Session = Depends(get_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Get all future scheduled shifts for the logged-in employee.
+    """
+    user_id = current_user["uid"]
+    today = date.today()
+
+    try:
+        # Query for shifts that are on or after today and are not cancelled
+        upcoming_shifts_stmt = (
+            select(EmployeeScheduledShift)
+            .where(EmployeeScheduledShift.employee_id == user_id)
+            .where(EmployeeScheduledShift.shift_date >= today)
+            .where(EmployeeScheduledShift.status.in_([ShiftStatus.SCHEDULED, ShiftStatus.CONFIRMED]))
+            .order_by(EmployeeScheduledShift.shift_date.asc(), EmployeeScheduledShift.start_time.asc())
+        )
+        
+        shift_records = session.exec(upcoming_shifts_stmt).all()
+        
+        # Format the response
+        response = [
+            UpcomingShiftResponse(
+                dealership_name=shift.dealership_name,
+                shift_date=shift.shift_date,
+                start_time=shift.start_time,
+                end_time=shift.end_time,
+                status=shift.status,
+                notes=shift.notes,
+            )
+            for shift in shift_records
+        ]
+        
+        return response
+        
+    except Exception as e:
+        print(f"Error fetching upcoming shifts for user {user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not retrieve upcoming shifts.",
+        )
