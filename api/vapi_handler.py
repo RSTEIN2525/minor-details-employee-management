@@ -1,13 +1,14 @@
 import os
 import logging
-from typing import Optional, Dict, Any, List
-from fastapi import APIRouter, HTTPException, Header, Request
+from typing import Optional, Dict, Any, List, Tuple
+from fastapi import APIRouter, HTTPException, Header, Request, BackgroundTasks
 from pydantic import BaseModel
 import json
 import httpx
 from sqlmodel import Session
 from datetime import datetime, date
 import pytz
+import asyncio
 
 # Import the functions we want to call directly
 from api.admin_analytics_routes import (
@@ -164,7 +165,9 @@ class VapiResponse(BaseModel):
 # Cache for employees and dealerships (refresh every hour)
 _employee_cache = {"data": None, "timestamp": 0}
 _dealership_cache = {"data": None, "timestamp": 0}
+_pnl_cache = {"data": None, "timestamp": 0}
 CACHE_TTL = 3600  # 1 hour
+PNL_CACHE_TTL = 600 # 10 minutes
 
 def get_today_date() -> str:
     """Get today's date in YYYY-MM-DD format using EST timezone"""
@@ -342,11 +345,12 @@ async def determine_action_with_llm(user_input: str) -> Optional[str]:
 AVAILABLE ACTIONS:
 
 REVENUE & P&L ACTIONS (PRIORITY - USE THESE FOR REVENUE/MONEY/SALES QUESTIONS):
-- get_dealership_daily_revenue: Daily revenue for a specific dealership
-- get_dealership_revenue_report: Revenue report for a dealership over date range
-- get_company_daily_revenue: Company-wide daily revenue (P&L for today)
-- get_company_revenue_report: Company revenue over date range
-- get_company_profit_loss: Company profit & loss report
+- get_dealership_daily_revenue: For a specific dealership's revenue on a SINGLE DAY (e.g. "today", "yesterday", "on June 5th").
+- get_dealership_revenue_report: For a specific dealership's revenue over a DATE RANGE (e.g. "this week", "last month", "this quarter"). This is for an invoice or revenue report.
+- get_dealership_daily_pnl: For a specific dealership's Profit & Loss (P&L) on a SINGLE DAY. Use this if a dealership name is mentioned in a P&L query.
+- get_company_daily_revenue: For company-wide revenue on a SINGLE DAY (P&L for today).
+- get_company_revenue_report: For company-wide revenue over a DATE RANGE.
+- get_company_profit_loss: For COMPANY-WIDE Profit & Loss (P&L) report, which is always for a single day. Use this ONLY if NO dealership is mentioned.
 
 COMPANY-WIDE ACTIONS (NON-REVENUE):
 - get_company_financial_summary: Company financial overview (costs, not revenue)
@@ -390,10 +394,14 @@ DEALERSHIP-SPECIFIC ACTIONS (NON-REVENUE):
 - get_dealership_injury_stats: Dealership injury statistics
 
 IMPORTANT: 
-- For revenue, sales, money made, income questions → use revenue/P&L actions
-- For cost, expense, labor questions → use financial actions
-- For "today" or "daily" questions → use daily variants
-- For P&L, profit, loss questions → use get_company_profit_loss
+- For revenue, sales, money made, income questions → use revenue/P&L actions.
+- For cost, expense, labor questions → use financial actions.
+- CRITICALLY IMPORTANT: You must distinguish between a single day revenue request ("daily") and a date range revenue request ("report").
+  - If the user asks for "today's revenue", "daily report", or for a specific date, use a `_daily_revenue` action.
+  - If the user asks for revenue over a "week", "month", "quarter", or a date range, use a `_revenue_report` action.
+- For P&L, profit, or loss questions:
+  - If a dealership is mentioned, use `get_dealership_daily_pnl`.
+  - If it's for the whole company or no dealership is mentioned, use `get_company_profit_loss`.
 
 Respond with ONLY the action name, nothing else."""
                 },
@@ -476,6 +484,60 @@ Respond with ONLY the ID of the best match, nothing else. If no good match, resp
         logger.warning("[VAPI] 🔄 ENTITY_MATCHING_LLM: Falling back to keyword matching")
         return fallback_entity_matching(user_input, candidates, match_type)
 
+async def extract_dates_with_llm(user_input: str) -> Dict[str, Optional[str]]:
+    """Use OpenAI to extract a start and end date from user input."""
+    logger.warning(f"[VAPI] 🔄 DATE_EXTRACTION_LLM: Processing input for date extraction: '{user_input}'")
+    
+    if not OPENAI_AVAILABLE:
+        logger.warning("[VAPI] ⚠️ DATE_EXTRACTION_LLM: OpenAI not available, using fallback.")
+        return {"start_date": None, "end_date": None}
+
+    try:
+        # Provide current date for context, especially for relative terms like "today" or "yesterday"
+        current_date_info = f"For context, the current date is {datetime.now(pytz.timezone('US/Eastern')).strftime('%Y-%m-%d')}."
+
+        response = openai.ChatCompletion.create(
+            model="gpt-4.1",
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"""You are an AI assistant that extracts start and end dates from user text.
+{current_date_info}
+- Your task is to identify if the user is asking for a report for a specific date range.
+- Interpret terms like "today", "yesterday", "this week", "last month", "from June 1st to June 15th".
+- If a date range is found, return it as a JSON object with "start_date" and "end_date" in "YYYY-MM-DD" format.
+- If only a single date is mentioned, use it for both start_date and end_date.
+- If no specific dates are mentioned, return null for both values.
+
+Examples:
+- "How much money did we make last week?" -> {{"start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}} (with calculated dates for last week)
+- "Show me the report for June 5th 2024" -> {{"start_date": "2024-06-05", "end_date": "2024-06-05"}}
+- "What about from January 1 to January 31?" -> {{"start_date": "YYYY-01-01", "end_date": "YYYY-01-31"}} (with current year)
+- "Get me the company financial summary" -> {{"start_date": null, "end_date": null}}
+
+Respond with ONLY the JSON object, nothing else."""
+                },
+                {
+                    "role": "user",
+                    "content": f"Extract date range from this input: '{user_input}'"
+                }
+            ],
+            max_tokens=100,
+            temperature=0.0
+        )
+
+        dates_str = response.choices[0].message.content.strip()
+        logger.warning(f"[VAPI] ✅ DATE_EXTRACTION_LLM: OpenAI returned: {dates_str}")
+        
+        # Parse the JSON and return it
+        dates = json.loads(dates_str)
+        return dates
+
+    except Exception as e:
+        logger.error(f"[VAPI] ❌ DATE_EXTRACTION_LLM: Error during date extraction: {str(e)}")
+        # Fallback if LLM fails
+        return {"start_date": None, "end_date": None}
+
 async def call_external_invoice_report(dealership_name: str, start_date: str, end_date: str, token: str) -> Dict[str, Any]:
     """Call external invoice report API for dealership revenue data"""
     logger.warning(f"[VAPI] 📊 EXTERNAL_API: Calling invoice report for {dealership_name} from {start_date} to {end_date}")
@@ -544,76 +606,9 @@ async def call_external_invoice_report(dealership_name: str, start_date: str, en
         logger.error(f"[VAPI] ❌ EXTERNAL_API: Error type: {type(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch invoice report: {str(e)}")
 
-async def call_external_daily_report(dealership_name: str, target_date: str, token: str) -> Dict[str, Any]:
-    """Call external daily report API for single day dealership revenue"""
-    logger.warning(f"[VAPI] 📊 EXTERNAL_API: Calling daily report for {dealership_name} on {target_date}")
-    
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "dealership": dealership_name,
-        "startDate": target_date,
-        "endDate": target_date,
-        "role": "owner",
-        "userDepartment": "All",
-        "canSeeGrandTotal": True
-    }
-    
-    logger.warning(f"[VAPI] 📤 EXTERNAL_API: Sending payload: {json.dumps(payload, indent=2)}")
-    logger.warning(f"[VAPI] 📤 EXTERNAL_API: Using headers: {headers}")
-    
-    try:
-        # Increase timeout for daily report API - financial calculations may take longer
-        timeout_seconds = 90.0
-        logger.warning(f"[VAPI] ⏱️ EXTERNAL_API: Using timeout: {timeout_seconds} seconds")
-        
-        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            logger.warning(f"[VAPI] 🔄 EXTERNAL_API: Making POST request to {INVOICE_REPORT_URL}")
-            
-            # Track request timing for debugging
-            import time
-            start_time = time.time()
-            
-            response = await client.post(INVOICE_REPORT_URL, headers=headers, json=payload)
-            
-            end_time = time.time()
-            duration = end_time - start_time
-            logger.warning(f"[VAPI] ⏱️ EXTERNAL_API: Request completed in {duration:.2f} seconds")
-            
-            logger.warning(f"[VAPI] 📥 EXTERNAL_API: Response status: {response.status_code}")
-            logger.warning(f"[VAPI] 📥 EXTERNAL_API: Response headers: {dict(response.headers)}")
-            
-            # Log response content for debugging
-            try:
-                response_text = response.text
-                logger.warning(f"[VAPI] 📥 EXTERNAL_API: Response body: {response_text}")
-            except Exception as text_error:
-                logger.warning(f"[VAPI] ⚠️ EXTERNAL_API: Could not read response text: {str(text_error)}")
-                
-            response.raise_for_status()
-            result = response.json()
-            logger.warning(f"[VAPI] ✅ EXTERNAL_API: Successfully retrieved daily report for {dealership_name}")
-            return result
-    except httpx.HTTPStatusError as http_error:
-        logger.error(f"[VAPI] ❌ EXTERNAL_API: HTTP Error {http_error.response.status_code}: {http_error.response.text}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Daily Report API returned {http_error.response.status_code}: {http_error.response.text}"
-        )
-    except httpx.TimeoutException:
-        logger.error(f"[VAPI] ❌ EXTERNAL_API: Timeout calling daily report API")
-        raise HTTPException(status_code=500, detail="Daily Report API request timed out")
-    except Exception as e:
-        logger.error(f"[VAPI] ❌ EXTERNAL_API: Error calling daily report API: {str(e)}")
-        logger.error(f"[VAPI] ❌ EXTERNAL_API: Error type: {type(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch daily report: {str(e)}")
-
-async def call_external_profit_loss_report(target_date: str, token: str) -> Dict[str, Any]:
+async def call_external_profit_loss_report(start_date: str, end_date: str, token: str) -> Dict[str, Any]:
     """Call external profit/loss report API for company P&L"""
-    logger.warning(f"[VAPI] 📊 EXTERNAL_API: Calling P&L report for {target_date}")
+    logger.warning(f"[VAPI] 📊 EXTERNAL_API: Calling P&L report from {start_date} to {end_date}")
     
     headers = {
         "Authorization": f"Bearer {token}",
@@ -621,8 +616,8 @@ async def call_external_profit_loss_report(target_date: str, token: str) -> Dict
     }
     
     payload = {
-        "startDate": target_date,
-        "endDate": target_date
+        "startDate": start_date,
+        "endDate": end_date
     }
     
     logger.warning(f"[VAPI] 📤 EXTERNAL_API: Sending payload: {json.dumps(payload, indent=2)}")
@@ -658,7 +653,7 @@ async def call_external_profit_loss_report(target_date: str, token: str) -> Dict
             
             response.raise_for_status()
             result = response.json()
-            logger.warning(f"[VAPI] ✅ EXTERNAL_API: Successfully retrieved P&L report for {target_date}")
+            logger.warning(f"[VAPI] ✅ EXTERNAL_API: Successfully retrieved P&L report for {start_date}")
             return result
     except httpx.HTTPStatusError as http_error:
         logger.error(f"[VAPI] ❌ EXTERNAL_API: HTTP Error {http_error.response.status_code}: {http_error.response.text}")
@@ -674,6 +669,71 @@ async def call_external_profit_loss_report(target_date: str, token: str) -> Dict
         logger.error(f"[VAPI] ❌ EXTERNAL_API: Error type: {type(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch P&L report: {str(e)}")
 
+async def get_pnl_for_single_dealership(dealership: Dict, today: str, token: str, session: Session, admin_user: Dict) -> Dict[str, Any]:
+    """Fetches revenue and labor cost for a single dealership for a given day."""
+    dealership_id = dealership["id"]
+    dealership_name = dealership["name"]
+
+    logger.warning(f"[VAPI] 📊 PNL_HELPER: Fetching P&L for {dealership_name}")
+    
+    revenue_task = call_external_invoice_report(dealership_name, today, today, token)
+    labor_spend_task = get_dealership_labor_spend(dealership_id=dealership_id, session=session, admin_user=admin_user)
+    
+    try:
+        revenue_data, labor_spend_data = await asyncio.gather(
+            revenue_task,
+            labor_spend_task
+        )
+        
+        total_revenue = revenue_data.get("grandTotal", 0)
+        total_labor_cost = labor_spend_data.total_labor_spend
+        
+        return {
+            "dealership_name": dealership_name,
+            "revenue": total_revenue,
+            "labor_cost": total_labor_cost,
+            "pnl": total_revenue - total_labor_cost
+        }
+    except Exception as e:
+        logger.error(f"[VAPI] ❌ PNL_HELPER: Failed to get P&L for {dealership_name}: {str(e)}")
+        # Return zero values on failure so it doesn't break the aggregation
+        return {
+            "dealership_name": dealership_name,
+            "revenue": 0,
+            "labor_cost": 0,
+            "pnl": 0
+        }
+
+async def calculate_aggregated_company_pnl(dealerships: List[Dict], token: str, session: Session, admin_user: Dict) -> Tuple[Dict, str]:
+    """Helper to calculate company-wide PNL by aggregating dealership data."""
+    if not dealerships:
+        return ({"error": "No dealerships found"}, "No dealerships found to calculate P&L.")
+
+    today = get_today_date()
+    
+    pnl_tasks = [
+        get_pnl_for_single_dealership(dealership, today, token, session, admin_user) 
+        for dealership in dealerships
+    ]
+    
+    dealership_pnl_results = await asyncio.gather(*pnl_tasks)
+    
+    total_revenue = sum(r['revenue'] for r in dealership_pnl_results)
+    total_labor_cost = sum(r['labor_cost'] for r in dealership_pnl_results)
+    total_pnl = total_revenue - total_labor_cost
+
+    result = {
+        "calculation_method": "dealership_aggregation",
+        "total_revenue": total_revenue,
+        "total_labor_cost": total_labor_cost,
+        "total_profit_loss": total_pnl,
+        "date": today,
+        "dealership_breakdown": dealership_pnl_results
+    }
+    
+    message = f"Retrieved company-wide P&L for {today} by aggregating all dealerships."
+    return result, message
+
 async def handle_company_wide_workflow(action: str, user_input: str, token: str) -> WorkflowResult:
     """Handle company-wide workflows"""
     logger.warning(f"[VAPI] 🏢 COMPANY_WORKFLOW: Starting company-wide workflow - Action: {action}")
@@ -687,23 +747,25 @@ async def handle_company_wide_workflow(action: str, user_input: str, token: str)
         try:
             # REVENUE & P&L ACTIONS (External APIs)
             if action == "get_company_daily_revenue":
-                logger.warning("[VAPI] 💰 COMPANY_WORKFLOW: Calling external P&L report for today")
-                today = get_today_date()
-                result = await call_external_profit_loss_report(today, token)
-                message = "Retrieved company daily revenue and P&L for today"
-                endpoint = "external_profit_loss_report"
+                logger.warning("[VAPI] 💰 COMPANY_WORKFLOW: Calculating company-wide daily revenue via aggregation.")
+                dealerships = await get_all_dealerships_cached()
+                result, message = await calculate_aggregated_company_pnl(dealerships, token, session, admin_user)
+                endpoint = "aggregated_dealership_pnl"
             elif action == "get_company_revenue_report":
-                logger.warning("[VAPI] 💰 COMPANY_WORKFLOW: Calling external P&L report (using today as default)")
-                today = get_today_date()
-                result = await call_external_profit_loss_report(today, token)
-                message = "Retrieved company revenue report"
+                logger.warning("[VAPI] 💰 COMPANY_WORKFLOW: Calling external P&L report (date range aware)")
+                dates = await extract_dates_with_llm(user_input)
+                start_date = dates.get("start_date") or get_today_date()
+                end_date = dates.get("end_date") or get_today_date()
+                
+                logger.warning(f"[VAPI] 💰 COMPANY_WORKFLOW: Using date range: {start_date} to {end_date}")
+                result = await call_external_profit_loss_report(start_date, end_date, token)
+                message = f"Retrieved company revenue report from {start_date} to {end_date}"
                 endpoint = "external_profit_loss_report"
             elif action == "get_company_profit_loss":
-                logger.warning("[VAPI] 📊 COMPANY_WORKFLOW: Calling external P&L report")
-                today = get_today_date()
-                result = await call_external_profit_loss_report(today, token)
-                message = "Retrieved company profit & loss report"
-                endpoint = "external_profit_loss_report"
+                logger.warning("[VAPI] 📊 COMPANY_WORKFLOW: Calculating company-wide P&L via aggregation.")
+                dealerships = await get_all_dealerships_cached()
+                result, message = await calculate_aggregated_company_pnl(dealerships, token, session, admin_user)
+                endpoint = "aggregated_dealership_pnl"
             
             # Financial Analytics
             elif action == "get_company_financial_summary":
@@ -954,6 +1016,50 @@ async def handle_employee_specific_workflow(action: str, employee: Dict, user_in
             endpoint_called="error"
         )
 
+async def handle_dealership_pnl_workflow(dealership: Dict, user_input: str, token: str) -> WorkflowResult:
+    """Handle the specific workflow for getting a dealership's daily P&L."""
+    dealership_id = dealership["id"]
+    dealership_name = dealership["name"]
+    action = "get_dealership_daily_pnl"
+
+    logger.warning(f"[VAPI] 📈 DEALERSHIP_PNL_WORKFLOW: Starting for {dealership_name}")
+    
+    try:
+        admin_user = require_admin_role_from_token(token)
+        session = next(get_session())
+        
+        try:
+            # 1. Get today's date
+            today = get_today_date()
+            logger.warning(f"[VAPI] 📅 DEALERSHIP_PNL_WORKFLOW: Using date: {today}")
+
+            # 2. Use the helper to get PNL data
+            result = await get_pnl_for_single_dealership(dealership, today, token, session, admin_user)
+
+            # 3. Format the final message
+            message = f"Retrieved daily P&L for {dealership_name} on {today}"
+
+            return WorkflowResult(
+                success=True,
+                data=result,
+                message=message,
+                endpoint_called="get_dealership_daily_pnl",
+                action_detected=action
+            )
+
+        finally:
+            session.close()
+            logger.warning("[VAPI] 🔐 DEALERSHIP_PNL_WORKFLOW: Database session closed")
+
+    except Exception as e:
+        logger.error(f"[VAPI] ❌ DEALERSHIP_PNL_WORKFLOW: Error in P&L workflow for {dealership_name}: {str(e)}")
+        return WorkflowResult(
+            success=False,
+            message=f"Error calculating daily P&L: {str(e)}",
+            action_detected=action,
+            endpoint_called="error"
+        )
+
 async def handle_dealership_specific_workflow(action: str, dealership: Dict, user_input: str, token: str) -> WorkflowResult:
     """Handle dealership-specific workflows"""
     dealership_id = dealership["id"]
@@ -972,15 +1078,20 @@ async def handle_dealership_specific_workflow(action: str, dealership: Dict, use
             if action == "get_dealership_daily_revenue":
                 logger.warning(f"[VAPI] 💰 DEALERSHIP_WORKFLOW: Calling external daily report for {dealership_name}")
                 today = get_today_date()
-                result = await call_external_daily_report(dealership_name, today, token)
+                result = await call_external_invoice_report(dealership_name, today, today, token)
                 message = f"Retrieved daily revenue for {dealership_name}"
-                endpoint = "external_daily_report"
+                endpoint = "external_invoice_report"
             elif action == "get_dealership_revenue_report":
                 logger.warning(f"[VAPI] 📊 DEALERSHIP_WORKFLOW: Calling external invoice report for {dealership_name}")
-                today = get_today_date()
-                # For now, use today as both start and end date. Could be enhanced to parse date ranges from user input
-                result = await call_external_invoice_report(dealership_name, today, today, token)
-                message = f"Retrieved revenue report for {dealership_name}"
+                
+                logger.warning(f"[VAPI] 📅 DEALERSHIP_WORKFLOW: Extracting date range from user input: '{user_input}'")
+                dates = await extract_dates_with_llm(user_input)
+                start_date = dates.get("start_date") or get_today_date()
+                end_date = dates.get("end_date") or get_today_date()
+                logger.warning(f"[VAPI] 📅 DEALERSHIP_WORKFLOW: Extracted date range: {start_date} to {end_date}")
+                
+                result = await call_external_invoice_report(dealership_name, start_date, end_date, token)
+                message = f"Retrieved revenue report for {dealership_name} from {start_date} to {end_date}"
                 endpoint = "external_invoice_report"
             
             # FINANCIAL ACTIONS (Internal APIs)
@@ -1054,6 +1165,68 @@ async def handle_dealership_specific_workflow(action: str, dealership: Dict, use
             action_detected=action,
             endpoint_called="error"
         )
+
+async def update_pnl_cache(token: str):
+    """The background task to calculate and cache company P&L."""
+    logger.warning("[VAPI] 🔄 PNL_CACHE_WORKER: Starting background P&L calculation.")
+    try:
+        # We need a session and admin_user for the calculation
+        admin_user = require_admin_role_from_token(token)
+        session = next(get_session())
+        
+        try:
+            dealerships = await get_all_dealerships_cached()
+            if not dealerships:
+                logger.error("[VAPI] ❌ PNL_CACHE_WORKER: No dealerships found, cannot update cache.")
+                return
+
+            # This is the heavy lifting part
+            result, _ = await calculate_aggregated_company_pnl(dealerships, token, session, admin_user)
+            
+            # Update cache
+            import time
+            _pnl_cache["data"] = result
+            _pnl_cache["timestamp"] = time.time()
+            logger.warning("[VAPI] ✅ PNL_CACHE_WORKER: Successfully updated company-wide P&L cache.")
+
+        finally:
+            session.close()
+
+    except Exception as e:
+        logger.error(f"[VAPI] ❌ PNL_CACHE_WORKER: Failed to update P&L cache in background: {str(e)}")
+
+@router.post("/initiate-pnl-calculation")
+async def initiate_pnl_calculation(
+    background_tasks: BackgroundTasks,
+    request: Request
+):
+    """
+    Triggers a background task to calculate and cache the company-wide P&L report.
+    This is designed to be called proactively to "pre-warm" the cache.
+    """
+    logger.warning("[VAPI] 🚀 PNL_TRIGGER: Received request to initiate P&L calculation.")
+    
+    # Authenticate the trigger endpoint itself
+    x_vapi_secret = request.headers.get('x-vapi-secret')
+    if not x_vapi_secret or x_vapi_secret != VAPI_SECRET_TOKEN:
+        logger.error("[VAPI] ❌ PNL_TRIGGER: Authentication failed - Invalid or missing x-vapi-secret header")
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing x-vapi-secret header")
+    
+    # Get admin token from header or generate a new one for the background task
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith("Bearer "):
+        logger.warning("[VAPI] ⚠️ PNL_TRIGGER: No admin token provided, generating one for the background task.")
+        token = await generate_vapi_token()
+        if not token:
+            logger.error("[VAPI] ❌ PNL_TRIGGER: Failed to generate token for background task.")
+            raise HTTPException(status_code=500, detail="Failed to generate authentication token for background processing.")
+    else:
+        token = auth_header.split("Bearer ")[1]
+
+    logger.warning("[VAPI] ✅ PNL_TRIGGER: Authentication successful. Adding P&L calculation to background tasks.")
+    background_tasks.add_task(update_pnl_cache, token)
+    
+    return {"message": "Company-wide P&L calculation initiated in the background. The result will be cached for 10 minutes."}
 
 @router.post("/vapi-webhook")
 async def handle_vapi_webhook(
@@ -1250,6 +1423,19 @@ async def handle_vapi_webhook(
             logger.warning(f"[VAPI] ✅ WORKFLOW: Dealership matched: {dealership['name']} (ID: {dealership['id']})")
             workflow_result = await handle_dealership_specific_workflow(determined_action, dealership, user_input, token)
         
+        # === DEALERSHIP P&L WORKFLOW ===
+        elif determined_action == "get_dealership_daily_pnl":
+            logger.warning(f"[VAPI] 📈 WORKFLOW: Routing to dealership P&L workflow")
+            dealerships = await get_all_dealerships_cached()
+            if not dealerships:
+                return VapiResponse(success=False, message="No dealerships found.")
+            
+            dealership = await find_best_match_with_llm(user_input, dealerships, "dealership")
+            if not dealership:
+                return VapiResponse(success=False, message="Could not identify the dealership.")
+                
+            workflow_result = await handle_dealership_pnl_workflow(dealership, user_input, token)
+
         else:
             logger.error(f"[VAPI] ❌ WORKFLOW: Unknown action classification: {determined_action}")
             return VapiResponse(
