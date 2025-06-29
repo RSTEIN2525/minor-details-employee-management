@@ -10,6 +10,7 @@ from models.time_log import TimeLog, PunchType #
 from models.vacation_time import VacationTime #
 from utils.datetime_helpers import format_utc_datetime
 from models.employee_schedule import EmployeeScheduledShift, ShiftStatus
+from zoneinfo import ZoneInfo
 
 router = APIRouter()
 
@@ -1323,7 +1324,9 @@ async def get_upcoming_shifts(
     Get all future scheduled shifts for the logged-in employee.
     """
     user_id = current_user["uid"]
-    today = date.today()
+    
+    est = ZoneInfo("America/New_York")
+    today = datetime.now(est).date()
 
     try:
         # Query for shifts that are on or after today and are not cancelled

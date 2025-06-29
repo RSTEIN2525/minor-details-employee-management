@@ -316,36 +316,39 @@ async def create_scheduled_shift(
     Creates a new scheduled shift for an employee.
     """
     try:
-        # 1. Get Employee and Dealership names from Firestore
+        # 1. Get Employee name from Firestore
         try:
             employee_doc = firestore_db.collection("users").document(shift_request.employee_id).get()
             employee_name = employee_doc.to_dict().get("displayName", "Unknown Employee")
         except Exception as e:
             raise HTTPException(status_code=404, detail=f"Employee with ID {shift_request.employee_id} not found: {e}")
 
+        # 2. Verify the dealership ID from the request exists. The name is the ID.
+        dealership_id_from_request = shift_request.dealership_id
         try:
-            dealership_doc = firestore_db.collection("dealerships").document(shift_request.dealership_id).get()
-            dealership_name = dealership_doc.to_dict().get("name", "Unknown Dealership")
+            dealership_doc = firestore_db.collection("dealerships").document(dealership_id_from_request).get()
+            if not dealership_doc.exists:
+                raise HTTPException(status_code=404, detail=f"Dealership with ID '{dealership_id_from_request}' not found.")
         except Exception as e:
-            raise HTTPException(status_code=404, detail=f"Dealership with ID {shift_request.dealership_id} not found: {e}")
+            raise HTTPException(status_code=400, detail=f"Error verifying dealership with ID '{dealership_id_from_request}': {e}")
 
-        # 2. Calculate shift details
+        # 3. Calculate shift details
         estimated_hours = calculate_shift_hours(
             shift_request.start_time, shift_request.end_time, shift_request.break_minutes
         )
         
-        # 3. Check for potential overtime
+        # 4. Check for potential overtime
         weekly_hours_before_shift = await get_employee_weekly_hours(
             shift_request.employee_id, shift_request.shift_date, session
         )
         is_overtime_shift = (weekly_hours_before_shift + estimated_hours) > 40.0
         
-        # 4. Create the new shift object
+        # 5. Create the new shift object
         new_shift = EmployeeScheduledShift(
             employee_id=shift_request.employee_id,
             employee_name=employee_name,
-            dealership_id=shift_request.dealership_id,
-            dealership_name=dealership_name,
+            dealership_id=dealership_id_from_request,
+            dealership_name=dealership_id_from_request, # The name is the ID
             shift_date=shift_request.shift_date,
             start_time=shift_request.start_time,
             end_time=shift_request.end_time,
@@ -360,7 +363,7 @@ async def create_scheduled_shift(
             created_at=datetime.utcnow()
         )
         
-        # 5. Add to session and commit
+        # 6. Add to session and commit
         session.add(new_shift)
         session.commit()
         session.refresh(new_shift)
@@ -434,9 +437,23 @@ async def update_scheduled_shift(
         if not shift:
             raise HTTPException(status_code=404, detail="Shift not found")
         
-        # Update fields if provided
         update_data = update_request.model_dump(exclude_unset=True)
         
+        # If dealership is being updated, handle it specially
+        if "dealership_id" in update_data:
+            dealership_id_from_request = update_data.pop("dealership_id")
+            
+            try:
+                dealership_doc = firestore_db.collection("dealerships").document(dealership_id_from_request).get()
+                if not dealership_doc.exists:
+                    raise HTTPException(status_code=404, detail=f"Dealership with ID '{dealership_id_from_request}' not found.")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Error verifying dealership with ID '{dealership_id_from_request}': {e}")
+            
+            # Set both id and name from the request
+            shift.dealership_id = dealership_id_from_request
+            shift.dealership_name = dealership_id_from_request
+
         # If shift times change, recalculate estimated hours
         if "start_time" in update_data or "end_time" in update_data or "break_minutes" in update_data:
             start_time = update_request.start_time or shift.start_time
