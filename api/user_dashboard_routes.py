@@ -179,7 +179,7 @@ class UpcomingShiftResponse(BaseModel):
     status: ShiftStatus
     notes: Optional[str] = None
 
-# --- Helper Functions ---
+# ---- Helper Functions ----
 
 async def get_user_wage_from_firestore(user_id: str) -> Optional[float]:
 
