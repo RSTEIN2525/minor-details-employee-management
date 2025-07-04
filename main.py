@@ -109,7 +109,7 @@ app.include_router(admin_device_router, prefix="/admin/device-requests", tags=["
 app.include_router(admin_user_router, prefix="/admin/user-requests", tags = ["Admin", "User Management"])
 app.include_router(admin_shop_router, prefix="/admin/shop-requests", tags = ["Admin", "Shop Management"])
 app.include_router(admin_dealership_router,prefix="/admin/dealership-requests", tags=["Admin", "Dealerships"] )
-app.include_router(user_dashboard_routes.router, prefix="/api/user-dashboard", tags=["User Dashboard"], dependencies=[Depends(get_session)])
+app.include_router(user_dashboard_routes.router, prefix="/user-dashboard-requests", tags=["User Dashboard"], dependencies=[Depends(get_session)])
 app.include_router(admin_clock_request_router, prefix="/admin/clock-requests", tags=["Admin", "Clock Requests"])
 app.include_router(admin_analytics_routes.router, prefix="/admin/analytics", tags=["Admin Analytics"], dependencies=[Depends(get_session)])
 app.include_router(admin_time_router, prefix="/admin/time", tags=["Admin", "Direct Time Management"])
