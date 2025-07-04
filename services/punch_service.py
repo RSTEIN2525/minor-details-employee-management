@@ -1,5 +1,5 @@
 from sqlmodel import Session, select
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from models.time_log import TimeLog, PunchType
 from utils.geofence import is_within_radius
 from models.shop import Shop
@@ -24,6 +24,10 @@ class PunchService:
 
         # Capture the time of the request for consistency
         request_time = datetime.now(timezone.utc)
+        # By default, the new punch will use the same timestamp.
+        # If we generate an auto clock-out below, we'll bump the clock-in forward
+        # by a few seconds so ordering is always correct.
+        new_punch_time = request_time
         response_message = None
 
         # 0) Must supply location
@@ -95,6 +99,9 @@ class PunchService:
                     )
                     session.add(auto_clock_out)
                     response_message = "Automatically clocked out previous shift."
+
+                    # Ensure the subsequent clock-in appears *after* the auto clock-out
+                    new_punch_time = request_time + timedelta(seconds=3)
                 # Otherwise, it's a double clock-out, which is an error
                 else:
                     raise HTTPException(
@@ -116,7 +123,7 @@ class PunchService:
             punch_type=punch_type,
             latitude=latitude,
             longitude=longitude,
-            timestamp=request_time, # Use consistent request time
+            timestamp=new_punch_time,
             injured_at_work=injured_at_work if punch_type == PunchType.CLOCK_OUT else None,
             safety_signature=safety_signature.strip() if punch_type == PunchType.CLOCK_OUT and safety_signature else None,
         )
