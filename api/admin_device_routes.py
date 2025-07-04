@@ -10,7 +10,7 @@ from pydantic import BaseModel, field_serializer
 from typing import List
 from google.cloud import storage
 import os
-from utils.storage import generate_secure_photo_url, debug_file_metadata, remove_download_tokens_from_file
+from utils.storage import debug_file_metadata, remove_download_tokens_from_file
 from utils.database_storage import get_device_photo_from_db, photo_to_base64
 from utils.datetime_helpers import format_utc_datetime
 

@@ -4,6 +4,8 @@
 .env.production
 .env.staging
 
+.service-account-key.json
+
 # Service Account Keys (NEVER commit these!)
 serviceAccountKey.json
 **/serviceAccountKey.json

@@ -650,7 +650,7 @@ async def call_external_profit_loss_report(start_date: str, end_date: str, token
                 logger.warning(f"[VAPI] 📥 EXTERNAL_API: Response body: {response_text}")
             except Exception as text_error:
                 logger.warning(f"[VAPI] ⚠️ EXTERNAL_API: Could not read response text: {str(text_error)}")
-            
+                
             response.raise_for_status()
             result = response.json()
             logger.warning(f"[VAPI] ✅ EXTERNAL_API: Successfully retrieved P&L report for {start_date}")
@@ -1435,7 +1435,7 @@ async def handle_vapi_webhook(
                 return VapiResponse(success=False, message="Could not identify the dealership.")
                 
             workflow_result = await handle_dealership_pnl_workflow(dealership, user_input, token)
-
+        
         else:
             logger.error(f"[VAPI] ❌ WORKFLOW: Unknown action classification: {determined_action}")
             return VapiResponse(

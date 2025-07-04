@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import SQLModel
 from sqlalchemy import text
@@ -28,9 +28,33 @@ from api.admin_financial_routes import router as admin_financial_router
 from api.admin_scheduling_routes import router as admin_scheduling_router
 from api.shop_routes import router as shop_router
 from api.vapi_handler import router as vapi_router
+from api import (
+    time_routes,
+    shop_routes,
+    device_routes,
+    admin_time_routes,
+    admin_shop_routes,
+    admin_user_routes,
+    admin_clock_request_routes,
+    admin_dealership_routes,
+    admin_device_routes,
+    admin_vacation_routes,
+    admin_injury_routes,
+    admin_scheduling_routes,
+    user_shift_change_routes,
+    user_dashboard_routes,
+    admin_financial_routes,
+    admin_analytics_routes,
+    vapi_handler,
+    transaction_routes,
+    admin_transaction_routes
+)
+from core.deps import get_session
 import logging # Add this import
 import os
 from dotenv import load_dotenv
+import firebase_admin
+from firebase_admin import credentials
 
 # Configure logging
 logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING) # Add this line
@@ -60,11 +84,10 @@ print(f"🌐 CORS: Allowing origins: {allowed_origins_list}")
 # When We Start, Create the DB Tables if they don't exist
 @asynccontextmanager
 async def lifespan(app: FastAPI):
- 
-    SQLModel.metadata.create_all(engine)
-
-    # (would do shutdown cleanup here if needed)
+    print("INFO:     Waiting for application startup.")
+    SQLModel.metadata.create_all(engine, checkfirst=True)
     yield
+    print("INFO:     Shutting down application.")
 
 
 # Starts Fast API Up; Init
@@ -86,13 +109,15 @@ app.include_router(admin_device_router, prefix="/admin/device-requests", tags=["
 app.include_router(admin_user_router, prefix="/admin/user-requests", tags = ["Admin", "User Management"])
 app.include_router(admin_shop_router, prefix="/admin/shop-requests", tags = ["Admin", "Shop Management"])
 app.include_router(admin_dealership_router,prefix="/admin/dealership-requests", tags=["Admin", "Dealerships"] )
-app.include_router(user_dashboard_router, prefix = "/user-dashboard-requests", tags=["User", "Finances"])
+app.include_router(user_dashboard_routes.router, prefix="/api/user-dashboard", tags=["User Dashboard"], dependencies=[Depends(get_session)])
 app.include_router(admin_clock_request_router, prefix="/admin/clock-requests", tags=["Admin", "Clock Requests"])
-app.include_router(admin_analytics_router, prefix="/admin/analytics", tags=["Admin", "Labor Analytics"])
+app.include_router(admin_analytics_routes.router, prefix="/admin/analytics", tags=["Admin Analytics"], dependencies=[Depends(get_session)])
 app.include_router(admin_time_router, prefix="/admin/time", tags=["Admin", "Direct Time Management"])
 app.include_router(admin_injury_router, prefix="/admin/injury", tags=["Admin", "Injury Reports"])
 app.include_router(admin_vacation_router, prefix="/admin/vacation", tags=["Admin", "Vacation Management"])
 app.include_router(admin_financial_router, prefix="/admin/financial", tags=["Admin", "Financial Analytics"])
-app.include_router(admin_scheduling_router, prefix="/admin/scheduling", tags=["Admin", "Employee Scheduling"])
+app.include_router(admin_scheduling_routes.router, prefix="/admin/scheduling", tags=["Admin", "Employee Scheduling"])
 app.include_router(shop_router, prefix="/shops", tags=["Shops", "Geofence"])
-app.include_router(vapi_router, prefix="/api", tags=["Vapi", "Webhook"])
+app.include_router(vapi_handler.router, prefix="/api", tags=["Vapi", "Webhook"])
+app.include_router(transaction_routes.router, prefix="/transactions", tags=["Transactions"], dependencies=[Depends(get_session)])
+app.include_router(admin_transaction_routes.router, prefix="/admin/transactions", tags=["Admin Transactions"], dependencies=[Depends(get_session)])

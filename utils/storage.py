@@ -15,68 +15,6 @@ def get_storage_client():
     """Initialize and return Google Cloud Storage client"""
     return storage.Client()
 
-def get_storage_client_for_signing():
-    """
-    Initialize and return a Google Cloud Storage client capable of generating signed URLs.
-    This tries different authentication methods to ensure signed URL generation works.
-    """
-    try:
-        # First, try to use service account key file if available
-        credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        if credentials_path and os.path.exists(credentials_path):
-            return storage.Client.from_service_account_json(credentials_path)
-        
-        # Fallback to default client (might work in some environments)
-        return storage.Client()
-        
-    except Exception as e:
-        print(f"Warning: Could not create storage client for signing: {e}")
-        # Return None to indicate that signed URL generation might not work
-        return None
-
-async def generate_secure_photo_url(object_path: str, expiration_minutes: int = 15) -> str:
-    """
-    Generate a secure URL for accessing a photo using Firebase Admin SDK.
-    Assumes Firebase Admin SDK is initialized with credentials that can sign URLs.
-    
-    Args:
-        object_path: The GCS object path
-        expiration_minutes: How long the URL should be valid (in minutes)
-        
-    Returns:
-        str: A secure URL for accessing the photo
-    """
-    bucket_name = os.getenv("FIREBASE_STORAGE_BUCKET", "minordetails-1aff3.appspot.com")
-    
-    try:
-        # Get bucket through Firebase Admin SDK
-        bucket = admin_storage.bucket(bucket_name)
-        blob = bucket.blob(object_path)
-        
-        if not await asyncio.to_thread(blob.exists):
-             raise HTTPException(
-                status_code=404,
-                detail=f"ID photo not found at path: {object_path}"
-            )
-            
-        # Generate signed URL using Firebase Admin SDK
-        signed_url = await asyncio.to_thread(
-            blob.generate_signed_url,
-            expiration=timedelta(minutes=expiration_minutes),
-            method="GET",
-            version="v4" # v4 is generally recommended
-        )
-        return signed_url
-        
-    except HTTPException as http_exc: # Re-raise known HTTP exceptions
-        raise http_exc
-    except Exception as e:
-        print(f"Firebase Admin SDK URL generation failed for {object_path}: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail="Unable to generate secure access URL for the requested photo. Check server logs and Firebase/GCS permissions."
-        )
-
 async def upload_id_photo(
     file: UploadFile, 
     user_id: str, 
@@ -159,6 +97,56 @@ async def upload_id_photo(
         raise HTTPException(
             status_code=500,
             detail=f"Could not upload file (v3.2): {str(e)}"
+        )
+
+async def upload_receipt_image(
+    file: UploadFile, 
+    user_id: str
+) -> str:
+    """
+    Upload a transaction receipt image to Firebase Storage.
+    """
+    
+    print(f"✅ RECEIPT UPLOAD STARTED: file={file.filename}, user_id={user_id}")
+    
+    allowed_types = ["image/jpeg", "image/jpg", "image/png", "image/webp"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type for receipt. Allowed types: {', '.join(allowed_types)}"
+        )
+    
+    try:
+        file_content = await file.read()
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
+        unique_id = uuid.uuid4().hex[:6]
+        filename = f"{timestamp}_{unique_id}.{file_extension}"
+        object_path = f"company_card_receipts/{user_id}/{filename}"
+        
+        bucket_name = os.getenv("FIREBASE_STORAGE_BUCKET", "minordetails-1aff3.appspot.com")
+        
+        admin_bucket = admin_storage.bucket(bucket_name)
+        admin_blob = admin_bucket.blob(object_path)
+        
+        admin_blob.upload_from_string(
+            file_content, 
+            content_type=file.content_type
+        )
+        
+        # Make the file secure by nullifying any potential download tokens
+        admin_blob.metadata = {'firebaseStorageDownloadTokens': None}
+        await asyncio.to_thread(admin_blob.patch)
+        
+        print(f"🎉 RECEIPT UPLOAD COMPLETE: {object_path}")
+        return object_path
+        
+    except Exception as e:
+        print(f"❌ RECEIPT UPLOAD ERROR: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not upload receipt image: {str(e)}"
         )
 
 async def debug_file_metadata(object_path: str) -> dict:
