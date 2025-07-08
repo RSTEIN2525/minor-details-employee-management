@@ -1,32 +1,37 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session, select, func
-from pydantic import BaseModel, field_serializer
-from typing import List, Dict, Optional, Any, Tuple
-from datetime import datetime, date, timedelta, timezone
-from zoneinfo import ZoneInfo
-from db.session import get_session
-from core.deps import require_admin_role, get_current_user
-from core.firebase import db as firestore_db
-from models.time_log import TimeLog, PunchType
-from models.shop import Shop
-from models.vacation_time import VacationTime
 from collections import defaultdict
-from utils.datetime_helpers import format_utc_datetime
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, field_serializer
+from sqlmodel import Session, func, select
+
+from core.deps import get_current_user, require_admin_role
+from core.firebase import db as firestore_db
+from db.session import get_session
+from models.shop import Shop
+from models.time_log import PunchType, TimeLog
+from models.vacation_time import VacationTime
 from utils.breaks import apply_unpaid_break
+from utils.datetime_helpers import format_utc_datetime
 
 router = APIRouter()
 
 # --- Pydantic Models for Responses ---
+
 
 class DealershipLaborSpend(BaseModel):
     dealership_id: str
     total_labor_spend: float
     total_hours: float
 
+
 class HourlyLaborSpend(BaseModel):
     hour: int  # 0-23
     total_labor_spend: float
     total_employees: int
+
 
 # Enhanced models for the new detailed daily labor endpoint
 class EnhancedDealershipBreakdown(BaseModel):
@@ -36,6 +41,7 @@ class EnhancedDealershipBreakdown(BaseModel):
     total_hours: float
     employee_count: int
 
+
 class EnhancedDailyLaborSummary(BaseModel):
     target_date: str
     total_labor_spend: float
@@ -43,12 +49,14 @@ class EnhancedDailyLaborSummary(BaseModel):
     dealership_breakdown: List[EnhancedDealershipBreakdown]
     hourly_breakdown: List[HourlyLaborSpend]
 
+
 class DailyLaborSummary(BaseModel):
     date: str
     total_labor_spend: float
     total_hours: float
     hourly_breakdown: List[HourlyLaborSpend]
     dealership_breakdown: List[DealershipLaborSpend]
+
 
 class EmployeeShiftInfo(BaseModel):
     employee_id: str
@@ -60,10 +68,11 @@ class EmployeeShiftInfo(BaseModel):
     weekly_hours_worked: float
     is_overtime: bool = False
 
-    @field_serializer('shift_start_time')
+    @field_serializer("shift_start_time")
     def serialize_shift_start_time(self, dt: datetime) -> str:
         """Ensure shift_start_time is formatted as UTC with Z suffix"""
         return format_utc_datetime(dt)
+
 
 class DealershipEmployeeStatus(BaseModel):
     dealership_id: str
@@ -72,7 +81,9 @@ class DealershipEmployeeStatus(BaseModel):
     total_current_hourly_rate: float
     total_labor_spend_today: float
 
+
 # --- New Employee Detail Models and Endpoints ---
+
 
 class EmployeeClockEntry(BaseModel):
     id: int
@@ -80,10 +91,11 @@ class EmployeeClockEntry(BaseModel):
     punch_type: PunchType
     dealership_id: str
 
-    @field_serializer('timestamp')
+    @field_serializer("timestamp")
     def serialize_timestamp(self, dt: datetime) -> str:
         """Ensure timestamp is formatted as UTC with Z suffix"""
         return format_utc_datetime(dt)
+
 
 class WeekSummary(BaseModel):
     week_start_date: str
@@ -95,6 +107,7 @@ class WeekSummary(BaseModel):
     vacation_hours: float = 0.0
     is_current_week: bool
 
+
 class TodaysSummary(BaseModel):
     date: str
     total_hours: float
@@ -104,6 +117,7 @@ class TodaysSummary(BaseModel):
     vacation_hours: float = 0.0
     is_currently_clocked_in: bool
 
+
 class EmployeeDetailResponse(BaseModel):
     employee_id: str
     employee_name: Optional[str] = None
@@ -112,6 +126,7 @@ class EmployeeDetailResponse(BaseModel):
     week_summaries: List[WeekSummary]
     todays_summary: TodaysSummary
     two_week_total_pay: float
+
 
 # New model for dealership employee hours breakdown
 class EmployeeHoursBreakdown(BaseModel):
@@ -124,24 +139,26 @@ class EmployeeHoursBreakdown(BaseModel):
     estimated_pay: float
     is_currently_active: bool
 
+
 class DealershipEmployeeHoursResponse(BaseModel):
     dealership_id: str
     start_date: str  # YYYY-MM-DD
-    end_date: str    # YYYY-MM-DD
+    end_date: str  # YYYY-MM-DD
     employees: List[EmployeeHoursBreakdown]
     summary: Dict[str, float]  # totals for all employees combined
+
 
 # Comprehensive Labor Spend Models
 class EmployeeLaborDetail(BaseModel):
     employee_id: str
     employee_name: Optional[str] = None
     hourly_wage: Optional[float] = None
-    
+
     # Current status
     is_currently_active: bool = False
     current_shift_start_time: Optional[datetime] = None
     current_shift_duration_hours: float = 0.0
-    
+
     # Today's work
     todays_total_hours: float = 0.0
     todays_regular_hours: float = 0.0
@@ -150,37 +167,40 @@ class EmployeeLaborDetail(BaseModel):
     todays_vacation_hours: float = 0.0
     todays_vacation_cost: float = 0.0
     todays_total_cost: float = 0.0  # work + vacation
-    
+
     # Weekly aggregates
     weekly_total_hours: float = 0.0
     weekly_regular_hours: float = 0.0
     weekly_overtime_hours: float = 0.0
     weekly_labor_cost: float = 0.0
-    
+
     # Today's clock info
     todays_clock_in_count: int = 0
     todays_first_clock_in: Optional[datetime] = None
     todays_last_clock_out: Optional[datetime] = None
-    
-    @field_serializer('current_shift_start_time', 'todays_first_clock_in', 'todays_last_clock_out')
+
+    @field_serializer(
+        "current_shift_start_time", "todays_first_clock_in", "todays_last_clock_out"
+    )
     def serialize_timestamps(self, dt: Optional[datetime]) -> Optional[str]:
         """Ensure timestamps are formatted as UTC with Z suffix"""
         if dt is None:
             return None
         return format_utc_datetime(dt)
 
+
 class DealershipLaborSpendSummary(BaseModel):
     # Basic info
     dealership_id: str
     analysis_date: str  # ISO date string
     analysis_timestamp: datetime
-    
+
     # Employee counts
     total_employees: int = 0
     active_employees_today: int = 0
     employees_who_clocked_in_today: int = 0
     employees_currently_clocked_in: int = 0
-    
+
     # Today's labor costs
     todays_total_work_hours: float = 0.0
     todays_total_vacation_hours: float = 0.0
@@ -188,130 +208,137 @@ class DealershipLaborSpendSummary(BaseModel):
     todays_total_work_cost: float = 0.0
     todays_total_vacation_cost: float = 0.0
     todays_total_labor_cost: float = 0.0  # work + vacation
-    
+
     # Today's time breakdown
     todays_regular_hours: float = 0.0
     todays_overtime_hours: float = 0.0
     todays_regular_cost: float = 0.0
     todays_overtime_cost: float = 0.0
-    
+
     # Current rates
     current_hourly_labor_rate: float = 0.0  # Sum of all active employees' wages
     average_hourly_wage: float = 0.0  # Average across all employees
     weighted_average_hourly_rate: float = 0.0  # Weighted by hours worked
-    
+
     # Weekly aggregates (current week)
     weekly_total_hours: float = 0.0
     weekly_regular_hours: float = 0.0
     weekly_overtime_hours: float = 0.0
     weekly_total_cost: float = 0.0
-    
+
     # Clock activity
     total_clock_ins_today: int = 0
     total_clock_outs_today: int = 0
-    
+
     # Cost efficiency metrics
     cost_per_employee_today: float = 0.0
     hours_per_employee_today: float = 0.0
-    
-    @field_serializer('analysis_timestamp')
+
+    @field_serializer("analysis_timestamp")
     def serialize_analysis_timestamp(self, dt: datetime) -> str:
         """Ensure timestamp is formatted as UTC with Z suffix"""
         return format_utc_datetime(dt)
 
+
 class ComprehensiveLaborSpendResponse(BaseModel):
     summary: DealershipLaborSpendSummary
     employees: List[EmployeeLaborDetail]
-    
+
     # Additional insights
     top_earners_today: List[EmployeeLaborDetail] = []  # Top 5 by cost
-    most_hours_today: List[EmployeeLaborDetail] = []   # Top 5 by hours
-    
+    most_hours_today: List[EmployeeLaborDetail] = []  # Top 5 by hours
+
     # Data freshness
     data_generated_at: datetime
-    
-    @field_serializer('data_generated_at')
+
+    @field_serializer("data_generated_at")
     def serialize_data_generated_at(self, dt: datetime) -> str:
         """Ensure data_generated_at is formatted as UTC with Z suffix"""
         return format_utc_datetime(dt)
 
+
 class AllDealershipsComprehensiveLaborSpendResponse(BaseModel):
     """Response model for comprehensive labor spend data for ALL dealerships"""
+
     analysis_date: str  # ISO date string
     analysis_timestamp: datetime
     total_company_labor_cost: float
     total_company_employees: int
     dealerships: List[ComprehensiveLaborSpendResponse]
-    
-    @field_serializer('analysis_timestamp')
+
+    @field_serializer("analysis_timestamp")
     def serialize_analysis_timestamp(self, dt: datetime) -> str:
         """Ensure analysis_timestamp is formatted as UTC with Z suffix"""
         return format_utc_datetime(dt)
+
 
 # Quick Preview Labor Spend Models
 class QuickLaborPreview(BaseModel):
     dealership_id: str
     current_time: datetime
-    
+
     # Today's spending so far
     total_labor_cost_today: float = 0.0
     total_work_cost_today: float = 0.0
     total_vacation_cost_today: float = 0.0
-    
+
     # Hours so far today
     total_hours_today: float = 0.0
     total_work_hours_today: float = 0.0
     total_vacation_hours_today: float = 0.0
-    
+
     # Current activity
     employees_currently_clocked_in: int = 0
     employees_who_worked_today: int = 0
-    current_hourly_burn_rate: float = 0.0  # Sum of wages of currently clocked in employees
-    
+    current_hourly_burn_rate: float = (
+        0.0  # Sum of wages of currently clocked in employees
+    )
+
     # Quick stats
     average_cost_per_employee_today: float = 0.0
     projected_daily_cost: float = 0.0  # Based on current burn rate
-    
-    @field_serializer('current_time')
+
+    @field_serializer("current_time")
     def serialize_current_time(self, dt: datetime) -> str:
         """Ensure timestamp is formatted as UTC with Z suffix"""
         return format_utc_datetime(dt)
+
 
 # All Dealerships Labor Cost Model
 class DealershipLaborCost(BaseModel):
     dealership_id: str
     total_labor_cost_today: float
 
+
 class AllDealershipsLaborCostResponse(BaseModel):
     analysis_date: str  # ISO date string
     total_company_labor_cost: float
     dealerships: List[DealershipLaborCost]
     analysis_time: datetime
-    
-    @field_serializer('analysis_time')
+
+    @field_serializer("analysis_time")
     def serialize_analysis_time(self, dt: datetime) -> str:
         """Ensure timestamp is formatted as UTC with Z suffix"""
         return format_utc_datetime(dt)
 
+
 # --- Helper Functions ---
+
 
 async def get_user_details(user_id: str) -> Dict[str, Any]:
     """Fetch user details from Firestore."""
     user_ref = firestore_db.collection("users").document(user_id)
     user_doc = user_ref.get()
-    
+
     if user_doc.exists:
         user_data = user_doc.to_dict()
         return {
             "id": user_id,
             "name": user_data.get("displayName", "Unknown"),
-            "hourly_wage": user_data.get("hourlyWage", 0.0)
+            "hourly_wage": user_data.get("hourlyWage", 0.0),
         }
-    return {
-        "id": user_id,
-        "name": "Unknown",
-        "hourly_wage": 0.0
-    }
+    return {"id": user_id, "name": "Unknown", "hourly_wage": 0.0}
+
 
 def calculate_regular_and_overtime_hours(total_hours: float) -> Tuple[float, float]:
     """Calculate regular and overtime hours based on total hours worked."""
@@ -320,21 +347,31 @@ def calculate_regular_and_overtime_hours(total_hours: float) -> Tuple[float, flo
     else:
         return 40.0, total_hours - 40.0
 
-def calculate_pay_with_overtime(regular_hours: float, overtime_hours: float, hourly_wage: float) -> float:
+
+def calculate_pay_with_overtime(
+    regular_hours: float, overtime_hours: float, hourly_wage: float
+) -> float:
     """Calculate total pay including overtime rate (1.5x) for overtime hours."""
     regular_pay = regular_hours * hourly_wage
     overtime_pay = overtime_hours * hourly_wage * 1.5
     return regular_pay + overtime_pay
 
-async def calculate_todays_hours_and_status(session: Session, employee_id: str) -> Tuple[float, bool]:
+
+async def calculate_todays_hours_and_status(
+    session: Session, employee_id: str
+) -> Tuple[float, bool]:
     """Calculate hours worked today and current clock status for an employee."""
     now = datetime.now(timezone.utc)
     today = now.date()
-    
+
     # Start and end of today in UTC
-    start_of_day = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
-    end_of_day = datetime.combine(today, datetime.max.time()).replace(tzinfo=timezone.utc)
-    
+    start_of_day = datetime.combine(today, datetime.min.time()).replace(
+        tzinfo=timezone.utc
+    )
+    end_of_day = datetime.combine(today, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
+
     # Get all clock entries for today
     todays_clocks = session.exec(
         select(TimeLog)
@@ -343,16 +380,16 @@ async def calculate_todays_hours_and_status(session: Session, employee_id: str) 
         .where(TimeLog.timestamp <= end_of_day)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     total_hours = 0.0
     clock_in_time = None
     is_currently_clocked_in = False
-    
+
     for clock in todays_clocks:
         ts = clock.timestamp
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-            
+
         if clock.punch_type == PunchType.CLOCK_IN:
             clock_in_time = ts
         elif clock.punch_type == PunchType.CLOCK_OUT and clock_in_time:
@@ -360,24 +397,25 @@ async def calculate_todays_hours_and_status(session: Session, employee_id: str) 
             paid_hours = apply_unpaid_break(raw_hours)
             total_hours += paid_hours
             clock_in_time = None
-    
+
     # If still clocked in, add time until now and set status
     if clock_in_time:
         raw_hours = (now - clock_in_time).total_seconds() / 3600
         paid_hours = apply_unpaid_break(raw_hours)
         total_hours += paid_hours
         is_currently_clocked_in = True
-    
+
     return total_hours, is_currently_clocked_in
+
 
 async def calculate_weekly_hours(session: Session, employee_id: str) -> float:
     """Calculate total hours worked by an employee in the current week."""
     # Get start of week (Monday)
     today = datetime.now(timezone.utc).date()
-    start_of_week = (datetime.now(timezone.utc) - timedelta(days=today.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    
+    start_of_week = (
+        datetime.now(timezone.utc) - timedelta(days=today.weekday())
+    ).replace(hour=0, minute=0, second=0, microsecond=0)
+
     # Get all punches for this week
     punches = session.exec(
         select(TimeLog)
@@ -385,11 +423,11 @@ async def calculate_weekly_hours(session: Session, employee_id: str) -> float:
         .where(TimeLog.timestamp >= start_of_week)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     # Calculate total hours
     total_hours = 0.0
     clock_in_time: Optional[datetime] = None
-    
+
     for punch in punches:
         punch_ts = punch.timestamp
         if punch_ts.tzinfo is None:
@@ -403,7 +441,7 @@ async def calculate_weekly_hours(session: Session, employee_id: str) -> float:
             paid_hours = apply_unpaid_break(raw_hours)
             total_hours += paid_hours
             clock_in_time = None
-    
+
     # If still clocked in, add time until now
     if clock_in_time:
         # clock_in_time is already UTC aware
@@ -411,46 +449,56 @@ async def calculate_weekly_hours(session: Session, employee_id: str) -> float:
         raw_hours = (now - clock_in_time).total_seconds() / 3600
         paid_hours = apply_unpaid_break(raw_hours)
         total_hours += paid_hours
-    
+
     return total_hours
 
-async def is_employee_currently_active(session: Session, employee_id: str, dealership_id: Optional[str] = None) -> Tuple[bool, Optional[datetime]]:
+
+async def is_employee_currently_active(
+    session: Session, employee_id: str, dealership_id: Optional[str] = None
+) -> Tuple[bool, Optional[datetime]]:
     """
     Determine if an employee is currently active (clocked in) by checking their most recent clock action.
     If their last clock was a CLOCK_IN, they're active. If it was a CLOCK_OUT, they're not.
-    
+
     Returns:
         Tuple[bool, Optional[datetime]]: (is_active, most_recent_clock_in_time)
     """
     # Get the most recent clock entry for this employee
     # Look back a reasonable amount to handle cross-day shifts
     lookback_date = datetime.now(timezone.utc) - timedelta(days=3)
-    
-    query = select(TimeLog).where(TimeLog.employee_id == employee_id).where(TimeLog.timestamp >= lookback_date)
-    
+
+    query = (
+        select(TimeLog)
+        .where(TimeLog.employee_id == employee_id)
+        .where(TimeLog.timestamp >= lookback_date)
+    )
+
     # Filter by dealership if provided
     if dealership_id:
         query = query.where(TimeLog.dealership_id == dealership_id)
-        
+
     most_recent_clock = session.exec(
         query.order_by(TimeLog.timestamp.desc()).limit(1)
     ).first()
-    
+
     if not most_recent_clock:
         return False, None
-    
+
     # Ensure timestamp is timezone aware
     ts = most_recent_clock.timestamp
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    
+
     # Simple logic: if last action was CLOCK_IN, they're active
     if most_recent_clock.punch_type == PunchType.CLOCK_IN:
         return True, ts
     else:
         return False, None
 
-async def calculate_vacation_hours(session: Session, employee_id: str, start_date: date, end_date: date) -> float:
+
+async def calculate_vacation_hours(
+    session: Session, employee_id: str, start_date: date, end_date: date
+) -> float:
     """Calculate total vacation hours for an employee within a date range."""
     vacation_entries = session.exec(
         select(VacationTime)
@@ -458,87 +506,112 @@ async def calculate_vacation_hours(session: Session, employee_id: str, start_dat
         .where(VacationTime.date >= start_date)
         .where(VacationTime.date <= end_date)
     ).all()
-    
+
     return sum(entry.hours for entry in vacation_entries)
 
+
 # --- API Endpoints ---
+
 
 @router.get("/labor/daily/enhanced", response_model=EnhancedDailyLaborSummary)
 async def get_enhanced_daily_labor_spend(
     target_date: date,  # Required parameter
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role)
+    admin_user: dict = Depends(require_admin_role),
 ):
     """
     Get enhanced daily labor spend with detailed dealership breakdown including employee counts.
     Requires a specific target date.
-    
+
     Now uses the same robust calculation logic as the comprehensive endpoint:
     - Proper overtime calculation based on weekly context
     - Correct dealership assignment handling
     - Includes currently clocked-in employees
     - Applies unpaid break deductions
     """
-    print(f"\n--- Starting enhanced daily labor spend analysis for date: {target_date} ---")
-    
+    print(
+        f"\n--- Starting enhanced daily labor spend analysis for date: {target_date} ---"
+    )
+
     # Use Eastern timezone for date boundaries to align with business operations
     from zoneinfo import ZoneInfo
+
     analysis_tz = ZoneInfo("America/New_York")
-    start_of_day = datetime.combine(target_date, datetime.min.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    end_of_day = datetime.combine(target_date, datetime.max.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    
+    start_of_day = datetime.combine(
+        target_date, datetime.min.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+    end_of_day = datetime.combine(
+        target_date, datetime.max.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+
     # Current week boundaries (Monday to Sunday) for overtime calculation
     current_week_start = target_date - timedelta(days=target_date.weekday())
     current_week_end = current_week_start + timedelta(days=6)
-    start_of_week = datetime.combine(current_week_start, datetime.min.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    end_of_week = datetime.combine(current_week_end, datetime.max.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    
+    start_of_week = datetime.combine(
+        current_week_start, datetime.min.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+    end_of_week = datetime.combine(
+        current_week_end, datetime.max.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+
     now = datetime.now(timezone.utc)
-    
+
     print(f"Analysis period (UTC) - Day: {start_of_day} to {end_of_day}")
     print(f"Analysis period (UTC) - Week: {start_of_week} to {end_of_week}")
-    
+
     # Get ALL employees from Firestore to properly handle dealership assignments
-    users_ref = firestore_db.collection("users").where("role", "in", ["employee", "clockOnlyEmployee"]).stream()
+    users_ref = (
+        firestore_db.collection("users")
+        .where("role", "in", ["employee", "clockOnlyEmployee"])
+        .stream()
+    )
     all_employees = {}
     for doc in users_ref:
         user_data = doc.to_dict()
         employee_id = doc.id
-        
+
         # Parse dealership assignments
         raw_dealerships = user_data.get("dealerships", "")
         if isinstance(raw_dealerships, list):
             employee_dealerships = [str(d).strip() for d in raw_dealerships]
         else:
-            employee_dealerships = [s.strip() for s in str(raw_dealerships).split(",") if s.strip()]
+            employee_dealerships = [
+                s.strip() for s in str(raw_dealerships).split(",") if s.strip()
+            ]
 
         raw_tc_dealers = user_data.get("timeClockDealerships", "")
         if isinstance(raw_tc_dealers, list):
             time_clock_dealerships = [str(d).strip() for d in raw_tc_dealers]
         else:
-            time_clock_dealerships = [s.strip() for s in str(raw_tc_dealers).split(",") if s.strip()]
+            time_clock_dealerships = [
+                s.strip() for s in str(raw_tc_dealers).split(",") if s.strip()
+            ]
 
         combined_dealerships = set(employee_dealerships) | set(time_clock_dealerships)
-        
+
         all_employees[employee_id] = {
             "name": user_data.get("displayName", "Unknown"),
-            "hourly_wage": float(user_data.get("hourlyWage", 0.0)) if user_data.get("hourlyWage") else 0.0,
-            "dealerships": combined_dealerships
+            "hourly_wage": (
+                float(user_data.get("hourlyWage", 0.0))
+                if user_data.get("hourlyWage")
+                else 0.0
+            ),
+            "dealerships": combined_dealerships,
         }
-    
+
     print(f"Found {len(all_employees)} total employees")
-    
+
     if not all_employees:
         return EnhancedDailyLaborSummary(
             target_date=target_date.isoformat(),
             total_labor_spend=0.0,
             total_hours=0.0,
             dealership_breakdown=[],
-            hourly_breakdown=[]
+            hourly_breakdown=[],
         )
-    
+
     employee_ids = list(all_employees.keys())
-    
+
     # Get time logs for the target day across all dealerships
     today_logs = session.exec(
         select(TimeLog)
@@ -547,7 +620,7 @@ async def get_enhanced_daily_labor_spend(
         .where(TimeLog.timestamp <= end_of_day)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     # Get weekly logs for overtime calculation
     week_logs = session.exec(
         select(TimeLog)
@@ -556,9 +629,9 @@ async def get_enhanced_daily_labor_spend(
         .where(TimeLog.timestamp <= end_of_week)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     print(f"Found {len(today_logs)} today logs and {len(week_logs)} week logs")
-    
+
     # Get dealership names from Firestore
     dealership_names = {}
     try:
@@ -568,45 +641,50 @@ async def get_enhanced_daily_labor_spend(
             dealership_names[doc.id] = dealership_data.get("name", doc.id)
     except Exception as e:
         print(f"Warning: Could not fetch dealership names: {e}")
-    
+
     # Process by dealership
     dealership_breakdowns = []
     hourly_breakdown = defaultdict(lambda: {"spend": 0.0, "employees": set()})
     total_labor_spend = 0.0
     total_hours = 0.0
-    
+
     # Get unique dealerships from logs
     dealerships_with_activity = set()
     for log in today_logs:
         dealerships_with_activity.add(log.dealership_id)
-    
+
     for dealership_id in dealerships_with_activity:
         print(f"Processing dealership: {dealership_id}")
-        
+
         dealership_labor_spend = 0.0
         dealership_hours = 0.0
         employees_with_activity = set()
-        
+
         # Get employees assigned to this dealership
         dealership_employees = [
-            emp_id for emp_id, emp_data in all_employees.items()
+            emp_id
+            for emp_id, emp_data in all_employees.items()
             if dealership_id in emp_data["dealerships"]
         ]
-        
+
         for employee_id in dealership_employees:
             try:
                 employee_data = all_employees[employee_id]
                 hourly_wage = employee_data["hourly_wage"]
-                
+
                 # Get this employee's logs for today and this week
-                employee_today_logs = [log for log in today_logs if log.employee_id == employee_id]
-                employee_week_logs = [log for log in week_logs if log.employee_id == employee_id]
-                
+                employee_today_logs = [
+                    log for log in today_logs if log.employee_id == employee_id
+                ]
+                employee_week_logs = [
+                    log for log in week_logs if log.employee_id == employee_id
+                ]
+
                 if not employee_today_logs:
                     continue
-                
+
                 employees_with_activity.add(employee_id)
-                
+
                 # Calculate hours worked this week BEFORE today for overtime context
                 week_logs_before_today = []
                 for log in employee_week_logs:
@@ -615,17 +693,19 @@ async def get_enhanced_daily_labor_spend(
                         log_ts = log_ts.replace(tzinfo=timezone.utc)
                     if log_ts < start_of_day:
                         week_logs_before_today.append(log)
-                
-                hours_worked_before_today = calculate_hours_from_logs(week_logs_before_today, start_of_day)
-                
+
+                hours_worked_before_today = calculate_hours_from_logs(
+                    week_logs_before_today, start_of_day
+                )
+
                 # Calculate today's hours for this dealership
                 todays_hours = calculate_hours_by_dealership_from_logs(
                     employee_today_logs, dealership_id, now
                 )
-                
+
                 if todays_hours <= 0:
                     continue
-                
+
                 # Calculate regular vs overtime hours based on weekly context
                 if hours_worked_before_today >= 40.0:
                     # All of today's hours are overtime
@@ -636,33 +716,46 @@ async def get_enhanced_daily_labor_spend(
                     remaining_regular_hours = 40.0 - hours_worked_before_today
                     regular_hours = min(todays_hours, remaining_regular_hours)
                     overtime_hours = max(0.0, todays_hours - remaining_regular_hours)
-                
+
                 # Calculate cost with proper overtime pay
-                labor_cost = calculate_pay_with_overtime(regular_hours, overtime_hours, hourly_wage)
-                
+                labor_cost = calculate_pay_with_overtime(
+                    regular_hours, overtime_hours, hourly_wage
+                )
+
                 dealership_labor_spend += labor_cost
                 dealership_hours += todays_hours
-                
+
                 # Add to hourly breakdown
                 # Find first and last clock times for this employee at this dealership today
                 dealership_logs_today = [
-                    log for log in employee_today_logs 
+                    log
+                    for log in employee_today_logs
                     if log.dealership_id == dealership_id
                 ]
-                
+
                 if dealership_logs_today:
                     # Simple distribution across hours based on first and last activity
                     first_log = min(dealership_logs_today, key=lambda x: x.timestamp)
                     last_log = max(dealership_logs_today, key=lambda x: x.timestamp)
-                    
-                    start_hour = first_log.timestamp.hour if first_log.timestamp.tzinfo else first_log.timestamp.replace(tzinfo=timezone.utc).hour
-                    end_hour = last_log.timestamp.hour if last_log.timestamp.tzinfo else last_log.timestamp.replace(tzinfo=timezone.utc).hour
-                    
+
+                    start_hour = (
+                        first_log.timestamp.hour
+                        if first_log.timestamp.tzinfo
+                        else first_log.timestamp.replace(tzinfo=timezone.utc).hour
+                    )
+                    end_hour = (
+                        last_log.timestamp.hour
+                        if last_log.timestamp.tzinfo
+                        else last_log.timestamp.replace(tzinfo=timezone.utc).hour
+                    )
+
                     # If employee is currently active, extend to current hour
-                    is_active, _ = await is_employee_currently_active(session, employee_id, dealership_id)
+                    is_active, _ = await is_employee_currently_active(
+                        session, employee_id, dealership_id
+                    )
                     if is_active:
                         end_hour = max(end_hour, now.hour)
-                    
+
                     # Distribute cost across hours
                     if start_hour == end_hour:
                         hourly_breakdown[start_hour]["spend"] += labor_cost
@@ -674,54 +767,57 @@ async def get_enhanced_daily_labor_spend(
                             hour_mod = hour % 24
                             hourly_breakdown[hour_mod]["spend"] += cost_per_hour
                             hourly_breakdown[hour_mod]["employees"].add(employee_id)
-                
+
             except Exception as e:
                 print(f"Error processing employee {employee_id}: {e}")
                 continue
-        
+
         # Only include dealerships with activity
         if dealership_hours > 0 and len(employees_with_activity) > 0:
             total_labor_spend += dealership_labor_spend
             total_hours += dealership_hours
-            
+
             dealership_breakdowns.append(
                 EnhancedDealershipBreakdown(
                     dealership_id=dealership_id,
                     dealership_name=dealership_names.get(dealership_id),
                     total_labor_spend=round(dealership_labor_spend, 2),
                     total_hours=round(dealership_hours, 2),
-                    employee_count=len(employees_with_activity)
+                    employee_count=len(employees_with_activity),
                 )
             )
-    
+
     # Format hourly breakdown for response
     formatted_hourly_breakdown = [
         HourlyLaborSpend(
             hour=hour,
             total_labor_spend=round(data["spend"], 2),
-            total_employees=len(data["employees"])
+            total_employees=len(data["employees"]),
         )
         for hour, data in sorted(hourly_breakdown.items())
     ]
-    
+
     # Sort dealership breakdown by labor spend (highest first)
     dealership_breakdowns.sort(key=lambda x: x.total_labor_spend, reverse=True)
-    
-    print(f"Enhanced analysis complete. Total: ${total_labor_spend:.2f}, {total_hours:.2f} hours")
-    
+
+    print(
+        f"Enhanced analysis complete. Total: ${total_labor_spend:.2f}, {total_hours:.2f} hours"
+    )
+
     return EnhancedDailyLaborSummary(
         target_date=target_date.isoformat(),
         total_labor_spend=round(total_labor_spend, 2),
         total_hours=round(total_hours, 2),
         dealership_breakdown=dealership_breakdowns,
-        hourly_breakdown=formatted_hourly_breakdown
+        hourly_breakdown=formatted_hourly_breakdown,
     )
+
 
 @router.get("/labor/daily", response_model=DailyLaborSummary)
 async def get_daily_labor_spend(
     target_date: Optional[date] = None,
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role)
+    admin_user: dict = Depends(require_admin_role),
 ):
     """
     Get the total labor spend for a specific day, broken down by hour and dealership.
@@ -730,11 +826,15 @@ async def get_daily_labor_spend(
     # Default to today if no date provided
     if not target_date:
         target_date = datetime.now(timezone.utc).date()
-    
+
     # Start and end of the target day in UTC
-    start_of_day = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-    end_of_day = datetime.combine(target_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-    
+    start_of_day = datetime.combine(target_date, datetime.min.time()).replace(
+        tzinfo=timezone.utc
+    )
+    end_of_day = datetime.combine(target_date, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
+
     # Get all time logs for the day
     time_logs = session.exec(
         select(TimeLog)
@@ -742,34 +842,36 @@ async def get_daily_labor_spend(
         .where(TimeLog.timestamp <= end_of_day)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     # Group time logs by dealership and employee for accurate counting
     dealership_employee_logs = defaultdict(lambda: defaultdict(list))
     for log in time_logs:
         dealership_employee_logs[log.dealership_id][log.employee_id].append(log)
-    
+
     # Calculate hours and labor spend for each employee
     total_labor_spend = 0.0
     total_hours = 0.0
-    
+
     # Track hourly and dealership breakdowns
     hourly_breakdown = defaultdict(lambda: {"spend": 0.0, "employees": set()})
-    dealership_breakdown = defaultdict(lambda: {"spend": 0.0, "hours": 0.0, "employees": set()})
-    
+    dealership_breakdown = defaultdict(
+        lambda: {"spend": 0.0, "hours": 0.0, "employees": set()}
+    )
+
     # Process each dealership and its employees
     for dealership_id, employee_logs in dealership_employee_logs.items():
         for employee_id, logs in employee_logs.items():
             # Get employee's hourly wage
             user_details = await get_user_details(employee_id)
             hourly_wage = user_details.get("hourly_wage", 0.0)
-            
+
             # Sort logs by timestamp
             sorted_logs = sorted(logs, key=lambda x: x.timestamp)
-            
+
             # Calculate hours worked and corresponding spend
             clock_in_time: Optional[datetime] = None
             employee_had_activity = False
-            
+
             for log in sorted_logs:
                 log_ts = log.timestamp
                 if log_ts.tzinfo is None:
@@ -783,20 +885,20 @@ async def get_daily_labor_spend(
                     raw_hours = (log_ts - clock_in_time).total_seconds() / 3600
                     paid_hours = apply_unpaid_break(raw_hours)
                     spend = paid_hours * hourly_wage
-                    
+
                     # Add to totals
                     total_labor_spend += spend
                     total_hours += paid_hours
-                    
+
                     # Add to dealership breakdown
                     dealership_breakdown[dealership_id]["spend"] += spend
                     dealership_breakdown[dealership_id]["hours"] += paid_hours
-                    
+
                     # Add to hourly breakdown
                     # For each hour of the shift, distribute the labor spend proportionally
-                    shift_start_hour = clock_in_time.hour # clock_in_time is UTC aware
-                    shift_end_hour = log_ts.hour # log_ts is UTC aware
-                    
+                    shift_start_hour = clock_in_time.hour  # clock_in_time is UTC aware
+                    shift_end_hour = log_ts.hour  # log_ts is UTC aware
+
                     # Handle shifts that span multiple hours
                     if shift_start_hour == shift_end_hour:
                         # Shift within the same hour
@@ -807,37 +909,39 @@ async def get_daily_labor_spend(
                         for hour in range(shift_start_hour, shift_end_hour + 1):
                             hour_mod = hour % 24  # Handle overnight shifts
                             hourly_breakdown[hour_mod]["employees"].add(employee_id)
-                            
+
                             # Simple proportional distribution
-                            hour_fraction = 1.0 / (shift_end_hour - shift_start_hour + 1)
+                            hour_fraction = 1.0 / (
+                                shift_end_hour - shift_start_hour + 1
+                            )
                             hourly_breakdown[hour_mod]["spend"] += spend * hour_fraction
-                    
+
                     clock_in_time = None
                     employee_had_activity = True
-            
+
             # Handle active shifts (if employee is still clocked in)
             if clock_in_time is not None:
                 # Employee is currently clocked in - calculate time until target date end OR current time (whichever is earlier)
                 now = datetime.now(timezone.utc)
                 end_time = min(now, end_of_day)
-                
+
                 if end_time > clock_in_time:
                     raw_hours = (end_time - clock_in_time).total_seconds() / 3600
                     paid_hours = apply_unpaid_break(raw_hours)
                     spend = paid_hours * hourly_wage
-                    
+
                     # Add to totals
                     total_labor_spend += spend
                     total_hours += paid_hours
-                    
+
                     # Add to dealership breakdown
                     dealership_breakdown[dealership_id]["spend"] += spend
                     dealership_breakdown[dealership_id]["hours"] += paid_hours
-                    
+
                     # Add to hourly breakdown for active shift
                     shift_start_hour = clock_in_time.hour
                     current_hour = end_time.hour
-                    
+
                     if shift_start_hour == current_hour:
                         # Active shift within the same hour
                         hourly_breakdown[shift_start_hour]["spend"] += spend
@@ -850,47 +954,48 @@ async def get_daily_labor_spend(
                             # Simple proportional distribution
                             hour_fraction = 1.0 / (current_hour - shift_start_hour + 1)
                             hourly_breakdown[hour_mod]["spend"] += spend * hour_fraction
-                    
+
                     employee_had_activity = True
 
             # Count employee if they had any clock activity at this dealership (including active shifts)
             if employee_had_activity:
                 dealership_breakdown[dealership_id]["employees"].add(employee_id)
-    
+
     # Format hourly breakdown for response
     formatted_hourly_breakdown = [
         HourlyLaborSpend(
             hour=hour,
             total_labor_spend=round(data["spend"], 2),
-            total_employees=len(data["employees"])
+            total_employees=len(data["employees"]),
         )
         for hour, data in sorted(hourly_breakdown.items())
     ]
-    
+
     # Format dealership breakdown for response
     formatted_dealership_breakdown = [
         DealershipLaborSpend(
             dealership_id=dealership_id,
             total_labor_spend=round(data["spend"], 2),
-            total_hours=round(data["hours"], 2)
+            total_hours=round(data["hours"], 2),
         )
         for dealership_id, data in dealership_breakdown.items()
     ]
-    
+
     return DailyLaborSummary(
         date=target_date.isoformat(),
         total_labor_spend=round(total_labor_spend, 2),
         total_hours=round(total_hours, 2),
         hourly_breakdown=formatted_hourly_breakdown,
-        dealership_breakdown=formatted_dealership_breakdown
+        dealership_breakdown=formatted_dealership_breakdown,
     )
+
 
 @router.get("/labor/dealership/{dealership_id}", response_model=DealershipLaborSpend)
 async def get_dealership_labor_spend(
     dealership_id: str,
     target_date: Optional[date] = None,
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role)
+    admin_user: dict = Depends(require_admin_role),
 ):
     """
     Get the labor spend for a specific dealership on a specific day.
@@ -899,11 +1004,15 @@ async def get_dealership_labor_spend(
     # Default to today if no date provided
     if not target_date:
         target_date = datetime.now(timezone.utc).date()
-    
+
     # Start and end of the target day in UTC
-    start_of_day = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-    end_of_day = datetime.combine(target_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-    
+    start_of_day = datetime.combine(target_date, datetime.min.time()).replace(
+        tzinfo=timezone.utc
+    )
+    end_of_day = datetime.combine(target_date, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
+
     # Get all time logs for the dealership on the target day
     time_logs = session.exec(
         select(TimeLog)
@@ -912,24 +1021,24 @@ async def get_dealership_labor_spend(
         .where(TimeLog.timestamp <= end_of_day)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     # Group time logs by employee
     employee_logs = defaultdict(list)
     for log in time_logs:
         employee_logs[log.employee_id].append(log)
-    
+
     # Calculate total labor spend and hours
     total_labor_spend = 0.0
     total_hours = 0.0
-    
+
     for employee_id, logs in employee_logs.items():
         # Get employee's hourly wage
         user_details = await get_user_details(employee_id)
         hourly_wage = user_details.get("hourly_wage", 0.0)
-        
+
         # Sort logs by timestamp
         sorted_logs = sorted(logs, key=lambda x: x.timestamp)
-        
+
         # Calculate hours worked and corresponding spend
         clock_in_time: Optional[datetime] = None
         for log in sorted_logs:
@@ -946,32 +1055,37 @@ async def get_dealership_labor_spend(
                 total_labor_spend += paid_hours * hourly_wage
                 total_hours += paid_hours
                 clock_in_time = None
-        
+
         # Handle active shifts (if employee is still clocked in at this dealership)
         if clock_in_time is not None:
             # Employee is currently clocked in - calculate time until target date end OR current time (whichever is earlier)
             now = datetime.now(timezone.utc)
             end_time = min(now, end_of_day)
-            
+
             if end_time > clock_in_time:
                 raw_hours = (end_time - clock_in_time).total_seconds() / 3600
                 paid_hours = apply_unpaid_break(raw_hours)
                 total_labor_spend += paid_hours * hourly_wage
                 total_hours += paid_hours
-    
+
     return DealershipLaborSpend(
         dealership_id=dealership_id,
         total_labor_spend=round(total_labor_spend, 2),
-        total_hours=round(total_hours, 2)
+        total_hours=round(total_hours, 2),
     )
 
-@router.get("/active/dealership/{dealership_id}", response_model=DealershipEmployeeStatus)
+
+@router.get(
+    "/active/dealership/{dealership_id}", response_model=DealershipEmployeeStatus
+)
 async def get_active_employees_by_dealership(
     dealership_id: str,
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role)
+    admin_user: dict = Depends(require_admin_role),
 ):
-    print(f"\n--- Processing get_active_employees_by_dealership for dealership_id: {dealership_id} ---")
+    print(
+        f"\n--- Processing get_active_employees_by_dealership for dealership_id: {dealership_id} ---"
+    )
     """
     Get information about all currently active employees at a specific dealership,
     including their hourly rates, shift duration, and weekly hours.
@@ -979,7 +1093,7 @@ async def get_active_employees_by_dealership(
     # Get all employees who have clocked in at this dealership recently
     # Look back a few days to catch cross-day shifts
     lookback_date = datetime.now(timezone.utc) - timedelta(days=2)
-    
+
     # Get recent clock entries for this dealership
     recent_clocks = session.exec(
         select(TimeLog)
@@ -987,50 +1101,60 @@ async def get_active_employees_by_dealership(
         .where(TimeLog.timestamp >= lookback_date)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     print(f"Found {len(recent_clocks)} recent clock entries for {dealership_id}")
-    
+
     # Get unique employee IDs who have clocked at this dealership recently
     employee_ids = list(set(clock.employee_id for clock in recent_clocks))
     print(f"Found {len(employee_ids)} unique employees for {dealership_id}")
-    
+
     # Check each employee's current active status
     active_employees = []
     total_current_hourly_rate = 0.0
     total_labor_spend_today = 0.0
-    
+
     for employee_id in employee_ids:
         # Use the more robust active detection
         is_active, most_recent_clock_in_ts = await is_employee_currently_active(
             session, employee_id, dealership_id
         )
-        
+
         if is_active and most_recent_clock_in_ts:
-            print(f"Employee {employee_id} determined ACTIVE. Most recent clock-in: {most_recent_clock_in_ts}")
-            
+            print(
+                f"Employee {employee_id} determined ACTIVE. Most recent clock-in: {most_recent_clock_in_ts}"
+            )
+
             # Get employee details
             user_details = await get_user_details(employee_id)
             print(f"User details for {employee_id}: {user_details}")
             hourly_wage = user_details.get("hourly_wage", 0.0)
             employee_name = user_details.get("name", "Unknown")
-            
+
             # Calculate current shift duration
             now = datetime.now(timezone.utc)
-            shift_duration_hours = (now - most_recent_clock_in_ts).total_seconds() / 3600
-            
+            shift_duration_hours = (
+                now - most_recent_clock_in_ts
+            ).total_seconds() / 3600
+
             # Calculate weekly hours
             weekly_hours = await calculate_weekly_hours(session, employee_id)
-            print(f"Calculated shift_duration_hours for {employee_id}: {shift_duration_hours}")
+            print(
+                f"Calculated shift_duration_hours for {employee_id}: {shift_duration_hours}"
+            )
             print(f"Calculated weekly_hours for {employee_id}: {weekly_hours}")
-            
+
             # Check if in overtime
             is_overtime = weekly_hours > 40.0
-            
+
             # Calculate today's labor spend for this employee
             today = datetime.now(timezone.utc).date()
-            start_of_day = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
-            end_of_day = datetime.combine(today, datetime.max.time()).replace(tzinfo=timezone.utc)
-            
+            start_of_day = datetime.combine(today, datetime.min.time()).replace(
+                tzinfo=timezone.utc
+            )
+            end_of_day = datetime.combine(today, datetime.max.time()).replace(
+                tzinfo=timezone.utc
+            )
+
             # Get today's clocks for this employee at this dealership
             todays_clocks = session.exec(
                 select(TimeLog)
@@ -1040,23 +1164,28 @@ async def get_active_employees_by_dealership(
                 .where(TimeLog.timestamp <= end_of_day)
                 .order_by(TimeLog.timestamp.asc())
             ).all()
-            
+
             today_labor_spend = 0.0
             current_shift_clock_in_time: Optional[datetime] = None
-            
+
             for punch in todays_clocks:
                 punch_ts = punch.timestamp
                 if punch_ts.tzinfo is None:
                     punch_ts = punch_ts.replace(tzinfo=timezone.utc)
-                    
+
                 if punch.punch_type == PunchType.CLOCK_IN:
                     current_shift_clock_in_time = punch_ts
-                elif punch.punch_type == PunchType.CLOCK_OUT and current_shift_clock_in_time:
-                    raw_hours = (punch_ts - current_shift_clock_in_time).total_seconds() / 3600
+                elif (
+                    punch.punch_type == PunchType.CLOCK_OUT
+                    and current_shift_clock_in_time
+                ):
+                    raw_hours = (
+                        punch_ts - current_shift_clock_in_time
+                    ).total_seconds() / 3600
                     paid_hours = apply_unpaid_break(raw_hours)
                     today_labor_spend += paid_hours * hourly_wage
                     current_shift_clock_in_time = None
-            
+
             # Add current open shift (if the active clock-in was today)
             if current_shift_clock_in_time:
                 raw_hours = (now - current_shift_clock_in_time).total_seconds() / 3600
@@ -1067,10 +1196,10 @@ async def get_active_employees_by_dealership(
                 raw_hours = (now - most_recent_clock_in_ts).total_seconds() / 3600
                 paid_hours = apply_unpaid_break(raw_hours)
                 today_labor_spend += paid_hours * hourly_wage
-            
+
             total_labor_spend_today += today_labor_spend
             total_current_hourly_rate += hourly_wage
-            
+
             active_employees.append(
                 EmployeeShiftInfo(
                     employee_id=employee_id,
@@ -1080,29 +1209,30 @@ async def get_active_employees_by_dealership(
                     shift_start_time=most_recent_clock_in_ts,
                     current_shift_duration_hours=round(shift_duration_hours, 2),
                     weekly_hours_worked=round(weekly_hours, 2),
-                    is_overtime=is_overtime
+                    is_overtime=is_overtime,
                 )
             )
-    
+
     print(f"Final active_employees list for {dealership_id}: {active_employees}")
-    
+
     # Sort by shift duration (longest first)
     active_employees.sort(key=lambda x: x.current_shift_duration_hours, reverse=True)
-    
+
     result = DealershipEmployeeStatus(
         dealership_id=dealership_id,
         active_employees=active_employees,
         active_employee_count=len(active_employees),
         total_current_hourly_rate=round(total_current_hourly_rate, 2),
-        total_labor_spend_today=round(total_labor_spend_today, 2)
+        total_labor_spend_today=round(total_labor_spend_today, 2),
     )
     print(f"Returning DealershipEmployeeStatus for {dealership_id}: {result}")
     return result
 
+
 @router.get("/active/all", response_model=List[DealershipEmployeeStatus])
 async def get_all_active_employees(
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role)
+    admin_user: dict = Depends(require_admin_role),
 ):
     print(f"\n--- Processing get_all_active_employees ---")
     """
@@ -1113,34 +1243,35 @@ async def get_all_active_employees(
     dealerships_ref = firestore_db.collection("dealerships").stream()
     dealership_ids = [doc.id for doc in dealerships_ref]
     print(f"Found dealership_ids: {dealership_ids}")
-    
+
     # For each dealership, get active employees
     all_dealership_statuses = []
-    
+
     for dealership_id in dealership_ids:
         dealership_status = await get_active_employees_by_dealership(
-            dealership_id=dealership_id,
-            session=session,
-            admin_user=admin_user
+            dealership_id=dealership_id, session=session, admin_user=admin_user
         )
-        print(f"Status for dealership {dealership_id} (from get_active_employees_by_dealership): {dealership_status}")
-        
+        print(
+            f"Status for dealership {dealership_id} (from get_active_employees_by_dealership): {dealership_status}"
+        )
+
         # Only include dealerships with active employees
         if dealership_status.active_employee_count > 0:
             all_dealership_statuses.append(dealership_status)
-    
+
     # Sort by active employee count (highest first)
     all_dealership_statuses.sort(key=lambda x: x.active_employee_count, reverse=True)
-    
+
     print(f"Final all_dealership_statuses before returning: {all_dealership_statuses}")
     return all_dealership_statuses
+
 
 @router.get("/labor/weekly", response_model=List[DealershipLaborSpend])
 async def get_weekly_labor_spend(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role)
+    admin_user: dict = Depends(require_admin_role),
 ):
     """
     Get the weekly labor spend across all dealerships.
@@ -1151,15 +1282,19 @@ async def get_weekly_labor_spend(
     if not start_date:
         # Get Monday of current week
         start_date = today - timedelta(days=today.weekday())
-    
+
     if not end_date:
         # Get Sunday of current week
         end_date = start_date + timedelta(days=6)
-    
+
     # Start and end of the date range in UTC
-    start_datetime = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-    end_datetime = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-    
+    start_datetime = datetime.combine(start_date, datetime.min.time()).replace(
+        tzinfo=timezone.utc
+    )
+    end_datetime = datetime.combine(end_date, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
+
     # Get all time logs for the week
     time_logs = session.exec(
         select(TimeLog)
@@ -1167,27 +1302,27 @@ async def get_weekly_labor_spend(
         .where(TimeLog.timestamp <= end_datetime)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     # Group time logs by dealership and employee
     dealership_employee_logs = defaultdict(lambda: defaultdict(list))
     for log in time_logs:
         dealership_employee_logs[log.dealership_id][log.employee_id].append(log)
-    
+
     # Calculate labor spend for each dealership
     dealership_labor_spend = []
-    
+
     for dealership_id, employee_logs in dealership_employee_logs.items():
         total_labor_spend = 0.0
         total_hours = 0.0
-        
+
         for employee_id, logs in employee_logs.items():
             # Get employee's hourly wage
             user_details = await get_user_details(employee_id)
             hourly_wage = user_details.get("hourly_wage", 0.0)
-            
+
             # Sort logs by timestamp
             sorted_logs = sorted(logs, key=lambda x: x.timestamp)
-            
+
             # Calculate hours worked and corresponding spend
             clock_in_time: Optional[datetime] = None
             for log in sorted_logs:
@@ -1201,36 +1336,39 @@ async def get_weekly_labor_spend(
                     # clock_in_time is already UTC aware
                     raw_hours = (log_ts - clock_in_time).total_seconds() / 3600
                     paid_hours = apply_unpaid_break(raw_hours)
-                    
+
                     # Apply overtime rate for hours > 40 in the week
                     # This is a simplified approach; in a real system you'd track
                     # cumulative hours throughout the week more precisely
-                    if employee_logs[employee_id].index(log) > 8:  # Rough approximation of 40 hours
+                    if (
+                        employee_logs[employee_id].index(log) > 8
+                    ):  # Rough approximation of 40 hours
                         total_labor_spend += paid_hours * hourly_wage * 1.5
                     else:
                         total_labor_spend += paid_hours * hourly_wage
-                        
+
                     total_hours += paid_hours
                     clock_in_time = None
-        
+
         dealership_labor_spend.append(
             DealershipLaborSpend(
                 dealership_id=dealership_id,
                 total_labor_spend=round(total_labor_spend, 2),
-                total_hours=round(total_hours, 2)
+                total_hours=round(total_hours, 2),
             )
         )
-    
+
     # Sort by total labor spend (highest first)
     dealership_labor_spend.sort(key=lambda x: x.total_labor_spend, reverse=True)
-    
+
     return dealership_labor_spend
+
 
 @router.get("/employee/{employee_id}/details", response_model=EmployeeDetailResponse)
 async def get_employee_details(
     employee_id: str,
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role)
+    admin_user: dict = Depends(require_admin_role),
 ):
     """
     Get detailed information about a specific employee including:
@@ -1242,24 +1380,24 @@ async def get_employee_details(
     # Get current date and calculate date ranges
     now = datetime.now(timezone.utc)
     today = now.date()
-    
+
     # Calculate start of current week (Monday)
     current_week_start = today - timedelta(days=today.weekday())
     current_week_end = current_week_start + timedelta(days=6)
-    
+
     # Calculate previous week
     prev_week_start = current_week_start - timedelta(days=7)
     prev_week_end = current_week_start - timedelta(days=1)
-    
+
     # Start date for fetching clocks (2 weeks ago)
     two_weeks_ago = now - timedelta(days=14)
     print(f"DEBUG: Fetching clocks since {two_weeks_ago} for employee {employee_id}")
-    
+
     # Get employee details from Firestore
     user_details = await get_user_details(employee_id)
     employee_name = user_details.get("name", "Unknown")
     hourly_wage = user_details.get("hourly_wage", 0.0)
-    
+
     # Get all clock entries for the past two weeks
     recent_clocks = session.exec(
         select(TimeLog)
@@ -1267,13 +1405,13 @@ async def get_employee_details(
         .where(TimeLog.timestamp >= two_weeks_ago)
         .order_by(TimeLog.timestamp.desc())
     ).all()
-    
+
     print(f"DEBUG: Found {len(recent_clocks)} clock entries for employee {employee_id}")
-    
+
     # Print the first few clock entries for debugging
     for i, clock in enumerate(recent_clocks[:5]):
         print(f"DEBUG: Clock {i+1}: {clock.timestamp} - {clock.punch_type}")
-        
+
     # Format clock entries
     clock_entries = []
     for clock in recent_clocks:
@@ -1281,21 +1419,27 @@ async def get_employee_details(
         ts = clock.timestamp
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-            
-        clock_entries.append(EmployeeClockEntry(
-            id=clock.id,
-            timestamp=ts,
-            punch_type=clock.punch_type,
-            dealership_id=clock.dealership_id
-        ))
-    
+
+        clock_entries.append(
+            EmployeeClockEntry(
+                id=clock.id,
+                timestamp=ts,
+                punch_type=clock.punch_type,
+                dealership_id=clock.dealership_id,
+            )
+        )
+
     print(f"DEBUG: Formatted {len(clock_entries)} clock entries for response")
-    
+
     # Calculate hours and pay for current week
     current_week_hours = 0.0
-    current_week_start_dt = datetime.combine(current_week_start, datetime.min.time()).replace(tzinfo=timezone.utc)
-    current_week_end_dt = datetime.combine(current_week_end, datetime.max.time()).replace(tzinfo=timezone.utc)
-    
+    current_week_start_dt = datetime.combine(
+        current_week_start, datetime.min.time()
+    ).replace(tzinfo=timezone.utc)
+    current_week_end_dt = datetime.combine(
+        current_week_end, datetime.max.time()
+    ).replace(tzinfo=timezone.utc)
+
     current_week_clocks = session.exec(
         select(TimeLog)
         .where(TimeLog.employee_id == employee_id)
@@ -1303,17 +1447,21 @@ async def get_employee_details(
         .where(TimeLog.timestamp <= current_week_end_dt)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     # Calculate hours for current week using helper (handles implicit clock-outs)
     current_week_hours = calculate_hours_from_logs(current_week_clocks, now)
-    
+
     current_week_pay = current_week_hours * hourly_wage
-    
+
     # Calculate hours and pay for previous week
     prev_week_hours = 0.0
-    prev_week_start_dt = datetime.combine(prev_week_start, datetime.min.time()).replace(tzinfo=timezone.utc)
-    prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(tzinfo=timezone.utc)
-    
+    prev_week_start_dt = datetime.combine(prev_week_start, datetime.min.time()).replace(
+        tzinfo=timezone.utc
+    )
+    prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
+
     prev_week_clocks = session.exec(
         select(TimeLog)
         .where(TimeLog.employee_id == employee_id)
@@ -1321,29 +1469,49 @@ async def get_employee_details(
         .where(TimeLog.timestamp <= prev_week_end_dt)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     # Calculate hours for previous week using helper (handles implicit clock-outs)
-    prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(tzinfo=timezone.utc)
+    prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
     prev_week_hours = calculate_hours_from_logs(prev_week_clocks, prev_week_end_dt)
-    
+
     prev_week_pay = prev_week_hours * hourly_wage
-    
+
     # Calculate regular and overtime hours for each week
-    prev_week_regular, prev_week_overtime = calculate_regular_and_overtime_hours(prev_week_hours)
-    prev_week_pay = calculate_pay_with_overtime(prev_week_regular, prev_week_overtime, hourly_wage)
-    
-    current_week_regular, current_week_overtime = calculate_regular_and_overtime_hours(current_week_hours)
-    current_week_pay = calculate_pay_with_overtime(current_week_regular, current_week_overtime, hourly_wage)
-    
+    prev_week_regular, prev_week_overtime = calculate_regular_and_overtime_hours(
+        prev_week_hours
+    )
+    prev_week_pay = calculate_pay_with_overtime(
+        prev_week_regular, prev_week_overtime, hourly_wage
+    )
+
+    current_week_regular, current_week_overtime = calculate_regular_and_overtime_hours(
+        current_week_hours
+    )
+    current_week_pay = calculate_pay_with_overtime(
+        current_week_regular, current_week_overtime, hourly_wage
+    )
+
     # Calculate today's hours and clock status
-    todays_hours, is_currently_clocked_in = await calculate_todays_hours_and_status(session, employee_id)
+    todays_hours, is_currently_clocked_in = await calculate_todays_hours_and_status(
+        session, employee_id
+    )
     todays_regular, todays_overtime = calculate_regular_and_overtime_hours(todays_hours)
-    todays_pay = calculate_pay_with_overtime(todays_regular, todays_overtime, hourly_wage)
+    todays_pay = calculate_pay_with_overtime(
+        todays_regular, todays_overtime, hourly_wage
+    )
 
     # Calculate vacation hours for each period
-    prev_week_vacation_hours = await calculate_vacation_hours(session, employee_id, prev_week_start, prev_week_end)
-    current_week_vacation_hours = await calculate_vacation_hours(session, employee_id, current_week_start, current_week_end)
-    todays_vacation_hours = await calculate_vacation_hours(session, employee_id, today, today)
+    prev_week_vacation_hours = await calculate_vacation_hours(
+        session, employee_id, prev_week_start, prev_week_end
+    )
+    current_week_vacation_hours = await calculate_vacation_hours(
+        session, employee_id, current_week_start, current_week_end
+    )
+    todays_vacation_hours = await calculate_vacation_hours(
+        session, employee_id, today, today
+    )
 
     # Create week summaries
     week_summaries = [
@@ -1355,7 +1523,7 @@ async def get_employee_details(
             overtime_hours=round(prev_week_overtime, 2),
             total_pay=round(prev_week_pay, 2),
             vacation_hours=round(prev_week_vacation_hours, 2),
-            is_current_week=False
+            is_current_week=False,
         ),
         WeekSummary(
             week_start_date=current_week_start.isoformat(),
@@ -1365,13 +1533,13 @@ async def get_employee_details(
             overtime_hours=round(current_week_overtime, 2),
             total_pay=round(current_week_pay, 2),
             vacation_hours=round(current_week_vacation_hours, 2),
-            is_current_week=True
-        )
+            is_current_week=True,
+        ),
     ]
-    
+
     # Calculate total pay for both weeks
     two_week_total_pay = prev_week_pay + current_week_pay
-    
+
     return EmployeeDetailResponse(
         employee_id=employee_id,
         employee_name=employee_name,
@@ -1385,17 +1553,18 @@ async def get_employee_details(
             overtime_hours=round(todays_overtime, 2),
             total_pay=round(todays_pay, 2),
             vacation_hours=round(todays_vacation_hours, 2),
-            is_currently_clocked_in=is_currently_clocked_in
+            is_currently_clocked_in=is_currently_clocked_in,
         ),
-        two_week_total_pay=round(two_week_total_pay, 2)
+        two_week_total_pay=round(two_week_total_pay, 2),
     )
+
 
 @router.get("/employees/details", response_model=List[EmployeeDetailResponse])
 async def get_all_employees_details(
     session: Session = Depends(get_session),
     admin_user: dict = Depends(require_admin_role),
     limit: Optional[int] = 100,
-    offset: Optional[int] = 0
+    offset: Optional[int] = 0,
 ):
     """
     Get detailed information about all employees including:
@@ -1403,52 +1572,64 @@ async def get_all_employees_details(
     - Hours worked per week
     - Pay per week
     - Hourly rate
-    
+
     This endpoint uses pagination with limit and offset parameters.
     """
     # Calculate date ranges once for all employees
     now = datetime.now(timezone.utc)
     today = now.date()
-    
+
     # Calculate start of current week (Monday)
     current_week_start = today - timedelta(days=today.weekday())
     current_week_end = current_week_start + timedelta(days=6)
-    
+
     # Calculate previous week
     prev_week_start = current_week_start - timedelta(days=7)
     prev_week_end = current_week_start - timedelta(days=1)
-    
+
     # Start date for fetching clocks (2 weeks ago)
     two_weeks_ago = now - timedelta(days=14)
-    
+
     # Convert to datetime objects with timezone
-    current_week_start_dt = datetime.combine(current_week_start, datetime.min.time()).replace(tzinfo=timezone.utc)
-    current_week_end_dt = datetime.combine(current_week_end, datetime.max.time()).replace(tzinfo=timezone.utc)
-    prev_week_start_dt = datetime.combine(prev_week_start, datetime.min.time()).replace(tzinfo=timezone.utc)
-    prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(tzinfo=timezone.utc)
-    
+    current_week_start_dt = datetime.combine(
+        current_week_start, datetime.min.time()
+    ).replace(tzinfo=timezone.utc)
+    current_week_end_dt = datetime.combine(
+        current_week_end, datetime.max.time()
+    ).replace(tzinfo=timezone.utc)
+    prev_week_start_dt = datetime.combine(prev_week_start, datetime.min.time()).replace(
+        tzinfo=timezone.utc
+    )
+    prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
+
     # Get all employees from Firestore
-    users_ref = firestore_db.collection("users").where("role", "in", ["employee", "clockOnlyEmployee"]).stream()
+    users_ref = (
+        firestore_db.collection("users")
+        .where("role", "in", ["employee", "clockOnlyEmployee"])
+        .stream()
+    )
     employees_data = {}
     employee_ids = []
-    
+
     for doc in users_ref:
         user_data = doc.to_dict()
         employee_id = doc.id
         employee_ids.append(employee_id)
         employees_data[employee_id] = {
             "name": user_data.get("displayName", "Unknown"),
-            "hourly_wage": user_data.get("hourlyWage", 0.0)
+            "hourly_wage": user_data.get("hourlyWage", 0.0),
         }
-    
+
     # Apply pagination to employee list
     total_employees = len(employee_ids)
-    paginated_employee_ids = sorted(employee_ids)[offset:offset+limit]
-    
+    paginated_employee_ids = sorted(employee_ids)[offset : offset + limit]
+
     # If no employees, return empty list
     if not paginated_employee_ids:
         return []
-    
+
     # Batch fetch all clock entries for the past two weeks for all paginated employees
     all_clocks = session.exec(
         select(TimeLog)
@@ -1456,7 +1637,7 @@ async def get_all_employees_details(
         .where(TimeLog.timestamp >= two_weeks_ago)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     # Ensure all timestamps from DB are timezone-aware before comparisons
     for clock in all_clocks:
         if clock.timestamp.tzinfo is None:
@@ -1469,62 +1650,94 @@ async def get_all_employees_details(
         if employee_id not in employee_clocks:
             employee_clocks[employee_id] = []
         employee_clocks[employee_id].append(clock)
-    
+
     # Process each employee
     all_employee_details = []
     for employee_id in paginated_employee_ids:
         employee_name = employees_data[employee_id]["name"]
         hourly_wage = employees_data[employee_id]["hourly_wage"]
-        
+
         # Get this employee's clocks
         employee_clock_list = employee_clocks.get(employee_id, [])
-        
+
         # Format clock entries (most recent first)
         clock_entries = []
-        for clock in sorted(employee_clock_list, key=lambda x: x.timestamp, reverse=True):
+        for clock in sorted(
+            employee_clock_list, key=lambda x: x.timestamp, reverse=True
+        ):
             # Ensure timestamp is timezone aware
             ts = clock.timestamp
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
-                
-            clock_entries.append(EmployeeClockEntry(
-                id=clock.id,
-                timestamp=ts,
-                punch_type=clock.punch_type,
-                dealership_id=clock.dealership_id
-            ))
-        
+
+            clock_entries.append(
+                EmployeeClockEntry(
+                    id=clock.id,
+                    timestamp=ts,
+                    punch_type=clock.punch_type,
+                    dealership_id=clock.dealership_id,
+                )
+            )
+
         # Calculate hours and pay
         current_week_hours = 0.0
         prev_week_hours = 0.0
-        
+
         # Calculate hours using shared helper for consistency
-        current_week_clocks = [c for c in employee_clock_list if current_week_start_dt <= c.timestamp <= current_week_end_dt]
-        prev_week_clocks = [c for c in employee_clock_list if prev_week_start_dt <= c.timestamp <= prev_week_end_dt]
+        current_week_clocks = [
+            c
+            for c in employee_clock_list
+            if current_week_start_dt <= c.timestamp <= current_week_end_dt
+        ]
+        prev_week_clocks = [
+            c
+            for c in employee_clock_list
+            if prev_week_start_dt <= c.timestamp <= prev_week_end_dt
+        ]
 
         current_week_hours = calculate_hours_from_logs(current_week_clocks, now)
         # Cap previous week's calculation at the end of that week
         prev_week_hours = calculate_hours_from_logs(prev_week_clocks, prev_week_end_dt)
-        
+
         current_week_pay = current_week_hours * hourly_wage
         prev_week_pay = prev_week_hours * hourly_wage
-        
+
         # Calculate regular and overtime hours for each week
-        prev_week_regular, prev_week_overtime = calculate_regular_and_overtime_hours(prev_week_hours)
-        prev_week_pay = calculate_pay_with_overtime(prev_week_regular, prev_week_overtime, hourly_wage)
-        
-        current_week_regular, current_week_overtime = calculate_regular_and_overtime_hours(current_week_hours)
-        current_week_pay = calculate_pay_with_overtime(current_week_regular, current_week_overtime, hourly_wage)
-        
+        prev_week_regular, prev_week_overtime = calculate_regular_and_overtime_hours(
+            prev_week_hours
+        )
+        prev_week_pay = calculate_pay_with_overtime(
+            prev_week_regular, prev_week_overtime, hourly_wage
+        )
+
+        current_week_regular, current_week_overtime = (
+            calculate_regular_and_overtime_hours(current_week_hours)
+        )
+        current_week_pay = calculate_pay_with_overtime(
+            current_week_regular, current_week_overtime, hourly_wage
+        )
+
         # Calculate today's hours and clock status
-        todays_hours, is_currently_clocked_in = await calculate_todays_hours_and_status(session, employee_id)
-        todays_regular, todays_overtime = calculate_regular_and_overtime_hours(todays_hours)
-        todays_pay = calculate_pay_with_overtime(todays_regular, todays_overtime, hourly_wage)
+        todays_hours, is_currently_clocked_in = await calculate_todays_hours_and_status(
+            session, employee_id
+        )
+        todays_regular, todays_overtime = calculate_regular_and_overtime_hours(
+            todays_hours
+        )
+        todays_pay = calculate_pay_with_overtime(
+            todays_regular, todays_overtime, hourly_wage
+        )
 
         # Calculate vacation hours for each period
-        prev_week_vacation_hours = await calculate_vacation_hours(session, employee_id, prev_week_start, prev_week_end)
-        current_week_vacation_hours = await calculate_vacation_hours(session, employee_id, current_week_start, current_week_end)
-        todays_vacation_hours = await calculate_vacation_hours(session, employee_id, today, today)
+        prev_week_vacation_hours = await calculate_vacation_hours(
+            session, employee_id, prev_week_start, prev_week_end
+        )
+        current_week_vacation_hours = await calculate_vacation_hours(
+            session, employee_id, current_week_start, current_week_end
+        )
+        todays_vacation_hours = await calculate_vacation_hours(
+            session, employee_id, today, today
+        )
 
         # Create week summaries
         week_summaries = [
@@ -1535,7 +1748,7 @@ async def get_all_employees_details(
                 regular_hours=round(prev_week_regular, 2),
                 overtime_hours=round(prev_week_overtime, 2),
                 total_pay=round(prev_week_pay, 2),
-                is_current_week=False
+                is_current_week=False,
             ),
             WeekSummary(
                 week_start_date=current_week_start.isoformat(),
@@ -1544,72 +1757,82 @@ async def get_all_employees_details(
                 regular_hours=round(current_week_regular, 2),
                 overtime_hours=round(current_week_overtime, 2),
                 total_pay=round(current_week_pay, 2),
-                is_current_week=True
-            )
+                is_current_week=True,
+            ),
         ]
-        
+
         # Calculate total pay for both weeks
         two_week_total_pay = prev_week_pay + current_week_pay
-        
-        all_employee_details.append(EmployeeDetailResponse(
-            employee_id=employee_id,
-            employee_name=employee_name,
-            hourly_wage=hourly_wage,
-            recent_clocks=clock_entries,
-            week_summaries=week_summaries,
-            todays_summary=TodaysSummary(
-                date=today.isoformat(),
-                total_hours=round(todays_hours, 2),
-                regular_hours=round(todays_regular, 2),
-                overtime_hours=round(todays_overtime, 2),
-                total_pay=round(todays_pay, 2),
-                is_currently_clocked_in=is_currently_clocked_in
-            ),
-            two_week_total_pay=round(two_week_total_pay, 2)
-        ))
-    
+
+        all_employee_details.append(
+            EmployeeDetailResponse(
+                employee_id=employee_id,
+                employee_name=employee_name,
+                hourly_wage=hourly_wage,
+                recent_clocks=clock_entries,
+                week_summaries=week_summaries,
+                todays_summary=TodaysSummary(
+                    date=today.isoformat(),
+                    total_hours=round(todays_hours, 2),
+                    regular_hours=round(todays_regular, 2),
+                    overtime_hours=round(todays_overtime, 2),
+                    total_pay=round(todays_pay, 2),
+                    is_currently_clocked_in=is_currently_clocked_in,
+                ),
+                two_week_total_pay=round(two_week_total_pay, 2),
+            )
+        )
+
     # Sort by name
     all_employee_details.sort(key=lambda x: x.employee_name or "")
-    
+
     return all_employee_details
 
-@router.get("/dealership/{dealership_id}/employee-hours", response_model=DealershipEmployeeHoursResponse)
+
+@router.get(
+    "/dealership/{dealership_id}/employee-hours",
+    response_model=DealershipEmployeeHoursResponse,
+)
 async def get_dealership_employee_hours_breakdown(
     dealership_id: str,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role)
+    admin_user: dict = Depends(require_admin_role),
 ):
     """
     Get a breakdown of all employees at a dealership with their regular and overtime hours.
     Perfect for labor cost overview and management.
-    
+
     Args:
         dealership_id: The ID of the dealership
         start_date: Start date for the calculation (defaults to current week start)
         end_date: End date for the calculation (defaults to current week end)
-    
+
     Returns:
         DealershipEmployeeHoursResponse with each employee's hours breakdown
     """
-    
+
     # Set default date range to current week if not provided
     now = datetime.now(timezone.utc)
     today = now.date()
-    
+
     if not start_date:
         # Default to start of current week (Monday)
         start_date = today - timedelta(days=today.weekday())
-    
+
     if not end_date:
         # Default to end of current week (Sunday)
         end_date = start_date + timedelta(days=6)
-    
+
     # Convert dates to datetime objects with timezone
-    start_datetime = datetime.combine(start_date, datetime.min.time()).replace(tzinfo=timezone.utc)
-    end_datetime = datetime.combine(end_date, datetime.max.time()).replace(tzinfo=timezone.utc)
-    
+    start_datetime = datetime.combine(start_date, datetime.min.time()).replace(
+        tzinfo=timezone.utc
+    )
+    end_datetime = datetime.combine(end_date, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
+
     # Get all time logs for this dealership in the date range
     time_logs = session.exec(
         select(TimeLog)
@@ -1618,64 +1841,72 @@ async def get_dealership_employee_hours_breakdown(
         .where(TimeLog.timestamp <= end_datetime)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     # Group time logs by employee
     employee_logs = defaultdict(list)
     for log in time_logs:
         employee_logs[log.employee_id].append(log)
-    
+
     # Get all unique employee IDs for this dealership
     employee_ids = list(employee_logs.keys())
-    
+
     # Calculate summary totals
     summary_total_hours = 0.0
     summary_regular_hours = 0.0
     summary_overtime_hours = 0.0
     summary_estimated_pay = 0.0
-    
+
     employee_breakdown_list = []
-    
+
     for employee_id in employee_ids:
         # Get employee details from Firestore
         user_details = await get_user_details(employee_id)
         employee_name = user_details.get("name", "Unknown")
         hourly_wage = user_details.get("hourly_wage", 0.0)
-        
+
         # Check if employee is currently active at this dealership
-        is_currently_active, _ = await is_employee_currently_active(session, employee_id, dealership_id)
-        
+        is_currently_active, _ = await is_employee_currently_active(
+            session, employee_id, dealership_id
+        )
+
         # Calculate total hours worked by this employee using helper
         logs = employee_logs[employee_id]
         # Cap the calculation at the end of the requested period
         calculation_end_time = min(now, end_datetime)
         total_hours_worked = calculate_hours_from_logs(logs, calculation_end_time)
-        
+
         # Calculate regular vs overtime hours
-        regular_hours, overtime_hours = calculate_regular_and_overtime_hours(total_hours_worked)
-        
+        regular_hours, overtime_hours = calculate_regular_and_overtime_hours(
+            total_hours_worked
+        )
+
         # Calculate estimated pay with overtime
-        estimated_pay = calculate_pay_with_overtime(regular_hours, overtime_hours, hourly_wage)
-        
+        estimated_pay = calculate_pay_with_overtime(
+            regular_hours, overtime_hours, hourly_wage
+        )
+
         # Add to summary totals
         summary_total_hours += total_hours_worked
         summary_regular_hours += regular_hours
         summary_overtime_hours += overtime_hours
         summary_estimated_pay += estimated_pay
-        
-        employee_breakdown_list.append(EmployeeHoursBreakdown(
-            employee_id=employee_id,
-            employee_name=employee_name,
-            hourly_wage=hourly_wage,
-            total_hours=round(total_hours_worked, 2),
-            regular_hours=round(regular_hours, 2),
-            overtime_hours=round(overtime_hours, 2),
-            estimated_pay=round(estimated_pay, 2),
-            is_currently_active=is_currently_active
-        ))
-    
+
+        employee_breakdown_list.append(
+            EmployeeHoursBreakdown(
+                employee_id=employee_id,
+                employee_name=employee_name,
+                hourly_wage=hourly_wage,
+                total_hours=round(total_hours_worked, 2),
+                regular_hours=round(regular_hours, 2),
+                overtime_hours=round(overtime_hours, 2),
+                estimated_pay=round(estimated_pay, 2),
+                is_currently_active=is_currently_active,
+            )
+        )
+
     # Sort by total hours (highest first) for better overview
     employee_breakdown_list.sort(key=lambda x: x.total_hours, reverse=True)
-    
+
     # Create summary dictionary
     summary = {
         "total_hours": round(summary_total_hours, 2),
@@ -1683,22 +1914,30 @@ async def get_dealership_employee_hours_breakdown(
         "overtime_hours": round(summary_overtime_hours, 2),
         "estimated_total_pay": round(summary_estimated_pay, 2),
         "employee_count": len(employee_breakdown_list),
-        "average_hours_per_employee": round(summary_total_hours / len(employee_breakdown_list) if employee_breakdown_list else 0, 2)
+        "average_hours_per_employee": round(
+            (
+                summary_total_hours / len(employee_breakdown_list)
+                if employee_breakdown_list
+                else 0
+            ),
+            2,
+        ),
     }
-    
+
     return DealershipEmployeeHoursResponse(
         dealership_id=dealership_id,
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
         employees=employee_breakdown_list,
-        summary=summary
+        summary=summary,
     )
+
 
 def calculate_dealership_weekly_breakdown(
     logs: List[TimeLog],
     target_dealership_id: str,
     hourly_wage: float,
-    current_time: datetime
+    current_time: datetime,
 ) -> Dict[str, float]:
     """
     Calculates a breakdown of hours and cost for a single dealership from a list of
@@ -1708,9 +1947,9 @@ def calculate_dealership_weekly_breakdown(
         return {"total": 0.0, "regular": 0.0, "overtime": 0.0, "cost": 0.0}
 
     sorted_logs = sorted(logs, key=lambda x: x.timestamp)
-    
+
     breakdown = {"total": 0.0, "regular": 0.0, "overtime": 0.0}
-    
+
     cumulative_hours_this_week = 0.0
     clock_in_log: Optional[TimeLog] = None
 
@@ -1725,11 +1964,16 @@ def calculate_dealership_weekly_breakdown(
             if clock_in_log:
                 processed_shifts.append({"start": clock_in_log, "end": log})
                 clock_in_log = None
-    
+
     # Account for a shift that is still open
     if clock_in_log:
         # Create a temporary 'end' log at the current time to cap the shift
-        end_log = TimeLog(timestamp=current_time, punch_type=PunchType.CLOCK_OUT, employee_id="", dealership_id="")
+        end_log = TimeLog(
+            timestamp=current_time,
+            punch_type=PunchType.CLOCK_OUT,
+            employee_id="",
+            dealership_id="",
+        )
         processed_shifts.append({"start": clock_in_log, "end": end_log})
 
     # Iterate through the processed shifts to calculate hours
@@ -1740,7 +1984,7 @@ def calculate_dealership_weekly_breakdown(
         start_ts = start_log.timestamp
         if start_ts.tzinfo is None:
             start_ts = start_ts.replace(tzinfo=timezone.utc)
-        
+
         end_ts = end_log.timestamp
         if end_ts.tzinfo is None:
             end_ts = end_ts.replace(tzinfo=timezone.utc)
@@ -1751,7 +1995,7 @@ def calculate_dealership_weekly_breakdown(
         # Only add to dealership breakdown if the shift started at the target dealership
         if start_log.dealership_id == target_dealership_id:
             remaining_before_ot = 40.0 - cumulative_hours_this_week
-            
+
             if remaining_before_ot <= 0:
                 # All hours for this shift are overtime
                 breakdown["overtime"] += paid_hours
@@ -1764,26 +2008,32 @@ def calculate_dealership_weekly_breakdown(
                 overtime_part = paid_hours - regular_part
                 breakdown["regular"] += regular_part
                 breakdown["overtime"] += overtime_part
-        
+
         # IMPORTANT: Always update cumulative hours with hours from all dealerships
         # to correctly track when the 40-hour overtime threshold is met.
         cumulative_hours_this_week += paid_hours
 
     breakdown["total"] = breakdown["regular"] + breakdown["overtime"]
-    breakdown["cost"] = calculate_pay_with_overtime(breakdown["regular"], breakdown["overtime"], hourly_wage)
-    
+    breakdown["cost"] = calculate_pay_with_overtime(
+        breakdown["regular"], breakdown["overtime"], hourly_wage
+    )
+
     return breakdown
 
-@router.get("/dealership/{dealership_id}/comprehensive-labor-spend", response_model=ComprehensiveLaborSpendResponse)
+
+@router.get(
+    "/dealership/{dealership_id}/comprehensive-labor-spend",
+    response_model=ComprehensiveLaborSpendResponse,
+)
 async def get_comprehensive_labor_spend(
     dealership_id: str,
     target_date: Optional[date] = None,
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role)
+    admin_user: dict = Depends(require_admin_role),
 ):
     """
     Get absolutely comprehensive labor spend information for a dealership.
-    
+
     This endpoint returns EVERYTHING you could want to know about labor costs:
     - All employees (active and inactive)
     - Individual and total labor costs for today
@@ -1794,11 +2044,13 @@ async def get_comprehensive_labor_spend(
     - Cost efficiency metrics
     - Top performers
     """
-    print(f"\n--- Starting comprehensive labor spend analysis for dealership: {dealership_id} ---")
-    
+    print(
+        f"\n--- Starting comprehensive labor spend analysis for dealership: {dealership_id} ---"
+    )
+
     # Current time and date setup
     now = datetime.now(timezone.utc)
-    
+
     # If a target date is not provided, default to the current date in US/Eastern timezone
     # to better align with user expectations.
     if target_date:
@@ -1808,20 +2060,34 @@ async def get_comprehensive_labor_spend(
 
     # Define the boundaries for the analysis date. All calculations will be based on this day.
     analysis_tz = ZoneInfo("America/New_York")
-    start_of_analysis_day = datetime.combine(analysis_date, datetime.min.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    end_of_analysis_day = datetime.combine(analysis_date, datetime.max.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    
+    start_of_analysis_day = datetime.combine(
+        analysis_date, datetime.min.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+    end_of_analysis_day = datetime.combine(
+        analysis_date, datetime.max.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+
     # Current week boundaries (Monday to Sunday) based on the analysis date
     current_week_start = analysis_date - timedelta(days=analysis_date.weekday())
     current_week_end = current_week_start + timedelta(days=6)
-    start_of_week = datetime.combine(current_week_start, datetime.min.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    end_of_week = datetime.combine(current_week_end, datetime.max.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
+    start_of_week = datetime.combine(
+        current_week_start, datetime.min.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+    end_of_week = datetime.combine(
+        current_week_end, datetime.max.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
 
-    print(f"Analysis period (UTC) - Day: {start_of_analysis_day} to {end_of_analysis_day}")
+    print(
+        f"Analysis period (UTC) - Day: {start_of_analysis_day} to {end_of_analysis_day}"
+    )
     print(f"Analysis period (UTC) - Week: {start_of_week} to {end_of_week}")
-    
+
     # Get ALL employees from Firestore (not just those who clocked in)
-    users_ref = firestore_db.collection("users").where("role", "in", ["employee", "clockOnlyEmployee"]).stream()
+    users_ref = (
+        firestore_db.collection("users")
+        .where("role", "in", ["employee", "clockOnlyEmployee"])
+        .stream()
+    )
     all_employees = {}
     for doc in users_ref:
         user_data = doc.to_dict()
@@ -1831,14 +2097,18 @@ async def get_comprehensive_labor_spend(
         if isinstance(raw_dealerships, list):
             employee_dealerships = [str(d).strip() for d in raw_dealerships]
         else:
-            employee_dealerships = [s.strip() for s in str(raw_dealerships).split(",") if s.strip()]
+            employee_dealerships = [
+                s.strip() for s in str(raw_dealerships).split(",") if s.strip()
+            ]
 
         # Parse optional "timeClockDealerships" field (same format)
         raw_tc_dealers = user_data.get("timeClockDealerships", "")
         if isinstance(raw_tc_dealers, list):
             time_clock_dealerships = [str(d).strip() for d in raw_tc_dealers]
         else:
-            time_clock_dealerships = [s.strip() for s in str(raw_tc_dealers).split(",") if s.strip()]
+            time_clock_dealerships = [
+                s.strip() for s in str(raw_tc_dealers).split(",") if s.strip()
+            ]
 
         combined_dealerships = set(employee_dealerships) | set(time_clock_dealerships)
 
@@ -1849,21 +2119,23 @@ async def get_comprehensive_labor_spend(
         employee_id = doc.id
         all_employees[employee_id] = {
             "name": user_data.get("displayName", "Unknown"),
-            "hourly_wage": float(user_data.get("hourlyWage", 0.0)) if user_data.get("hourlyWage") else 0.0
+            "hourly_wage": (
+                float(user_data.get("hourlyWage", 0.0))
+                if user_data.get("hourlyWage")
+                else 0.0
+            ),
         }
-    
+
     print(f"Found {len(all_employees)} total employees assigned to {dealership_id}")
-    
+
     # Get ALL time logs for THIS WEEK for ALL RELEVANT EMPLOYEES across ALL dealerships.
     # This is crucial for correctly calculating cross-dealership implicit clock-outs.
     employee_ids = list(all_employees.keys())
-    
+
     if not employee_ids:
         # No employees for this dealership, so return an empty response.
         return ComprehensiveLaborSpendResponse(
-            summary=summary,
-            employees=[],
-            data_generated_at=now
+            summary=summary, employees=[], data_generated_at=now
         )
 
     today_logs = session.exec(
@@ -1873,7 +2145,7 @@ async def get_comprehensive_labor_spend(
         .where(TimeLog.timestamp <= end_of_analysis_day)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     week_logs = session.exec(
         select(TimeLog)
         .where(TimeLog.employee_id.in_(employee_ids))
@@ -1881,51 +2153,57 @@ async def get_comprehensive_labor_spend(
         .where(TimeLog.timestamp <= end_of_week)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
-    print(f"Found {len(today_logs)} today logs and {len(week_logs)} week logs for these employees across all dealerships")
-    
+
+    print(
+        f"Found {len(today_logs)} today logs and {len(week_logs)} week logs for these employees across all dealerships"
+    )
+
     # Get vacation time for the target dealership
     vacation_today = session.exec(
         select(VacationTime)
         .where(VacationTime.dealership_id == dealership_id)
         .where(VacationTime.date == analysis_date)
     ).all()
-    
+
     vacation_this_week = session.exec(
         select(VacationTime)
         .where(VacationTime.dealership_id == dealership_id)
         .where(VacationTime.date >= current_week_start)
         .where(VacationTime.date <= current_week_end)
     ).all()
-    
-    print(f"Found {len(vacation_today)} vacation entries for today, {len(vacation_this_week)} for this week")
-    
+
+    print(
+        f"Found {len(vacation_today)} vacation entries for today, {len(vacation_this_week)} for this week"
+    )
+
     # Initialize summary
     summary = DealershipLaborSpendSummary(
         dealership_id=dealership_id,
         analysis_date=analysis_date.isoformat(),
-        analysis_timestamp=now
+        analysis_timestamp=now,
     )
-    
+
     employee_details = []
     employees_who_worked_today = set()
     employees_currently_active = set()
-    
+
     # Process each employee
     for employee_id, employee_data in all_employees.items():
         try:
             employee_name = employee_data["name"]
             hourly_wage = employee_data["hourly_wage"]
-            
-            print(f"Processing employee: {employee_id} ({employee_name}) @ ${hourly_wage}/hr")
-            
+
+            print(
+                f"Processing employee: {employee_id} ({employee_name}) @ ${hourly_wage}/hr"
+            )
+
             # Initialize employee detail
             detail = EmployeeLaborDetail(
                 employee_id=employee_id,
                 employee_name=employee_name,
-                hourly_wage=hourly_wage
+                hourly_wage=hourly_wage,
             )
-            
+
             # Check if currently active
             is_active, most_recent_clock_in_ts = await is_employee_currently_active(
                 session, employee_id, dealership_id
@@ -1933,11 +2211,15 @@ async def get_comprehensive_labor_spend(
             detail.is_currently_active = is_active
             if is_active and most_recent_clock_in_ts:
                 detail.current_shift_start_time = most_recent_clock_in_ts
-                detail.current_shift_duration_hours = (now - most_recent_clock_in_ts).total_seconds() / 3600
+                detail.current_shift_duration_hours = (
+                    now - most_recent_clock_in_ts
+                ).total_seconds() / 3600
                 employees_currently_active.add(employee_id)
-            
+
             # First, calculate hours worked this week BEFORE today
-            employee_week_logs = [log for log in week_logs if log.employee_id == employee_id]
+            employee_week_logs = [
+                log for log in week_logs if log.employee_id == employee_id
+            ]
             week_logs_before_today = []
             for log in employee_week_logs:
                 log_ts = log.timestamp
@@ -1948,34 +2230,56 @@ async def get_comprehensive_labor_spend(
             hours_worked_before_today = calculate_hours_by_dealership_from_logs(
                 week_logs_before_today, dealership_id, start_of_analysis_day
             )
-            
+
             # Process today's time logs for this employee
-            employee_today_logs = [log for log in today_logs if log.employee_id == employee_id]
-            
+            employee_today_logs = [
+                log for log in today_logs if log.employee_id == employee_id
+            ]
+
             if employee_today_logs:
                 employees_who_worked_today.add(employee_id)
-                
+
                 # Count clock-ins and find first/last
-                clock_ins = [log for log in employee_today_logs if log.punch_type == PunchType.CLOCK_IN]
-                clock_outs = [log for log in employee_today_logs if log.punch_type == PunchType.CLOCK_OUT]
-                
+                clock_ins = [
+                    log
+                    for log in employee_today_logs
+                    if log.punch_type == PunchType.CLOCK_IN
+                ]
+                clock_outs = [
+                    log
+                    for log in employee_today_logs
+                    if log.punch_type == PunchType.CLOCK_OUT
+                ]
+
                 detail.todays_clock_in_count = len(clock_ins)
                 if clock_ins:
-                    detail.todays_first_clock_in = min(clock_ins, key=lambda x: x.timestamp).timestamp
+                    detail.todays_first_clock_in = min(
+                        clock_ins, key=lambda x: x.timestamp
+                    ).timestamp
                 if clock_outs:
-                    detail.todays_last_clock_out = max(clock_outs, key=lambda x: x.timestamp).timestamp
-                
+                    detail.todays_last_clock_out = max(
+                        clock_outs, key=lambda x: x.timestamp
+                    ).timestamp
+
                 # Calculate today's total hours
                 # Special handling: if the employee is currently active and their shift started before today,
                 # we need to calculate how many hours they've worked TODAY from their ongoing shift
-                if detail.is_currently_active and detail.current_shift_start_time and detail.current_shift_start_time < start_of_analysis_day:
+                if (
+                    detail.is_currently_active
+                    and detail.current_shift_start_time
+                    and detail.current_shift_start_time < start_of_analysis_day
+                ):
                     # Employee has been clocked in since before today - calculate hours worked today only
-                    hours_since_start_of_today = (now - start_of_analysis_day).total_seconds() / 3600
+                    hours_since_start_of_today = (
+                        now - start_of_analysis_day
+                    ).total_seconds() / 3600
                     detail.todays_total_hours = hours_since_start_of_today
                 else:
                     # Standard calculation for shifts that started today
-                    detail.todays_total_hours = calculate_hours_by_dealership_from_logs(employee_today_logs, dealership_id, now)
-                
+                    detail.todays_total_hours = calculate_hours_by_dealership_from_logs(
+                        employee_today_logs, dealership_id, now
+                    )
+
                 # Correctly allocate today's hours into regular and overtime based on weekly context
                 # If employee has already worked 40+ hours this week, all of today's hours are overtime
                 if hours_worked_before_today >= 40.0:
@@ -1984,29 +2288,53 @@ async def get_comprehensive_labor_spend(
                 else:
                     # Some of today's hours may be regular, some overtime
                     remaining_regular_hours = 40.0 - hours_worked_before_today
-                    detail.todays_regular_hours = min(detail.todays_total_hours, remaining_regular_hours)
-                    detail.todays_overtime_hours = max(0.0, detail.todays_total_hours - remaining_regular_hours)
-                
-                detail.todays_labor_cost = calculate_pay_with_overtime(detail.todays_regular_hours, detail.todays_overtime_hours, hourly_wage)
-            
+                    detail.todays_regular_hours = min(
+                        detail.todays_total_hours, remaining_regular_hours
+                    )
+                    detail.todays_overtime_hours = max(
+                        0.0, detail.todays_total_hours - remaining_regular_hours
+                    )
+
+                detail.todays_labor_cost = calculate_pay_with_overtime(
+                    detail.todays_regular_hours,
+                    detail.todays_overtime_hours,
+                    hourly_wage,
+                )
+
             # Process this week's time logs for this employee
-            employee_week_logs = [log for log in week_logs if log.employee_id == employee_id]
+            employee_week_logs = [
+                log for log in week_logs if log.employee_id == employee_id
+            ]
             if employee_week_logs:
-                detail.weekly_total_hours = calculate_hours_by_dealership_from_logs(employee_week_logs, dealership_id, now)
-                detail.weekly_regular_hours, detail.weekly_overtime_hours = calculate_regular_and_overtime_hours(detail.weekly_total_hours)
-                detail.weekly_labor_cost = calculate_pay_with_overtime(detail.weekly_regular_hours, detail.weekly_overtime_hours, hourly_wage)
-            
+                detail.weekly_total_hours = calculate_hours_by_dealership_from_logs(
+                    employee_week_logs, dealership_id, now
+                )
+                detail.weekly_regular_hours, detail.weekly_overtime_hours = (
+                    calculate_regular_and_overtime_hours(detail.weekly_total_hours)
+                )
+                detail.weekly_labor_cost = calculate_pay_with_overtime(
+                    detail.weekly_regular_hours,
+                    detail.weekly_overtime_hours,
+                    hourly_wage,
+                )
+
             # Process vacation for today
-            employee_vacation_today = [v for v in vacation_today if v.employee_id == employee_id]
+            employee_vacation_today = [
+                v for v in vacation_today if v.employee_id == employee_id
+            ]
             if employee_vacation_today:
-                detail.todays_vacation_hours = sum(v.hours for v in employee_vacation_today)
+                detail.todays_vacation_hours = sum(
+                    v.hours for v in employee_vacation_today
+                )
                 detail.todays_vacation_cost = detail.todays_vacation_hours * hourly_wage
-            
+
             # Calculate total cost for today (work + vacation)
-            detail.todays_total_cost = detail.todays_labor_cost + detail.todays_vacation_cost
-            
+            detail.todays_total_cost = (
+                detail.todays_labor_cost + detail.todays_vacation_cost
+            )
+
             employee_details.append(detail)
-            
+
             # Add to summary totals
             summary.todays_total_work_hours += detail.todays_total_hours
             summary.todays_total_vacation_hours += detail.todays_vacation_hours
@@ -2014,121 +2342,164 @@ async def get_comprehensive_labor_spend(
             summary.todays_total_vacation_cost += detail.todays_vacation_cost
             summary.todays_regular_hours += detail.todays_regular_hours
             summary.todays_overtime_hours += detail.todays_overtime_hours
-            
+
             # --- Weekly Calculations ---
             # First, calculate totals for the individual employee detail (across all dealerships)
-            employee_week_logs = [log for log in week_logs if log.employee_id == employee_id]
+            employee_week_logs = [
+                log for log in week_logs if log.employee_id == employee_id
+            ]
             if employee_week_logs:
-                employee_total_weekly_hours = calculate_hours_from_logs(employee_week_logs, now)
+                employee_total_weekly_hours = calculate_hours_from_logs(
+                    employee_week_logs, now
+                )
                 detail.weekly_total_hours = employee_total_weekly_hours
-                detail.weekly_regular_hours, detail.weekly_overtime_hours = calculate_regular_and_overtime_hours(employee_total_weekly_hours)
-                detail.weekly_labor_cost = calculate_pay_with_overtime(detail.weekly_regular_hours, detail.weekly_overtime_hours, hourly_wage)
+                detail.weekly_regular_hours, detail.weekly_overtime_hours = (
+                    calculate_regular_and_overtime_hours(employee_total_weekly_hours)
+                )
+                detail.weekly_labor_cost = calculate_pay_with_overtime(
+                    detail.weekly_regular_hours,
+                    detail.weekly_overtime_hours,
+                    hourly_wage,
+                )
 
             # Second, calculate the dealership-specific breakdown for the main summary
             dealership_weekly_breakdown = calculate_dealership_weekly_breakdown(
                 employee_week_logs, dealership_id, hourly_wage, now
             )
-            
+
             # Add dealership-specific weekly hours and costs to the main summary
-            employee_week_vacation = [v for v in vacation_this_week if v.employee_id == employee_id]
+            employee_week_vacation = [
+                v for v in vacation_this_week if v.employee_id == employee_id
+            ]
             weekly_vacation_hours = sum(v.hours for v in employee_week_vacation)
             weekly_vacation_cost = weekly_vacation_hours * hourly_wage
 
-            summary.weekly_total_hours += dealership_weekly_breakdown["total"] + weekly_vacation_hours
+            summary.weekly_total_hours += (
+                dealership_weekly_breakdown["total"] + weekly_vacation_hours
+            )
             summary.weekly_regular_hours += dealership_weekly_breakdown["regular"]
             summary.weekly_overtime_hours += dealership_weekly_breakdown["overtime"]
-            summary.weekly_total_cost += dealership_weekly_breakdown["cost"] + weekly_vacation_cost
-            
+            summary.weekly_total_cost += (
+                dealership_weekly_breakdown["cost"] + weekly_vacation_cost
+            )
+
             if is_active:
                 summary.current_hourly_labor_rate += hourly_wage
 
         except Exception as e:
-            print(f"--- ERROR processing employee {employee_id} ({employee_data.get('name', 'Unknown')}) ---")
+            print(
+                f"--- ERROR processing employee {employee_id} ({employee_data.get('name', 'Unknown')}) ---"
+            )
             print(f"Error: {e}")
             # Optionally, re-raise if you want to stop execution, or just continue
             # For robustness, we'll log and continue
             continue
-    
+
     # Calculate summary metrics
     summary.total_employees = len(all_employees)
-    summary.active_employees_today = len(employees_who_worked_today | employees_currently_active)
+    summary.active_employees_today = len(
+        employees_who_worked_today | employees_currently_active
+    )
     summary.employees_who_clocked_in_today = len(employees_who_worked_today)
     summary.employees_currently_clocked_in = len(employees_currently_active)
-    
-    summary.todays_total_combined_hours = summary.todays_total_work_hours + summary.todays_total_vacation_hours
-    summary.todays_total_labor_cost = summary.todays_total_work_cost + summary.todays_total_vacation_cost
-    
+
+    summary.todays_total_combined_hours = (
+        summary.todays_total_work_hours + summary.todays_total_vacation_hours
+    )
+    summary.todays_total_labor_cost = (
+        summary.todays_total_work_cost + summary.todays_total_vacation_cost
+    )
+
     # Calculate regular vs overtime costs
     total_regular_cost = 0.0
     total_overtime_cost = 0.0
     total_wages = 0.0
     total_weighted_hours = 0.0
-    
+
     for detail in employee_details:
         if detail.hourly_wage and detail.hourly_wage > 0:
             total_wages += detail.hourly_wage
             if detail.todays_total_hours > 0:
                 total_weighted_hours += detail.todays_total_hours * detail.hourly_wage
-            
+
             # Calculate regular and overtime costs
             total_regular_cost += detail.todays_regular_hours * detail.hourly_wage
-            total_overtime_cost += detail.todays_overtime_hours * detail.hourly_wage * 1.5
-    
+            total_overtime_cost += (
+                detail.todays_overtime_hours * detail.hourly_wage * 1.5
+            )
+
     summary.todays_regular_cost = total_regular_cost
     summary.todays_overtime_cost = total_overtime_cost
-    
+
     # Calculate averages safely
     if summary.total_employees > 0:
         summary.average_hourly_wage = total_wages / summary.total_employees
-        summary.cost_per_employee_today = summary.todays_total_labor_cost / summary.total_employees
-        summary.hours_per_employee_today = summary.todays_total_combined_hours / summary.total_employees
+        summary.cost_per_employee_today = (
+            summary.todays_total_labor_cost / summary.total_employees
+        )
+        summary.hours_per_employee_today = (
+            summary.todays_total_combined_hours / summary.total_employees
+        )
     else:
         summary.average_hourly_wage = 0.0
         summary.cost_per_employee_today = 0.0
         summary.hours_per_employee_today = 0.0
 
     if summary.todays_total_combined_hours > 0:
-        summary.weighted_average_hourly_rate = total_weighted_hours / summary.todays_total_combined_hours
+        summary.weighted_average_hourly_rate = (
+            total_weighted_hours / summary.todays_total_combined_hours
+        )
     else:
         summary.weighted_average_hourly_rate = 0.0
-    
+
     # Count clock activities
-    summary.total_clock_ins_today = len([log for log in today_logs if log.punch_type == PunchType.CLOCK_IN])
-    summary.total_clock_outs_today = len([log for log in today_logs if log.punch_type == PunchType.CLOCK_OUT])
-    
+    summary.total_clock_ins_today = len(
+        [log for log in today_logs if log.punch_type == PunchType.CLOCK_IN]
+    )
+    summary.total_clock_outs_today = len(
+        [log for log in today_logs if log.punch_type == PunchType.CLOCK_OUT]
+    )
+
     # Sort employees for insights
     employee_details.sort(key=lambda x: x.employee_name or "")
-    
+
     # Top performers
-    top_earners = sorted(employee_details, key=lambda x: x.todays_total_cost, reverse=True)[:5]
-    most_hours = sorted(employee_details, key=lambda x: x.todays_total_hours, reverse=True)[:5]
-    
-    print(f"Analysis complete. Summary: {summary.total_employees} employees, ${summary.todays_total_labor_cost:.2f} total cost today")
-    
+    top_earners = sorted(
+        employee_details, key=lambda x: x.todays_total_cost, reverse=True
+    )[:5]
+    most_hours = sorted(
+        employee_details, key=lambda x: x.todays_total_hours, reverse=True
+    )[:5]
+
+    print(
+        f"Analysis complete. Summary: {summary.total_employees} employees, ${summary.todays_total_labor_cost:.2f} total cost today"
+    )
+
     return ComprehensiveLaborSpendResponse(
         summary=summary,
         employees=employee_details,
         top_earners_today=top_earners,
         most_hours_today=most_hours,
-        data_generated_at=now
+        data_generated_at=now,
     )
+
 
 def calculate_hours_from_logs(logs: List[TimeLog], current_time: datetime) -> float:
     """Calculate total hours from a list of time logs"""
     if not logs:
         return 0.0
-    
+
     # Sort logs by timestamp
     sorted_logs = sorted(logs, key=lambda x: x.timestamp)
-    
+
     total_hours = 0.0
     clock_in_time = None
-    
+
     for log in sorted_logs:
         log_ts = log.timestamp
         if log_ts.tzinfo is None:
             log_ts = log_ts.replace(tzinfo=timezone.utc)
-        
+
         if log.punch_type == PunchType.CLOCK_IN:
             # If there's already an open shift, close it at the moment of this new CLOCK_IN
             if clock_in_time is not None:
@@ -2142,19 +2513,18 @@ def calculate_hours_from_logs(logs: List[TimeLog], current_time: datetime) -> fl
             paid_hours = apply_unpaid_break(raw_hours)
             total_hours += paid_hours
             clock_in_time = None
-    
+
     # If still clocked in, add time until current_time
     if clock_in_time:
         raw_hours = (current_time - clock_in_time).total_seconds() / 3600
         paid_hours = apply_unpaid_break(raw_hours)
         total_hours += paid_hours
-    
+
     return total_hours
 
+
 def calculate_hours_by_dealership_from_logs(
-    logs: List[TimeLog],
-    target_dealership_id: str,
-    current_time: datetime
+    logs: List[TimeLog], target_dealership_id: str, current_time: datetime
 ) -> float:
     """
     Calculates total paid hours for a specific dealership from a list of time logs,
@@ -2164,7 +2534,7 @@ def calculate_hours_by_dealership_from_logs(
         return 0.0
 
     sorted_logs = sorted(logs, key=lambda x: x.timestamp)
-    
+
     dealership_hours = 0.0
     clock_in_log: Optional[TimeLog] = None
 
@@ -2178,24 +2548,26 @@ def calculate_hours_by_dealership_from_logs(
 
         if clock_in_log:
             # A shift is currently open. This new log might close it.
-            is_new_shift_at_different_dealership = is_clock_in and log.dealership_id != clock_in_log.dealership_id
-            
+            is_new_shift_at_different_dealership = (
+                is_clock_in and log.dealership_id != clock_in_log.dealership_id
+            )
+
             # A shift is closed by either an explicit CLOCK_OUT or an implicit one (a CLOCK_IN anywhere).
             if is_clock_out or is_clock_in:
-                
+
                 # Only calculate hours if the OPEN shift belongs to the target dealership.
                 if clock_in_log.dealership_id == target_dealership_id:
                     clock_in_ts = clock_in_log.timestamp
                     if clock_in_ts.tzinfo is None:
                         clock_in_ts = clock_in_ts.replace(tzinfo=timezone.utc)
-                    
+
                     raw_hours = (log_ts - clock_in_ts).total_seconds() / 3600
                     paid_hours = apply_unpaid_break(raw_hours)
                     dealership_hours += paid_hours
-                
+
                 # If this log is a clock_in, it starts the next shift. Otherwise, no shift is open.
                 clock_in_log = log if is_clock_in else None
-        
+
         elif is_clock_in:
             # No shift was open, so this log starts a new one.
             clock_in_log = log
@@ -2205,25 +2577,28 @@ def calculate_hours_by_dealership_from_logs(
         clock_in_ts = clock_in_log.timestamp
         if clock_in_ts.tzinfo is None:
             clock_in_ts = clock_in_ts.replace(tzinfo=timezone.utc)
-        
+
         raw_hours = (current_time - clock_in_ts).total_seconds() / 3600
         paid_hours = apply_unpaid_break(raw_hours)
         dealership_hours += paid_hours
 
     return dealership_hours
 
-@router.get("/dealership/{dealership_id}/labor-preview", response_model=QuickLaborPreview)
+
+@router.get(
+    "/dealership/{dealership_id}/labor-preview", response_model=QuickLaborPreview
+)
 async def get_labor_preview(
     dealership_id: str,
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role)
+    admin_user: dict = Depends(require_admin_role),
 ):
     """
     Quick preview of labor spending for a dealership TODAY.
-    
+
     Returns essential metrics for current day's labor costs without detailed breakdowns.
     Perfect for dashboards, status displays, or quick checks.
-    
+
     Shows:
     - Total money spent on labor so far today
     - Current employees clocked in
@@ -2231,22 +2606,34 @@ async def get_labor_preview(
     - Projected daily spending
     """
     print(f"\n--- Getting labor preview for dealership: {dealership_id} ---")
-    
+
     # Current time and today's boundaries
     now = datetime.now(timezone.utc)
     today = now.date()
-    start_of_today = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
-    end_of_today = datetime.combine(today, datetime.max.time()).replace(tzinfo=timezone.utc)
-    
+    start_of_today = datetime.combine(today, datetime.min.time()).replace(
+        tzinfo=timezone.utc
+    )
+    end_of_today = datetime.combine(today, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
+
     # Get all employees with their wages
-    users_ref = firestore_db.collection("users").where("role", "in", ["employee", "clockOnlyEmployee"]).stream()
+    users_ref = (
+        firestore_db.collection("users")
+        .where("role", "in", ["employee", "clockOnlyEmployee"])
+        .stream()
+    )
     employee_wages = {}
     for doc in users_ref:
         user_data = doc.to_dict()
         employee_id = doc.id
-        hourly_wage = float(user_data.get("hourlyWage", 0.0)) if user_data.get("hourlyWage") else 0.0
+        hourly_wage = (
+            float(user_data.get("hourlyWage", 0.0))
+            if user_data.get("hourlyWage")
+            else 0.0
+        )
         employee_wages[employee_id] = hourly_wage
-    
+
     # Get today's time logs for this dealership
     today_logs = session.exec(
         select(TimeLog)
@@ -2255,16 +2642,18 @@ async def get_labor_preview(
         .where(TimeLog.timestamp <= end_of_today)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     # Get today's vacation time for this dealership
     vacation_today = session.exec(
         select(VacationTime)
         .where(VacationTime.dealership_id == dealership_id)
         .where(VacationTime.date == today)
     ).all()
-    
-    print(f"Found {len(today_logs)} time logs and {len(vacation_today)} vacation entries for today")
-    
+
+    print(
+        f"Found {len(today_logs)} time logs and {len(vacation_today)} vacation entries for today"
+    )
+
     # Initialize counters
     total_work_cost = 0.0
     total_vacation_cost = 0.0
@@ -2273,7 +2662,7 @@ async def get_labor_preview(
     current_burn_rate = 0.0
     employees_who_worked = set()
     employees_currently_active = set()
-    
+
     # Group logs by employee
     employee_logs = {}
     for log in today_logs:
@@ -2281,26 +2670,30 @@ async def get_labor_preview(
             employee_logs[log.employee_id] = []
         employee_logs[log.employee_id].append(log)
         employees_who_worked.add(log.employee_id)
-    
+
     # Calculate work costs and hours for each employee
     for employee_id, logs in employee_logs.items():
         hourly_wage = employee_wages.get(employee_id, 0.0)
-        
+
         # Calculate hours worked today
         hours_worked = calculate_hours_from_logs(logs, now)
         total_work_hours += hours_worked
-        
+
         # Calculate cost (with overtime)
-        regular_hours, overtime_hours = calculate_regular_and_overtime_hours(hours_worked)
+        regular_hours, overtime_hours = calculate_regular_and_overtime_hours(
+            hours_worked
+        )
         cost = calculate_pay_with_overtime(regular_hours, overtime_hours, hourly_wage)
         total_work_cost += cost
-        
+
         # Check if currently active
-        is_active, _ = await is_employee_currently_active(session, employee_id, dealership_id)
+        is_active, _ = await is_employee_currently_active(
+            session, employee_id, dealership_id
+        )
         if is_active:
             employees_currently_active.add(employee_id)
             current_burn_rate += hourly_wage
-    
+
     # Calculate vacation costs
     for vacation in vacation_today:
         employee_id = vacation.employee_id
@@ -2308,21 +2701,29 @@ async def get_labor_preview(
         vacation_cost = vacation.hours * hourly_wage
         total_vacation_cost += vacation_cost
         total_vacation_hours += vacation.hours
-    
+
     # Calculate projections
     # Project daily cost based on current burn rate and hours remaining in workday
     # Assume 8-hour workday, adjust based on current time
-    hours_into_workday = (now.hour - 8) if now.hour >= 8 else 0  # Assume workday starts at 8 AM
+    hours_into_workday = (
+        (now.hour - 8) if now.hour >= 8 else 0
+    )  # Assume workday starts at 8 AM
     hours_remaining_in_workday = max(0, 8 - hours_into_workday)  # Assume 8-hour workday
     projected_additional_cost = current_burn_rate * hours_remaining_in_workday
     projected_daily_cost = total_work_cost + projected_additional_cost
-    
+
     # Calculate averages
     total_employees_today = len(employees_who_worked)
-    average_cost_per_employee = (total_work_cost + total_vacation_cost) / total_employees_today if total_employees_today > 0 else 0.0
-    
-    print(f"Preview calculated: ${total_work_cost + total_vacation_cost:.2f} total cost, {len(employees_currently_active)} currently active")
-    
+    average_cost_per_employee = (
+        (total_work_cost + total_vacation_cost) / total_employees_today
+        if total_employees_today > 0
+        else 0.0
+    )
+
+    print(
+        f"Preview calculated: ${total_work_cost + total_vacation_cost:.2f} total cost, {len(employees_currently_active)} currently active"
+    )
+
     return QuickLaborPreview(
         dealership_id=dealership_id,
         current_time=now,
@@ -2336,96 +2737,120 @@ async def get_labor_preview(
         employees_who_worked_today=len(employees_who_worked),
         current_hourly_burn_rate=current_burn_rate,
         average_cost_per_employee_today=average_cost_per_employee,
-        projected_daily_cost=projected_daily_cost
+        projected_daily_cost=projected_daily_cost,
     )
 
-@router.get("/all-dealerships/labor-costs-today", response_model=AllDealershipsLaborCostResponse)
+
+@router.get(
+    "/all-dealerships/labor-costs-today", response_model=AllDealershipsLaborCostResponse
+)
 async def get_all_dealerships_labor_costs_today(
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role)
+    admin_user: dict = Depends(require_admin_role),
 ):
     """
     Get today's total labor costs for ALL dealerships.
-    
+
     Super lightweight endpoint that returns just the money spent on labor today
     for each dealership. Perfect for company-wide dashboard overview.
-    
+
     Now uses the same robust calculation logic as comprehensive endpoint:
     - Proper weekly overtime calculation
     - Correct dealership assignment handling
     - Eastern timezone for business day boundaries
     - Cross-dealership hour attribution
-    
+
     Returns:
     - Each dealership's total labor cost today (work + vacation)
     - Company-wide total
     - Current timestamp
     """
     print(f"\n--- Getting labor costs for all dealerships ---")
-    
+
     # Use Eastern timezone for business day boundaries
     from zoneinfo import ZoneInfo
+
     analysis_tz = ZoneInfo("America/New_York")
     now = datetime.now(timezone.utc)
     today = now.astimezone(analysis_tz).date()
-    
-    start_of_today = datetime.combine(today, datetime.min.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    end_of_today = datetime.combine(today, datetime.max.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    
+
+    start_of_today = datetime.combine(
+        today, datetime.min.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+    end_of_today = datetime.combine(
+        today, datetime.max.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+
     # Current week boundaries for overtime calculation
     current_week_start = today - timedelta(days=today.weekday())
     current_week_end = current_week_start + timedelta(days=6)
-    start_of_week = datetime.combine(current_week_start, datetime.min.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    end_of_week = datetime.combine(current_week_end, datetime.max.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    
+    start_of_week = datetime.combine(
+        current_week_start, datetime.min.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+    end_of_week = datetime.combine(
+        current_week_end, datetime.max.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+
     print(f"Analysis period (UTC) - Day: {start_of_today} to {end_of_today}")
     print(f"Analysis period (UTC) - Week: {start_of_week} to {end_of_week}")
-    
+
     # Get all dealerships
     dealerships_ref = firestore_db.collection("dealerships").stream()
     dealership_ids = [doc.id for doc in dealerships_ref]
-    
+
     print(f"Found {len(dealership_ids)} dealerships to analyze")
-    
+
     # Get ALL employees from Firestore with proper dealership assignments
-    users_ref = firestore_db.collection("users").where("role", "in", ["employee", "clockOnlyEmployee"]).stream()
+    users_ref = (
+        firestore_db.collection("users")
+        .where("role", "in", ["employee", "clockOnlyEmployee"])
+        .stream()
+    )
     all_employees = {}
     for doc in users_ref:
         user_data = doc.to_dict()
         employee_id = doc.id
-        
+
         # Parse dealership assignments
         raw_dealerships = user_data.get("dealerships", "")
         if isinstance(raw_dealerships, list):
             employee_dealerships = [str(d).strip() for d in raw_dealerships]
         else:
-            employee_dealerships = [s.strip() for s in str(raw_dealerships).split(",") if s.strip()]
+            employee_dealerships = [
+                s.strip() for s in str(raw_dealerships).split(",") if s.strip()
+            ]
 
         raw_tc_dealers = user_data.get("timeClockDealerships", "")
         if isinstance(raw_tc_dealers, list):
             time_clock_dealerships = [str(d).strip() for d in raw_tc_dealers]
         else:
-            time_clock_dealerships = [s.strip() for s in str(raw_tc_dealers).split(",") if s.strip()]
+            time_clock_dealerships = [
+                s.strip() for s in str(raw_tc_dealers).split(",") if s.strip()
+            ]
 
         combined_dealerships = set(employee_dealerships) | set(time_clock_dealerships)
-        
+
         all_employees[employee_id] = {
-            "hourly_wage": float(user_data.get("hourlyWage", 0.0)) if user_data.get("hourlyWage") else 0.0,
-            "dealerships": combined_dealerships
+            "hourly_wage": (
+                float(user_data.get("hourlyWage", 0.0))
+                if user_data.get("hourlyWage")
+                else 0.0
+            ),
+            "dealerships": combined_dealerships,
         }
-    
+
     print(f"Found {len(all_employees)} total employees")
-    
+
     if not all_employees:
         return AllDealershipsLaborCostResponse(
             analysis_date=today.isoformat(),
             total_company_labor_cost=0.0,
             dealerships=[],
-            analysis_time=now
+            analysis_time=now,
         )
-    
+
     employee_ids = list(all_employees.keys())
-    
+
     # Get all time logs for today and this week
     today_logs = session.exec(
         select(TimeLog)
@@ -2434,7 +2859,7 @@ async def get_all_dealerships_labor_costs_today(
         .where(TimeLog.timestamp <= end_of_today)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     week_logs = session.exec(
         select(TimeLog)
         .where(TimeLog.employee_id.in_(employee_ids))
@@ -2442,48 +2867,55 @@ async def get_all_dealerships_labor_costs_today(
         .where(TimeLog.timestamp <= end_of_week)
         .order_by(TimeLog.timestamp.asc())
     ).all()
-    
+
     # Get all vacation for today
     all_vacation_today = session.exec(
-        select(VacationTime)
-        .where(VacationTime.date == today)
+        select(VacationTime).where(VacationTime.date == today)
     ).all()
-    
-    print(f"Found {len(today_logs)} today logs, {len(week_logs)} week logs, {len(all_vacation_today)} vacation entries")
-    
+
+    print(
+        f"Found {len(today_logs)} today logs, {len(week_logs)} week logs, {len(all_vacation_today)} vacation entries"
+    )
+
     # Calculate costs for each dealership
     dealership_costs = []
     total_company_cost = 0.0
-    
+
     for dealership_id in dealership_ids:
         dealership_total_cost = 0.0
-        
+
         # Get employees assigned to this dealership
         dealership_employees = [
-            emp_id for emp_id, emp_data in all_employees.items()
+            emp_id
+            for emp_id, emp_data in all_employees.items()
             if dealership_id in emp_data["dealerships"]
         ]
-        
+
         if not dealership_employees:
-            dealership_costs.append(DealershipLaborCost(
-                dealership_id=dealership_id,
-                total_labor_cost_today=0.0
-            ))
+            dealership_costs.append(
+                DealershipLaborCost(
+                    dealership_id=dealership_id, total_labor_cost_today=0.0
+                )
+            )
             continue
-        
+
         # Calculate work costs for employees assigned to this dealership
         for employee_id in dealership_employees:
             try:
                 employee_data = all_employees[employee_id]
                 hourly_wage = employee_data["hourly_wage"]
-                
+
                 # Get this employee's logs
-                employee_today_logs = [log for log in today_logs if log.employee_id == employee_id]
-                employee_week_logs = [log for log in week_logs if log.employee_id == employee_id]
-                
+                employee_today_logs = [
+                    log for log in today_logs if log.employee_id == employee_id
+                ]
+                employee_week_logs = [
+                    log for log in week_logs if log.employee_id == employee_id
+                ]
+
                 if not employee_today_logs:
                     continue
-                
+
                 # Calculate hours worked this week BEFORE today for overtime context
                 week_logs_before_today = []
                 for log in employee_week_logs:
@@ -2492,17 +2924,19 @@ async def get_all_dealerships_labor_costs_today(
                         log_ts = log_ts.replace(tzinfo=timezone.utc)
                     if log_ts < start_of_today:
                         week_logs_before_today.append(log)
-                
-                hours_worked_before_today = calculate_hours_from_logs(week_logs_before_today, start_of_today)
-                
+
+                hours_worked_before_today = calculate_hours_from_logs(
+                    week_logs_before_today, start_of_today
+                )
+
                 # Calculate today's hours for this dealership
                 todays_hours = calculate_hours_by_dealership_from_logs(
                     employee_today_logs, dealership_id, now
                 )
-                
+
                 if todays_hours <= 0:
                     continue
-                
+
                 # Calculate regular vs overtime hours based on weekly context
                 if hours_worked_before_today >= 40.0:
                     # All of today's hours are overtime
@@ -2513,43 +2947,52 @@ async def get_all_dealerships_labor_costs_today(
                     remaining_regular_hours = 40.0 - hours_worked_before_today
                     regular_hours = min(todays_hours, remaining_regular_hours)
                     overtime_hours = max(0.0, todays_hours - remaining_regular_hours)
-                
+
                 # Calculate cost with proper overtime pay
-                labor_cost = calculate_pay_with_overtime(regular_hours, overtime_hours, hourly_wage)
+                labor_cost = calculate_pay_with_overtime(
+                    regular_hours, overtime_hours, hourly_wage
+                )
                 dealership_total_cost += labor_cost
-                
+
             except Exception as e:
-                print(f"Error processing employee {employee_id} for dealership {dealership_id}: {e}")
+                print(
+                    f"Error processing employee {employee_id} for dealership {dealership_id}: {e}"
+                )
                 continue
-        
+
         # Calculate vacation costs for this dealership
-        dealership_vacations = [v for v in all_vacation_today if v.dealership_id == dealership_id]
+        dealership_vacations = [
+            v for v in all_vacation_today if v.dealership_id == dealership_id
+        ]
         for vacation in dealership_vacations:
             employee_data = all_employees.get(vacation.employee_id)
             if employee_data:
                 hourly_wage = employee_data["hourly_wage"]
                 vacation_cost = vacation.hours * hourly_wage
                 dealership_total_cost += vacation_cost
-        
-        dealership_costs.append(DealershipLaborCost(
-            dealership_id=dealership_id,
-            total_labor_cost_today=dealership_total_cost
-        ))
+
+        dealership_costs.append(
+            DealershipLaborCost(
+                dealership_id=dealership_id,
+                total_labor_cost_today=dealership_total_cost,
+            )
+        )
         total_company_cost += dealership_total_cost
-        
+
         print(f"Dealership {dealership_id}: ${dealership_total_cost:.2f}")
-    
+
     # Sort by cost (highest first)
     dealership_costs.sort(key=lambda x: x.total_labor_cost_today, reverse=True)
-    
+
     print(f"Total company labor cost today: ${total_company_cost:.2f}")
-    
+
     return AllDealershipsLaborCostResponse(
         analysis_date=today.isoformat(),
         total_company_labor_cost=total_company_cost,
         dealerships=dealership_costs,
-        analysis_time=now
+        analysis_time=now,
     )
+
 
 # --- New Basic Weekly Summary Models ---
 class BasicEmployeeWeeklySummary(BaseModel):
@@ -2561,11 +3004,14 @@ class BasicEmployeeWeeklySummary(BaseModel):
     weekly_overtime_hours: float = 0.0
     weekly_pay: float = 0.0
 
+
 # --- New Endpoint ---
-@router.get("/employees/basic-weekly-summary", response_model=List[BasicEmployeeWeeklySummary])
+@router.get(
+    "/employees/basic-weekly-summary", response_model=List[BasicEmployeeWeeklySummary]
+)
 async def get_basic_weekly_summary(
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role)
+    admin_user: dict = Depends(require_admin_role),
 ):
     """Return a fast, lightweight weekly summary for ALL employees."""
     now = datetime.now(timezone.utc)
@@ -2573,8 +3019,12 @@ async def get_basic_weekly_summary(
     week_start = today - timedelta(days=today.weekday())
     week_end = week_start + timedelta(days=6)
 
-    start_dt = datetime.combine(week_start, datetime.min.time()).replace(tzinfo=timezone.utc)
-    end_dt = datetime.combine(week_end, datetime.max.time()).replace(tzinfo=timezone.utc)
+    start_dt = datetime.combine(week_start, datetime.min.time()).replace(
+        tzinfo=timezone.utc
+    )
+    end_dt = datetime.combine(week_end, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
 
     # Fetch all time logs for the current week once
     week_logs = session.exec(
@@ -2595,13 +3045,19 @@ async def get_basic_weekly_summary(
         employee_logs.setdefault(log.employee_id, []).append(log)
 
     # Get employee wage and name info from Firestore in one pass
-    users_ref = firestore_db.collection("users").where("role", "in", ["employee", "clockOnlyEmployee"]).stream()
+    users_ref = (
+        firestore_db.collection("users")
+        .where("role", "in", ["employee", "clockOnlyEmployee"])
+        .stream()
+    )
     employee_wages: Dict[str, Dict[str, Any]] = {}
     for doc in users_ref:
         data = doc.to_dict()
         employee_wages[doc.id] = {
             "name": data.get("displayName", "Unknown"),
-            "hourly_wage": float(data.get("hourlyWage", 0.0)) if data.get("hourlyWage") else 0.0,
+            "hourly_wage": (
+                float(data.get("hourlyWage", 0.0)) if data.get("hourlyWage") else 0.0
+            ),
         }
 
     summaries: List[BasicEmployeeWeeklySummary] = []
@@ -2609,8 +3065,12 @@ async def get_basic_weekly_summary(
     for employee_id, info in employee_wages.items():
         logs = employee_logs.get(employee_id, [])
         total_hours = calculate_hours_from_logs(logs, now)
-        regular_hours, overtime_hours = calculate_regular_and_overtime_hours(total_hours)
-        weekly_pay = calculate_pay_with_overtime(regular_hours, overtime_hours, info["hourly_wage"])
+        regular_hours, overtime_hours = calculate_regular_and_overtime_hours(
+            total_hours
+        )
+        weekly_pay = calculate_pay_with_overtime(
+            regular_hours, overtime_hours, info["hourly_wage"]
+        )
 
         summaries.append(
             BasicEmployeeWeeklySummary(
@@ -2628,20 +3088,24 @@ async def get_basic_weekly_summary(
     summaries.sort(key=lambda x: x.employee_name or "")
     return summaries
 
-@router.get("/all-dealerships/comprehensive-labor-spend", response_model=AllDealershipsComprehensiveLaborSpendResponse)
+
+@router.get(
+    "/all-dealerships/comprehensive-labor-spend",
+    response_model=AllDealershipsComprehensiveLaborSpendResponse,
+)
 async def get_all_dealerships_comprehensive_labor_spend(
     target_date: Optional[date] = None,
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role)
+    admin_user: dict = Depends(require_admin_role),
 ):
     """
     Get comprehensive labor spend information for ALL dealerships in a single call.
-    
-    This endpoint returns the EXACT same data as calling the individual comprehensive 
+
+    This endpoint returns the EXACT same data as calling the individual comprehensive
     endpoint for each dealership, but in a single efficient operation.
-    
+
     Perfect for replacing multiple parallel API calls with one optimized request.
-    
+
     Returns:
     - Comprehensive labor data for each dealership
     - Company-wide totals
@@ -2649,72 +3113,96 @@ async def get_all_dealerships_comprehensive_labor_spend(
     - Exact same calculations as individual endpoints
     """
     print(f"\n=== Starting comprehensive labor spend analysis for ALL dealerships ===")
-    
+
     # Current time and date setup
     now = datetime.now(timezone.utc)
-    
+
     # If a target date is not provided, default to the current date in US/Eastern timezone
     if target_date:
         analysis_date = target_date
     else:
         analysis_date = datetime.now(ZoneInfo("America/New_York")).date()
-    
+
     # Define the boundaries for the analysis date
     analysis_tz = ZoneInfo("America/New_York")
-    start_of_analysis_day = datetime.combine(analysis_date, datetime.min.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    end_of_analysis_day = datetime.combine(analysis_date, datetime.max.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    
+    start_of_analysis_day = datetime.combine(
+        analysis_date, datetime.min.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+    end_of_analysis_day = datetime.combine(
+        analysis_date, datetime.max.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+
     # Current week boundaries (Monday to Sunday) based on the analysis date
     current_week_start = analysis_date - timedelta(days=analysis_date.weekday())
     current_week_end = current_week_start + timedelta(days=6)
-    start_of_week = datetime.combine(current_week_start, datetime.min.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    end_of_week = datetime.combine(current_week_end, datetime.max.time(), tzinfo=analysis_tz).astimezone(timezone.utc)
-    
-    print(f"Analysis period (UTC) - Day: {start_of_analysis_day} to {end_of_analysis_day}")
+    start_of_week = datetime.combine(
+        current_week_start, datetime.min.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+    end_of_week = datetime.combine(
+        current_week_end, datetime.max.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+
+    print(
+        f"Analysis period (UTC) - Day: {start_of_analysis_day} to {end_of_analysis_day}"
+    )
     print(f"Analysis period (UTC) - Week: {start_of_week} to {end_of_week}")
-    
+
     # Get all dealerships
     dealerships_ref = firestore_db.collection("dealerships").stream()
     dealership_ids = [doc.id for doc in dealerships_ref]
     print(f"Found {len(dealership_ids)} dealerships to analyze")
-    
+
     # Get ALL employees from Firestore with their dealership assignments
-    users_ref = firestore_db.collection("users").where("role", "in", ["employee", "clockOnlyEmployee"]).stream()
+    users_ref = (
+        firestore_db.collection("users")
+        .where("role", "in", ["employee", "clockOnlyEmployee"])
+        .stream()
+    )
     all_employees_by_dealership = {}  # dealership_id -> {employee_id -> employee_data}
     all_employee_ids = set()
-    
+
     for doc in users_ref:
         user_data = doc.to_dict()
         employee_id = doc.id
-        
+
         # Parse dealership assignments
         raw_dealerships = user_data.get("dealerships", "")
         if isinstance(raw_dealerships, list):
             employee_dealerships = [str(d).strip() for d in raw_dealerships]
         else:
-            employee_dealerships = [s.strip() for s in str(raw_dealerships).split(",") if s.strip()]
-        
+            employee_dealerships = [
+                s.strip() for s in str(raw_dealerships).split(",") if s.strip()
+            ]
+
         raw_tc_dealers = user_data.get("timeClockDealerships", "")
         if isinstance(raw_tc_dealers, list):
             time_clock_dealerships = [str(d).strip() for d in raw_tc_dealers]
         else:
-            time_clock_dealerships = [s.strip() for s in str(raw_tc_dealers).split(",") if s.strip()]
-        
+            time_clock_dealerships = [
+                s.strip() for s in str(raw_tc_dealers).split(",") if s.strip()
+            ]
+
         combined_dealerships = set(employee_dealerships) | set(time_clock_dealerships)
-        
+
         # Add employee to each dealership they're assigned to
         for dealership_id in combined_dealerships:
             if dealership_id not in all_employees_by_dealership:
                 all_employees_by_dealership[dealership_id] = {}
-            
+
             all_employees_by_dealership[dealership_id][employee_id] = {
                 "name": user_data.get("displayName", "Unknown"),
-                "hourly_wage": float(user_data.get("hourlyWage", 0.0)) if user_data.get("hourlyWage") else 0.0
+                "hourly_wage": (
+                    float(user_data.get("hourlyWage", 0.0))
+                    if user_data.get("hourlyWage")
+                    else 0.0
+                ),
             }
             all_employee_ids.add(employee_id)
-    
-    print(f"Found {len(all_employee_ids)} total unique employees across all dealerships")
-    
+
+    print(
+        f"Found {len(all_employee_ids)} total unique employees across all dealerships"
+    )
+
     # Get ALL time logs for this week for ALL employees (single query)
     if all_employee_ids:
         all_today_logs = session.exec(
@@ -2724,7 +3212,7 @@ async def get_all_dealerships_comprehensive_labor_spend(
             .where(TimeLog.timestamp <= end_of_analysis_day)
             .order_by(TimeLog.timestamp.asc())
         ).all()
-        
+
         all_week_logs = session.exec(
             select(TimeLog)
             .where(TimeLog.employee_id.in_(list(all_employee_ids)))
@@ -2732,89 +3220,106 @@ async def get_all_dealerships_comprehensive_labor_spend(
             .where(TimeLog.timestamp <= end_of_week)
             .order_by(TimeLog.timestamp.asc())
         ).all()
-        
-        print(f"Found {len(all_today_logs)} today logs and {len(all_week_logs)} week logs across all employees")
+
+        print(
+            f"Found {len(all_today_logs)} today logs and {len(all_week_logs)} week logs across all employees"
+        )
     else:
         all_today_logs = []
         all_week_logs = []
-    
+
     # Get ALL vacation time for today and this week (single query)
     all_vacation_today = session.exec(
-        select(VacationTime)
-        .where(VacationTime.date == analysis_date)
+        select(VacationTime).where(VacationTime.date == analysis_date)
     ).all()
-    
+
     all_vacation_week = session.exec(
         select(VacationTime)
         .where(VacationTime.date >= current_week_start)
         .where(VacationTime.date <= current_week_end)
     ).all()
-    
-    print(f"Found {len(all_vacation_today)} vacation entries for today, {len(all_vacation_week)} for this week")
-    
+
+    print(
+        f"Found {len(all_vacation_today)} vacation entries for today, {len(all_vacation_week)} for this week"
+    )
+
     # Process each dealership
     dealership_results = []
     total_company_cost = 0.0
     total_company_employees = 0
-    
+
     for dealership_id in sorted(dealership_ids):
         try:
             print(f"\n--- Processing dealership: {dealership_id} ---")
-            
+
             # Get employees for this dealership
             dealership_employees = all_employees_by_dealership.get(dealership_id, {})
-            
+
             if not dealership_employees:
                 print(f"No employees assigned to {dealership_id}, skipping")
                 continue
-            
+
             employee_ids = list(dealership_employees.keys())
             print(f"Found {len(employee_ids)} employees assigned to {dealership_id}")
-            
+
             # Filter logs for this dealership's employees
-            today_logs = [log for log in all_today_logs if log.employee_id in employee_ids]
-            week_logs = [log for log in all_week_logs if log.employee_id in employee_ids]
-            
+            today_logs = [
+                log for log in all_today_logs if log.employee_id in employee_ids
+            ]
+            week_logs = [
+                log for log in all_week_logs if log.employee_id in employee_ids
+            ]
+
             # Filter vacation for this dealership
-            vacation_today = [v for v in all_vacation_today if v.dealership_id == dealership_id]
-            vacation_this_week = [v for v in all_vacation_week if v.dealership_id == dealership_id]
-            
+            vacation_today = [
+                v for v in all_vacation_today if v.dealership_id == dealership_id
+            ]
+            vacation_this_week = [
+                v for v in all_vacation_week if v.dealership_id == dealership_id
+            ]
+
             # Initialize summary for this dealership
             summary = DealershipLaborSpendSummary(
                 dealership_id=dealership_id,
                 analysis_date=analysis_date.isoformat(),
-                analysis_timestamp=now
+                analysis_timestamp=now,
             )
-            
+
             employee_details = []
             employees_who_worked_today = set()
             employees_currently_active = set()
-            
+
             # Process each employee for this dealership (same logic as individual endpoint)
             for employee_id, employee_data in dealership_employees.items():
                 try:
                     employee_name = employee_data["name"]
                     hourly_wage = employee_data["hourly_wage"]
-                    
+
                     # Initialize employee detail
                     detail = EmployeeLaborDetail(
                         employee_id=employee_id,
                         employee_name=employee_name,
-                        hourly_wage=hourly_wage
+                        hourly_wage=hourly_wage,
                     )
-                    
+
                     # Check if currently active
-                    is_active, most_recent_clock_in_ts = await is_employee_currently_active(
-                        session, employee_id, dealership_id
+                    is_active, most_recent_clock_in_ts = (
+                        await is_employee_currently_active(
+                            session, employee_id, dealership_id
+                        )
                     )
                     detail.is_currently_active = is_active
                     if is_active and most_recent_clock_in_ts:
                         detail.current_shift_start_time = most_recent_clock_in_ts
-                        detail.current_shift_duration_hours = (now - most_recent_clock_in_ts).total_seconds() / 3600
+                        detail.current_shift_duration_hours = (
+                            now - most_recent_clock_in_ts
+                        ).total_seconds() / 3600
                         employees_currently_active.add(employee_id)
-                    
+
                     # Calculate hours worked this week BEFORE today
-                    employee_week_logs = [log for log in week_logs if log.employee_id == employee_id]
+                    employee_week_logs = [
+                        log for log in week_logs if log.employee_id == employee_id
+                    ]
                     week_logs_before_today = []
                     for log in employee_week_logs:
                         log_ts = log.timestamp
@@ -2825,58 +3330,110 @@ async def get_all_dealerships_comprehensive_labor_spend(
                     hours_worked_before_today = calculate_hours_by_dealership_from_logs(
                         week_logs_before_today, dealership_id, start_of_analysis_day
                     )
-                    
+
                     # Process today's time logs
-                    employee_today_logs = [log for log in today_logs if log.employee_id == employee_id]
-                    
+                    employee_today_logs = [
+                        log for log in today_logs if log.employee_id == employee_id
+                    ]
+
                     if employee_today_logs:
                         employees_who_worked_today.add(employee_id)
-                        
+
                         # Count clock-ins and find first/last
-                        clock_ins = [log for log in employee_today_logs if log.punch_type == PunchType.CLOCK_IN]
-                        clock_outs = [log for log in employee_today_logs if log.punch_type == PunchType.CLOCK_OUT]
-                        
+                        clock_ins = [
+                            log
+                            for log in employee_today_logs
+                            if log.punch_type == PunchType.CLOCK_IN
+                        ]
+                        clock_outs = [
+                            log
+                            for log in employee_today_logs
+                            if log.punch_type == PunchType.CLOCK_OUT
+                        ]
+
                         detail.todays_clock_in_count = len(clock_ins)
                         if clock_ins:
-                            detail.todays_first_clock_in = min(clock_ins, key=lambda x: x.timestamp).timestamp
+                            detail.todays_first_clock_in = min(
+                                clock_ins, key=lambda x: x.timestamp
+                            ).timestamp
                         if clock_outs:
-                            detail.todays_last_clock_out = max(clock_outs, key=lambda x: x.timestamp).timestamp
-                        
+                            detail.todays_last_clock_out = max(
+                                clock_outs, key=lambda x: x.timestamp
+                            ).timestamp
+
                         # Calculate today's total hours
-                        if detail.is_currently_active and detail.current_shift_start_time and detail.current_shift_start_time < start_of_analysis_day:
-                            hours_since_start_of_today = (now - start_of_analysis_day).total_seconds() / 3600
+                        if (
+                            detail.is_currently_active
+                            and detail.current_shift_start_time
+                            and detail.current_shift_start_time < start_of_analysis_day
+                        ):
+                            hours_since_start_of_today = (
+                                now - start_of_analysis_day
+                            ).total_seconds() / 3600
                             detail.todays_total_hours = hours_since_start_of_today
                         else:
-                            detail.todays_total_hours = calculate_hours_by_dealership_from_logs(employee_today_logs, dealership_id, now)
-                        
+                            detail.todays_total_hours = (
+                                calculate_hours_by_dealership_from_logs(
+                                    employee_today_logs, dealership_id, now
+                                )
+                            )
+
                         # Allocate today's hours into regular and overtime
                         if hours_worked_before_today >= 40.0:
                             detail.todays_regular_hours = 0.0
                             detail.todays_overtime_hours = detail.todays_total_hours
                         else:
                             remaining_regular_hours = 40.0 - hours_worked_before_today
-                            detail.todays_regular_hours = min(detail.todays_total_hours, remaining_regular_hours)
-                            detail.todays_overtime_hours = max(0.0, detail.todays_total_hours - remaining_regular_hours)
-                        
-                        detail.todays_labor_cost = calculate_pay_with_overtime(detail.todays_regular_hours, detail.todays_overtime_hours, hourly_wage)
-                    
+                            detail.todays_regular_hours = min(
+                                detail.todays_total_hours, remaining_regular_hours
+                            )
+                            detail.todays_overtime_hours = max(
+                                0.0, detail.todays_total_hours - remaining_regular_hours
+                            )
+
+                        detail.todays_labor_cost = calculate_pay_with_overtime(
+                            detail.todays_regular_hours,
+                            detail.todays_overtime_hours,
+                            hourly_wage,
+                        )
+
                     # Process this week's time logs
                     if employee_week_logs:
-                        detail.weekly_total_hours = calculate_hours_by_dealership_from_logs(employee_week_logs, dealership_id, now)
-                        detail.weekly_regular_hours, detail.weekly_overtime_hours = calculate_regular_and_overtime_hours(detail.weekly_total_hours)
-                        detail.weekly_labor_cost = calculate_pay_with_overtime(detail.weekly_regular_hours, detail.weekly_overtime_hours, hourly_wage)
-                    
+                        detail.weekly_total_hours = (
+                            calculate_hours_by_dealership_from_logs(
+                                employee_week_logs, dealership_id, now
+                            )
+                        )
+                        detail.weekly_regular_hours, detail.weekly_overtime_hours = (
+                            calculate_regular_and_overtime_hours(
+                                detail.weekly_total_hours
+                            )
+                        )
+                        detail.weekly_labor_cost = calculate_pay_with_overtime(
+                            detail.weekly_regular_hours,
+                            detail.weekly_overtime_hours,
+                            hourly_wage,
+                        )
+
                     # Process vacation for today
-                    employee_vacation_today = [v for v in vacation_today if v.employee_id == employee_id]
+                    employee_vacation_today = [
+                        v for v in vacation_today if v.employee_id == employee_id
+                    ]
                     if employee_vacation_today:
-                        detail.todays_vacation_hours = sum(v.hours for v in employee_vacation_today)
-                        detail.todays_vacation_cost = detail.todays_vacation_hours * hourly_wage
-                    
+                        detail.todays_vacation_hours = sum(
+                            v.hours for v in employee_vacation_today
+                        )
+                        detail.todays_vacation_cost = (
+                            detail.todays_vacation_hours * hourly_wage
+                        )
+
                     # Calculate total cost for today
-                    detail.todays_total_cost = detail.todays_labor_cost + detail.todays_vacation_cost
-                    
+                    detail.todays_total_cost = (
+                        detail.todays_labor_cost + detail.todays_vacation_cost
+                    )
+
                     employee_details.append(detail)
-                    
+
                     # Add to summary totals
                     summary.todays_total_work_hours += detail.todays_total_hours
                     summary.todays_total_vacation_hours += detail.todays_vacation_hours
@@ -2884,103 +3441,146 @@ async def get_all_dealerships_comprehensive_labor_spend(
                     summary.todays_total_vacation_cost += detail.todays_vacation_cost
                     summary.todays_regular_hours += detail.todays_regular_hours
                     summary.todays_overtime_hours += detail.todays_overtime_hours
-                    
+
                     # Weekly calculations
                     dealership_weekly_breakdown = calculate_dealership_weekly_breakdown(
                         employee_week_logs, dealership_id, hourly_wage, now
                     )
-                    
-                    employee_week_vacation = [v for v in vacation_this_week if v.employee_id == employee_id]
+
+                    employee_week_vacation = [
+                        v for v in vacation_this_week if v.employee_id == employee_id
+                    ]
                     weekly_vacation_hours = sum(v.hours for v in employee_week_vacation)
                     weekly_vacation_cost = weekly_vacation_hours * hourly_wage
-                    
-                    summary.weekly_total_hours += dealership_weekly_breakdown["total"] + weekly_vacation_hours
-                    summary.weekly_regular_hours += dealership_weekly_breakdown["regular"]
-                    summary.weekly_overtime_hours += dealership_weekly_breakdown["overtime"]
-                    summary.weekly_total_cost += dealership_weekly_breakdown["cost"] + weekly_vacation_cost
-                    
+
+                    summary.weekly_total_hours += (
+                        dealership_weekly_breakdown["total"] + weekly_vacation_hours
+                    )
+                    summary.weekly_regular_hours += dealership_weekly_breakdown[
+                        "regular"
+                    ]
+                    summary.weekly_overtime_hours += dealership_weekly_breakdown[
+                        "overtime"
+                    ]
+                    summary.weekly_total_cost += (
+                        dealership_weekly_breakdown["cost"] + weekly_vacation_cost
+                    )
+
                     if is_active:
                         summary.current_hourly_labor_rate += hourly_wage
-                        
+
                 except Exception as e:
                     print(f"Error processing employee {employee_id}: {e}")
                     continue
-            
+
             # Calculate summary metrics
             summary.total_employees = len(dealership_employees)
-            summary.active_employees_today = len(employees_who_worked_today | employees_currently_active)
+            summary.active_employees_today = len(
+                employees_who_worked_today | employees_currently_active
+            )
             summary.employees_who_clocked_in_today = len(employees_who_worked_today)
             summary.employees_currently_clocked_in = len(employees_currently_active)
-            
-            summary.todays_total_combined_hours = summary.todays_total_work_hours + summary.todays_total_vacation_hours
-            summary.todays_total_labor_cost = summary.todays_total_work_cost + summary.todays_total_vacation_cost
-            
+
+            summary.todays_total_combined_hours = (
+                summary.todays_total_work_hours + summary.todays_total_vacation_hours
+            )
+            summary.todays_total_labor_cost = (
+                summary.todays_total_work_cost + summary.todays_total_vacation_cost
+            )
+
             # Calculate costs and averages
             total_regular_cost = 0.0
             total_overtime_cost = 0.0
             total_wages = 0.0
             total_weighted_hours = 0.0
-            
+
             for detail in employee_details:
                 if detail.hourly_wage and detail.hourly_wage > 0:
                     total_wages += detail.hourly_wage
                     if detail.todays_total_hours > 0:
-                        total_weighted_hours += detail.todays_total_hours * detail.hourly_wage
-                    
-                    total_regular_cost += detail.todays_regular_hours * detail.hourly_wage
-                    total_overtime_cost += detail.todays_overtime_hours * detail.hourly_wage * 1.5
-            
+                        total_weighted_hours += (
+                            detail.todays_total_hours * detail.hourly_wage
+                        )
+
+                    total_regular_cost += (
+                        detail.todays_regular_hours * detail.hourly_wage
+                    )
+                    total_overtime_cost += (
+                        detail.todays_overtime_hours * detail.hourly_wage * 1.5
+                    )
+
             summary.todays_regular_cost = total_regular_cost
             summary.todays_overtime_cost = total_overtime_cost
-            
+
             # Calculate averages
             if summary.total_employees > 0:
                 summary.average_hourly_wage = total_wages / summary.total_employees
-                summary.cost_per_employee_today = summary.todays_total_labor_cost / summary.total_employees
-                summary.hours_per_employee_today = summary.todays_total_combined_hours / summary.total_employees
-            
+                summary.cost_per_employee_today = (
+                    summary.todays_total_labor_cost / summary.total_employees
+                )
+                summary.hours_per_employee_today = (
+                    summary.todays_total_combined_hours / summary.total_employees
+                )
+
             if summary.todays_total_combined_hours > 0:
-                summary.weighted_average_hourly_rate = total_weighted_hours / summary.todays_total_combined_hours
-            
+                summary.weighted_average_hourly_rate = (
+                    total_weighted_hours / summary.todays_total_combined_hours
+                )
+
             # Count clock activities
-            summary.total_clock_ins_today = len([log for log in today_logs if log.punch_type == PunchType.CLOCK_IN])
-            summary.total_clock_outs_today = len([log for log in today_logs if log.punch_type == PunchType.CLOCK_OUT])
-            
+            summary.total_clock_ins_today = len(
+                [log for log in today_logs if log.punch_type == PunchType.CLOCK_IN]
+            )
+            summary.total_clock_outs_today = len(
+                [log for log in today_logs if log.punch_type == PunchType.CLOCK_OUT]
+            )
+
             # Sort employees and get insights
             employee_details.sort(key=lambda x: x.employee_name or "")
-            top_earners = sorted(employee_details, key=lambda x: x.todays_total_cost, reverse=True)[:5]
-            most_hours = sorted(employee_details, key=lambda x: x.todays_total_hours, reverse=True)[:5]
-            
+            top_earners = sorted(
+                employee_details, key=lambda x: x.todays_total_cost, reverse=True
+            )[:5]
+            most_hours = sorted(
+                employee_details, key=lambda x: x.todays_total_hours, reverse=True
+            )[:5]
+
             # Create comprehensive response for this dealership
             dealership_result = ComprehensiveLaborSpendResponse(
                 summary=summary,
                 employees=employee_details,
                 top_earners_today=top_earners,
                 most_hours_today=most_hours,
-                data_generated_at=now
+                data_generated_at=now,
             )
-            
+
             dealership_results.append(dealership_result)
             total_company_cost += summary.todays_total_labor_cost
             total_company_employees += summary.total_employees
-            
-            print(f"Completed {dealership_id}: {summary.total_employees} employees, ${summary.todays_total_labor_cost:.2f} total cost")
-            
+
+            print(
+                f"Completed {dealership_id}: {summary.total_employees} employees, ${summary.todays_total_labor_cost:.2f} total cost"
+            )
+
         except Exception as e:
             print(f"ERROR processing dealership {dealership_id}: {e}")
             import traceback
+
             traceback.print_exc()
             continue
-    
+
     # Sort dealerships by total cost (highest first)
-    dealership_results.sort(key=lambda x: x.summary.todays_total_labor_cost, reverse=True)
-    
-    print(f"\n=== Analysis complete: {len(dealership_results)} dealerships, ${total_company_cost:.2f} total cost ===")
-    
+    dealership_results.sort(
+        key=lambda x: x.summary.todays_total_labor_cost, reverse=True
+    )
+
+    print(
+        f"\n=== Analysis complete: {len(dealership_results)} dealerships, ${total_company_cost:.2f} total cost ==="
+    )
+
     return AllDealershipsComprehensiveLaborSpendResponse(
         analysis_date=analysis_date.isoformat(),
         analysis_timestamp=now,
         total_company_labor_cost=total_company_cost,
         total_company_employees=total_company_employees,
-        dealerships=dealership_results
+        dealerships=dealership_results,
     )
