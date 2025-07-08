@@ -69,7 +69,7 @@ class PunchLogResponse(BaseModel):
     longitude: Optional[float] = None
     # New injury reporting fields (only present on clockout entries)
     injured_at_work: Optional[bool] = None
-    safety_signature: Optional[str] = None
+    safety_signature_photo_id: Optional[int] = None
 
     @field_serializer("timestamp")
     def serialize_timestamp(self, dt: datetime) -> str:

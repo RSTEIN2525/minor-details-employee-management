@@ -1,11 +1,13 @@
-from sqlmodel import Session, select
-from datetime import datetime, timezone, timedelta
-from models.time_log import TimeLog, PunchType
-from utils.geofence import is_within_radius
-from models.shop import Shop
-from pydantic import TypeAdapter
-from fastapi import HTTPException, status
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+
+from fastapi import HTTPException, status
+from pydantic import TypeAdapter
+from sqlmodel import Session, select
+
+from models.shop import Shop
+from models.time_log import PunchType, TimeLog
+from utils.geofence import is_within_radius
 
 
 class PunchService:
@@ -19,7 +21,7 @@ class PunchService:
         longitude: float,
         session: Session,
         injured_at_work: Optional[bool] = None,
-        safety_signature: Optional[str] = None,
+        safety_signature_photo_id: Optional[int] = None,
     ):
 
         # Capture the time of the request for consistency
@@ -44,15 +46,10 @@ class PunchService:
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Injury status is required for clock out.",
                 )
-            if safety_signature is None or safety_signature.strip() == "":
+            if safety_signature_photo_id is None:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Safety signature (initials) is required for clock out.",
-                )
-            if len(safety_signature.strip()) > 10:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Safety signature must be 10 characters or less.",
+                    detail="Safety signature photo is required for clock out.",
                 )
 
         # 1) Check each shop the user belongs to
@@ -124,8 +121,12 @@ class PunchService:
             latitude=latitude,
             longitude=longitude,
             timestamp=new_punch_time,
-            injured_at_work=injured_at_work if punch_type == PunchType.CLOCK_OUT else None,
-            safety_signature=safety_signature.strip() if punch_type == PunchType.CLOCK_OUT and safety_signature else None,
+            injured_at_work=(
+                injured_at_work if punch_type == PunchType.CLOCK_OUT else None
+            ),
+            safety_signature_photo_id=(
+                safety_signature_photo_id if punch_type == PunchType.CLOCK_OUT else None
+            ),
         )
 
         # Append New Punch to List of Changes
@@ -141,5 +142,5 @@ class PunchService:
         response = {"status": "success", "data": punch}
         if response_message:
             response["message"] = response_message
-            
+
         return response
