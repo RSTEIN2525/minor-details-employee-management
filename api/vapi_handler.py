@@ -663,7 +663,7 @@ async def call_external_profit_loss_report(start_date: str, end_date: str, token
         )
     except httpx.TimeoutException:
         logger.error(f"[VAPI] ❌ EXTERNAL_API: Timeout calling P&L report API")
-        raise HTTPException(status_code=500, detail="P&L API request timed out")
+        raise HTTPException(status_code=500, detail="P&L API request timed out.") 
     except Exception as e:
         logger.error(f"[VAPI] ❌ EXTERNAL_API: Error calling P&L report API: {str(e)}")
         logger.error(f"[VAPI] ❌ EXTERNAL_API: Error type: {type(e)}")
