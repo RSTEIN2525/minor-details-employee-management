@@ -1,0 +1,83 @@
+# Development Dockerfile for devcontainer
+FROM python:3.11
+
+# Install system dependencies and development tools
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    wget \
+    unzip \
+    vim \
+    nano \
+    htop \
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user for development
+ARG USERNAME=vscode
+ARG USER_UID=1000
+ARG USER_GID=$USER_UID
+
+# Create the user
+RUN groupadd --gid $USER_GID $USERNAME \
+    && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
+    && apt-get update \
+    && apt-get install -y sudo \
+    && echo $USERNAME ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/$USERNAME \
+    && chmod 0440 /etc/sudoers.d/$USERNAME
+
+# Set the working directory
+WORKDIR /app
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install additional development dependencies
+RUN pip install --no-cache-dir \
+    pytest \
+    pytest-asyncio \
+    black \
+    mypy \
+    isort \
+    httpx \
+    ipython \
+    ipdb
+
+# Set environment variables for development
+ENV PYTHONPATH=/app
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV DEVELOPMENT=true
+
+# Application configuration
+ENV DEV_DOMAIN=http://localhost:5173
+ENV PRODUCTION_DOMAIN=https://minorautodetails.app
+ENV APP_HOST=0.0.0.0
+ENV APP_PORT=8000
+ENV APP_RELOAD=true
+ENV APP_LOG_LEVEL=info
+
+# Database configuration (development defaults - you can override these)
+ENV DB_HOST=localhost
+ENV DB_PORT=5432
+ENV DB_NAME=employee_management_dev
+ENV DB_USER=dev_user
+ENV DB_PASSWORD=dev_password
+
+# Firebase configuration (you'll need to set these with your actual values)
+ENV FIREBASE_STORAGE_BUCKET=minordetails-1aff3.appspot.com
+
+# API Keys (you'll need to set these with your actual values)
+# ENV FIREBASE_SERVICE_ACCOUNT_KEY=your_service_account_key_json
+# ENV VAPI_SECRET_TOKEN=your_vapi_token
+# ENV OPENAI_API_KEY=your_openai_key
+
+# Switch to non-root user
+USER $USERNAME
+
+# Expose port for development server
+EXPOSE 8000
+
+# Default command for development (with auto-reload)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app"] 
