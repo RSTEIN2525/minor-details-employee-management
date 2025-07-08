@@ -29,6 +29,7 @@
     "DB_USER": "postgres",
     "DB_PASSWORD": ";(Ets?MBFK`^D`\\>",
     "FIREBASE_STORAGE_BUCKET": "minordetails-1aff3.appspot.com",
+    "FIREBASE_SERVICE_ACCOUNT_KEY_PATH": "/app/.devcontainer/serviceAccountKey.json",
     "PRODUCTION_DOMAIN": "https://minorautodetails.app",
     "DEV_DOMAIN": "http://localhost:5173",
     "INTERNAL_API_BASE_URL": "https://employee-management-backend-507748767742.us-central1.run.app/api",

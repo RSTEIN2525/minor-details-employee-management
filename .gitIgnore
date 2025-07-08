@@ -12,6 +12,7 @@ serviceAccountKey.json
 *.json
 !package.json
 !tsconfig.json
+!.devcontainer/devcontainer.json
 
 # Logs
 *.log
