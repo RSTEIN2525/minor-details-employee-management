@@ -13,7 +13,7 @@ from db.session import get_session
 from models.shop import Shop
 from models.time_log import PunchType, TimeLog
 from models.vacation_time import VacationTime
-from utils.breaks import apply_unpaid_break
+from utils.breaks import apply_unpaid_break, calculate_daily_hours_with_breaks
 from utils.datetime_helpers import format_utc_datetime
 
 router = APIRouter()
@@ -1458,7 +1458,9 @@ async def get_employee_details(
     ).all()
 
     # Calculate hours for current week using helper (handles implicit clock-outs)
-    current_week_hours = calculate_hours_from_logs(current_week_clocks, now)
+    current_week_hours = calculate_hours_from_logs_with_daily_breaks(
+        current_week_clocks, now
+    )
 
     current_week_pay = current_week_hours * hourly_wage
 
@@ -1484,7 +1486,9 @@ async def get_employee_details(
     ).all()
 
     # Calculate hours for previous week using helper (handles implicit clock-outs)
-    prev_week_hours = calculate_hours_from_logs(prev_week_clocks, prev_week_end_dt)
+    prev_week_hours = calculate_hours_from_logs_with_daily_breaks(
+        prev_week_clocks, prev_week_end_dt
+    )
 
     prev_week_pay = prev_week_hours * hourly_wage
 
@@ -1683,7 +1687,9 @@ async def get_employee_details_by_date_range(
     ).all()
 
     # Calculate hours for current week using helper (handles implicit clock-outs)
-    current_week_hours = calculate_hours_from_logs(current_week_clocks, now)
+    current_week_hours = calculate_hours_from_logs_with_daily_breaks(
+        current_week_clocks, now
+    )
 
     current_week_pay = current_week_hours * hourly_wage
 
@@ -1701,14 +1707,16 @@ async def get_employee_details_by_date_range(
         .where(TimeLog.employee_id == employee_id)
         .where(TimeLog.timestamp >= prev_week_start_dt)
         .where(TimeLog.timestamp <= prev_week_end_dt)
-        .order_by(TimeLog.timestamp.asc())
+        .order_by(TimeLog.timestamp.asc(), TimeLog.punch_type.desc())
     ).all()
 
     # Calculate hours for previous week using helper (handles implicit clock-outs)
     prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(
         tzinfo=timezone.utc
     )
-    prev_week_hours = calculate_hours_from_logs(prev_week_clocks, prev_week_end_dt)
+    prev_week_hours = calculate_hours_from_logs_with_daily_breaks(
+        prev_week_clocks, prev_week_end_dt
+    )
 
     prev_week_pay = prev_week_hours * hourly_wage
 
@@ -3005,6 +3013,83 @@ def calculate_hours_from_logs(logs: List[TimeLog], current_time: datetime) -> fl
         total_hours += paid_hours
 
     return total_hours
+
+
+def calculate_hours_from_logs_with_daily_breaks(
+    logs: List[TimeLog], current_time: datetime
+) -> float:
+    """Calculate total hours from a list of time logs with DAILY break deductions.
+
+    Business rule: One 30-minute lunch break per day if daily total >= 5 hours,
+    regardless of how many shifts or dealerships the employee worked.
+
+    Args:
+        logs: List of TimeLog entries for an employee
+        current_time: Current time for calculating open shifts
+
+    Returns:
+        float: Total paid hours with daily break deductions applied
+    """
+    if not logs:
+        return 0.0
+
+    # Sort logs by timestamp
+    sorted_logs = sorted(logs, key=lambda x: x.timestamp)
+
+    # Group shifts by day and calculate raw hours
+    shifts_by_day = {}  # date -> [(raw_hours, dealership_id), ...]
+    clock_in_time = None
+    clock_in_dealership = None
+
+    for log in sorted_logs:
+        log_ts = log.timestamp
+        if log_ts.tzinfo is None:
+            log_ts = log_ts.replace(tzinfo=timezone.utc)
+
+        if log.punch_type == PunchType.CLOCK_IN:
+            # If there's already an open shift, close it at the moment of this new CLOCK_IN
+            if clock_in_time is not None:
+                raw_hours = (log_ts - clock_in_time).total_seconds() / 3600
+
+                # Get the date for this shift (use clock_in date for consistency)
+                shift_date = clock_in_time.date()
+
+                if shift_date not in shifts_by_day:
+                    shifts_by_day[shift_date] = []
+                shifts_by_day[shift_date].append((raw_hours, clock_in_dealership))
+
+            # Start new shift window
+            clock_in_time = log_ts
+            clock_in_dealership = log.dealership_id
+
+        elif log.punch_type == PunchType.CLOCK_OUT and clock_in_time:
+            raw_hours = (log_ts - clock_in_time).total_seconds() / 3600
+
+            # Get the date for this shift (use clock_in date for consistency)
+            shift_date = clock_in_time.date()
+
+            if shift_date not in shifts_by_day:
+                shifts_by_day[shift_date] = []
+            shifts_by_day[shift_date].append((raw_hours, clock_in_dealership))
+
+            clock_in_time = None
+            clock_in_dealership = None
+
+    # If still clocked in, add time until current_time
+    if clock_in_time:
+        raw_hours = (current_time - clock_in_time).total_seconds() / 3600
+
+        # Get the date for this shift (use clock_in date for consistency)
+        shift_date = clock_in_time.date()
+
+        if shift_date not in shifts_by_day:
+            shifts_by_day[shift_date] = []
+        shifts_by_day[shift_date].append((raw_hours, clock_in_dealership))
+
+    # Apply daily break deductions
+    from utils.breaks import calculate_daily_hours_with_breaks
+
+    return calculate_daily_hours_with_breaks(shifts_by_day)
 
 
 def calculate_hours_by_dealership_from_logs(
