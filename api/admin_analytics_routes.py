@@ -1559,6 +1559,230 @@ async def get_employee_details(
     )
 
 
+@router.get(
+    "/employee/{employee_id}/details-by-date-range",
+    response_model=EmployeeDetailResponse,
+)
+async def get_employee_details_by_date_range(
+    employee_id: str,
+    start_date: date,
+    end_date: date,
+    session: Session = Depends(get_session),
+    admin_user: dict = Depends(require_admin_role),
+):
+    """
+    Get detailed information about a specific employee including:
+    - Recent clock entries (within specified date range)
+    - Hours worked per week
+    - Pay per week
+    - Hourly rate
+
+        This endpoint accepts a date range in EST for filtering clock entries.
+
+    Args:
+        employee_id: The ID of the employee
+        start_date: Start date for clock entries (YYYY-MM-DD format, EST)
+        end_date: End date for clock entries (YYYY-MM-DD format, EST)
+    """
+    # Get current date and calculate date ranges
+    now = datetime.now(timezone.utc)
+    today = now.date()
+
+    # Calculate start of current week (Monday)
+    current_week_start = today - timedelta(days=today.weekday())
+    current_week_end = current_week_start + timedelta(days=6)
+
+    # Calculate previous week
+    prev_week_start = current_week_start - timedelta(days=7)
+    prev_week_end = current_week_start - timedelta(days=1)
+
+    # Convert input dates to datetime objects with EST timezone for filtering
+    # The user passes dates in EST, so we need to convert them properly
+    from zoneinfo import ZoneInfo
+
+    est_timezone = ZoneInfo("America/New_York")
+
+    date_range_start = (
+        datetime.combine(start_date, datetime.min.time())
+        .replace(tzinfo=est_timezone)
+        .astimezone(timezone.utc)
+    )
+    date_range_end = (
+        datetime.combine(end_date, datetime.max.time())
+        .replace(tzinfo=est_timezone)
+        .astimezone(timezone.utc)
+    )
+    print(
+        f"DEBUG: Fetching clocks from {date_range_start} to {date_range_end} for employee {employee_id} (converted from EST)"
+    )
+
+    # Get employee details from Firestore
+    user_details = await get_user_details(employee_id)
+    employee_name = user_details.get("name", "Unknown")
+    hourly_wage = user_details.get("hourly_wage", 0.0)
+
+    # Get all clock entries within the specified date range
+    recent_clocks = session.exec(
+        select(TimeLog)
+        .where(TimeLog.employee_id == employee_id)
+        .where(TimeLog.timestamp >= date_range_start)
+        .where(TimeLog.timestamp <= date_range_end)
+        .order_by(TimeLog.timestamp.desc())
+    ).all()
+
+    print(f"DEBUG: Found {len(recent_clocks)} clock entries for employee {employee_id}")
+
+    # Print the first few clock entries for debugging
+    for i, clock in enumerate(recent_clocks[:5]):
+        print(f"DEBUG: Clock {i+1}: {clock.timestamp} - {clock.punch_type}")
+
+    # Format clock entries
+    clock_entries = []
+    for clock in recent_clocks:
+        # Ensure timestamp is timezone aware
+        ts = clock.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        clock_entries.append(
+            EmployeeClockEntry(
+                id=clock.id,
+                timestamp=ts,
+                punch_type=clock.punch_type,
+                dealership_id=clock.dealership_id,
+            )
+        )
+
+    print(f"DEBUG: Formatted {len(clock_entries)} clock entries for response")
+
+    # Calculate hours and pay for current week
+    current_week_hours = 0.0
+    current_week_start_dt = datetime.combine(
+        current_week_start, datetime.min.time()
+    ).replace(tzinfo=timezone.utc)
+    current_week_end_dt = datetime.combine(
+        current_week_end, datetime.max.time()
+    ).replace(tzinfo=timezone.utc)
+
+    current_week_clocks = session.exec(
+        select(TimeLog)
+        .where(TimeLog.employee_id == employee_id)
+        .where(TimeLog.timestamp >= current_week_start_dt)
+        .where(TimeLog.timestamp <= current_week_end_dt)
+        .order_by(TimeLog.timestamp.asc())
+    ).all()
+
+    # Calculate hours for current week using helper (handles implicit clock-outs)
+    current_week_hours = calculate_hours_from_logs(current_week_clocks, now)
+
+    current_week_pay = current_week_hours * hourly_wage
+
+    # Calculate hours and pay for previous week
+    prev_week_hours = 0.0
+    prev_week_start_dt = datetime.combine(prev_week_start, datetime.min.time()).replace(
+        tzinfo=timezone.utc
+    )
+    prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
+
+    prev_week_clocks = session.exec(
+        select(TimeLog)
+        .where(TimeLog.employee_id == employee_id)
+        .where(TimeLog.timestamp >= prev_week_start_dt)
+        .where(TimeLog.timestamp <= prev_week_end_dt)
+        .order_by(TimeLog.timestamp.asc())
+    ).all()
+
+    # Calculate hours for previous week using helper (handles implicit clock-outs)
+    prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
+    prev_week_hours = calculate_hours_from_logs(prev_week_clocks, prev_week_end_dt)
+
+    prev_week_pay = prev_week_hours * hourly_wage
+
+    # Calculate regular and overtime hours for each week
+    prev_week_regular, prev_week_overtime = calculate_regular_and_overtime_hours(
+        prev_week_hours
+    )
+    prev_week_pay = calculate_pay_with_overtime(
+        prev_week_regular, prev_week_overtime, hourly_wage
+    )
+
+    current_week_regular, current_week_overtime = calculate_regular_and_overtime_hours(
+        current_week_hours
+    )
+    current_week_pay = calculate_pay_with_overtime(
+        current_week_regular, current_week_overtime, hourly_wage
+    )
+
+    # Calculate today's hours and clock status
+    todays_hours, is_currently_clocked_in = await calculate_todays_hours_and_status(
+        session, employee_id
+    )
+    todays_regular, todays_overtime = calculate_regular_and_overtime_hours(todays_hours)
+    todays_pay = calculate_pay_with_overtime(
+        todays_regular, todays_overtime, hourly_wage
+    )
+
+    # Calculate vacation hours for each period
+    prev_week_vacation_hours = await calculate_vacation_hours(
+        session, employee_id, prev_week_start, prev_week_end
+    )
+    current_week_vacation_hours = await calculate_vacation_hours(
+        session, employee_id, current_week_start, current_week_end
+    )
+    todays_vacation_hours = await calculate_vacation_hours(
+        session, employee_id, today, today
+    )
+
+    # Create week summaries
+    week_summaries = [
+        WeekSummary(
+            week_start_date=prev_week_start.isoformat(),
+            week_end_date=prev_week_end.isoformat(),
+            total_hours=round(prev_week_hours, 2),
+            regular_hours=round(prev_week_regular, 2),
+            overtime_hours=round(prev_week_overtime, 2),
+            total_pay=round(prev_week_pay, 2),
+            vacation_hours=round(prev_week_vacation_hours, 2),
+            is_current_week=False,
+        ),
+        WeekSummary(
+            week_start_date=current_week_start.isoformat(),
+            week_end_date=current_week_end.isoformat(),
+            total_hours=round(current_week_hours, 2),
+            regular_hours=round(current_week_regular, 2),
+            overtime_hours=round(current_week_overtime, 2),
+            total_pay=round(current_week_pay, 2),
+            vacation_hours=round(current_week_vacation_hours, 2),
+            is_current_week=True,
+        ),
+    ]
+
+    # Calculate total pay for both weeks
+    two_week_total_pay = prev_week_pay + current_week_pay
+
+    return EmployeeDetailResponse(
+        employee_id=employee_id,
+        employee_name=employee_name,
+        hourly_wage=hourly_wage,
+        recent_clocks=clock_entries,
+        week_summaries=week_summaries,
+        todays_summary=TodaysSummary(
+            date=today.isoformat(),
+            total_hours=round(todays_hours, 2),
+            regular_hours=round(todays_regular, 2),
+            overtime_hours=round(todays_overtime, 2),
+            total_pay=round(todays_pay, 2),
+            vacation_hours=round(todays_vacation_hours, 2),
+            is_currently_clocked_in=is_currently_clocked_in,
+        ),
+        two_week_total_pay=round(two_week_total_pay, 2),
+    )
+
+
 @router.get("/employees/details", response_model=List[EmployeeDetailResponse])
 async def get_all_employees_details(
     session: Session = Depends(get_session),
@@ -1654,6 +1878,256 @@ async def get_all_employees_details(
     # Process each employee
     all_employee_details = []
     for employee_id in paginated_employee_ids:
+        employee_name = employees_data[employee_id]["name"]
+        hourly_wage = employees_data[employee_id]["hourly_wage"]
+
+        # Get this employee's clocks
+        employee_clock_list = employee_clocks.get(employee_id, [])
+
+        # Format clock entries (most recent first)
+        clock_entries = []
+        for clock in sorted(
+            employee_clock_list, key=lambda x: x.timestamp, reverse=True
+        ):
+            # Ensure timestamp is timezone aware
+            ts = clock.timestamp
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+
+            clock_entries.append(
+                EmployeeClockEntry(
+                    id=clock.id,
+                    timestamp=ts,
+                    punch_type=clock.punch_type,
+                    dealership_id=clock.dealership_id,
+                )
+            )
+
+        # Calculate hours and pay
+        current_week_hours = 0.0
+        prev_week_hours = 0.0
+
+        # Calculate hours using shared helper for consistency
+        current_week_clocks = [
+            c
+            for c in employee_clock_list
+            if current_week_start_dt <= c.timestamp <= current_week_end_dt
+        ]
+        prev_week_clocks = [
+            c
+            for c in employee_clock_list
+            if prev_week_start_dt <= c.timestamp <= prev_week_end_dt
+        ]
+
+        current_week_hours = calculate_hours_from_logs(current_week_clocks, now)
+        # Cap previous week's calculation at the end of that week
+        prev_week_hours = calculate_hours_from_logs(prev_week_clocks, prev_week_end_dt)
+
+        current_week_pay = current_week_hours * hourly_wage
+        prev_week_pay = prev_week_hours * hourly_wage
+
+        # Calculate regular and overtime hours for each week
+        prev_week_regular, prev_week_overtime = calculate_regular_and_overtime_hours(
+            prev_week_hours
+        )
+        prev_week_pay = calculate_pay_with_overtime(
+            prev_week_regular, prev_week_overtime, hourly_wage
+        )
+
+        current_week_regular, current_week_overtime = (
+            calculate_regular_and_overtime_hours(current_week_hours)
+        )
+        current_week_pay = calculate_pay_with_overtime(
+            current_week_regular, current_week_overtime, hourly_wage
+        )
+
+        # Calculate today's hours and clock status
+        todays_hours, is_currently_clocked_in = await calculate_todays_hours_and_status(
+            session, employee_id
+        )
+        todays_regular, todays_overtime = calculate_regular_and_overtime_hours(
+            todays_hours
+        )
+        todays_pay = calculate_pay_with_overtime(
+            todays_regular, todays_overtime, hourly_wage
+        )
+
+        # Calculate vacation hours for each period
+        prev_week_vacation_hours = await calculate_vacation_hours(
+            session, employee_id, prev_week_start, prev_week_end
+        )
+        current_week_vacation_hours = await calculate_vacation_hours(
+            session, employee_id, current_week_start, current_week_end
+        )
+        todays_vacation_hours = await calculate_vacation_hours(
+            session, employee_id, today, today
+        )
+
+        # Create week summaries
+        week_summaries = [
+            WeekSummary(
+                week_start_date=prev_week_start.isoformat(),
+                week_end_date=prev_week_end.isoformat(),
+                total_hours=round(prev_week_hours, 2),
+                regular_hours=round(prev_week_regular, 2),
+                overtime_hours=round(prev_week_overtime, 2),
+                total_pay=round(prev_week_pay, 2),
+                is_current_week=False,
+            ),
+            WeekSummary(
+                week_start_date=current_week_start.isoformat(),
+                week_end_date=current_week_end.isoformat(),
+                total_hours=round(current_week_hours, 2),
+                regular_hours=round(current_week_regular, 2),
+                overtime_hours=round(current_week_overtime, 2),
+                total_pay=round(current_week_pay, 2),
+                is_current_week=True,
+            ),
+        ]
+
+        # Calculate total pay for both weeks
+        two_week_total_pay = prev_week_pay + current_week_pay
+
+        all_employee_details.append(
+            EmployeeDetailResponse(
+                employee_id=employee_id,
+                employee_name=employee_name,
+                hourly_wage=hourly_wage,
+                recent_clocks=clock_entries,
+                week_summaries=week_summaries,
+                todays_summary=TodaysSummary(
+                    date=today.isoformat(),
+                    total_hours=round(todays_hours, 2),
+                    regular_hours=round(todays_regular, 2),
+                    overtime_hours=round(todays_overtime, 2),
+                    total_pay=round(todays_pay, 2),
+                    is_currently_clocked_in=is_currently_clocked_in,
+                ),
+                two_week_total_pay=round(two_week_total_pay, 2),
+            )
+        )
+
+    # Sort by name
+    all_employee_details.sort(key=lambda x: x.employee_name or "")
+
+    return all_employee_details
+
+
+@router.get(
+    "/employees/details-by-date-range", response_model=List[EmployeeDetailResponse]
+)
+async def get_all_employees_details_by_date_range(
+    start_date: date,
+    end_date: date,
+    session: Session = Depends(get_session),
+    admin_user: dict = Depends(require_admin_role),
+):
+    """
+    Get detailed information about all employees including:
+    - Recent clock entries (within specified date range)
+    - Hours worked per week
+    - Pay per week
+    - Hourly rate
+
+        This endpoint accepts a date range in EST for filtering clock entries.
+
+    Args:
+        start_date: Start date for clock entries (YYYY-MM-DD format, EST)
+        end_date: End date for clock entries (YYYY-MM-DD format, EST)
+    """
+    # Calculate date ranges once for all employees
+    now = datetime.now(timezone.utc)
+    today = now.date()
+
+    # Calculate start of current week (Monday)
+    current_week_start = today - timedelta(days=today.weekday())
+    current_week_end = current_week_start + timedelta(days=6)
+
+    # Calculate previous week
+    prev_week_start = current_week_start - timedelta(days=7)
+    prev_week_end = current_week_start - timedelta(days=1)
+
+    # Convert input dates to datetime objects with EST timezone for filtering
+    # The user passes dates in EST, so we need to convert them properly
+    from zoneinfo import ZoneInfo
+
+    est_timezone = ZoneInfo("America/New_York")
+
+    date_range_start = (
+        datetime.combine(start_date, datetime.min.time())
+        .replace(tzinfo=est_timezone)
+        .astimezone(timezone.utc)
+    )
+    date_range_end = (
+        datetime.combine(end_date, datetime.max.time())
+        .replace(tzinfo=est_timezone)
+        .astimezone(timezone.utc)
+    )
+
+    # Convert to datetime objects with timezone
+    current_week_start_dt = datetime.combine(
+        current_week_start, datetime.min.time()
+    ).replace(tzinfo=timezone.utc)
+    current_week_end_dt = datetime.combine(
+        current_week_end, datetime.max.time()
+    ).replace(tzinfo=timezone.utc)
+    prev_week_start_dt = datetime.combine(prev_week_start, datetime.min.time()).replace(
+        tzinfo=timezone.utc
+    )
+    prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
+
+    # Get all employees from Firestore
+    users_ref = (
+        firestore_db.collection("users")
+        .where("role", "in", ["employee", "clockOnlyEmployee"])
+        .stream()
+    )
+    employees_data = {}
+    employee_ids = []
+
+    for doc in users_ref:
+        user_data = doc.to_dict()
+        employee_id = doc.id
+        employee_ids.append(employee_id)
+        employees_data[employee_id] = {
+            "name": user_data.get("displayName", "Unknown"),
+            "hourly_wage": user_data.get("hourlyWage", 0.0),
+        }
+
+    # No pagination - get all employees
+    all_employee_ids = sorted(employee_ids)
+
+    # If no employees, return empty list
+    if not all_employee_ids:
+        return []
+
+    # Batch fetch all clock entries within the specified date range for all employees
+    all_clocks = session.exec(
+        select(TimeLog)
+        .where(TimeLog.employee_id.in_(all_employee_ids))
+        .where(TimeLog.timestamp >= date_range_start)
+        .where(TimeLog.timestamp <= date_range_end)
+        .order_by(TimeLog.timestamp.asc())
+    ).all()
+
+    # Ensure all timestamps from DB are timezone-aware before comparisons
+    for clock in all_clocks:
+        if clock.timestamp.tzinfo is None:
+            clock.timestamp = clock.timestamp.replace(tzinfo=timezone.utc)
+
+    # Group clocks by employee_id
+    employee_clocks = {}
+    for clock in all_clocks:
+        employee_id = clock.employee_id
+        if employee_id not in employee_clocks:
+            employee_clocks[employee_id] = []
+        employee_clocks[employee_id].append(clock)
+
+    # Process each employee
+    all_employee_details = []
+    for employee_id in all_employee_ids:
         employee_name = employees_data[employee_id]["name"]
         hourly_wage = employees_data[employee_id]["hourly_wage"]
 
