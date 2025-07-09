@@ -1389,7 +1389,7 @@ async def get_employee_details(
     prev_week_start = current_week_start - timedelta(days=7)
     prev_week_end = current_week_start - timedelta(days=1)
 
-    # Start date for fetching clocks (2 weeks ago)
+    # Start date for fetching clocks (2 weeks ago) - ORIGINAL ENDPOINT
     two_weeks_ago = now - timedelta(days=14)
     print(f"DEBUG: Fetching clocks since {two_weeks_ago} for employee {employee_id}")
 
@@ -1433,12 +1433,21 @@ async def get_employee_details(
 
     # Calculate hours and pay for current week
     current_week_hours = 0.0
-    current_week_start_dt = datetime.combine(
-        current_week_start, datetime.min.time()
-    ).replace(tzinfo=timezone.utc)
-    current_week_end_dt = datetime.combine(
-        current_week_end, datetime.max.time()
-    ).replace(tzinfo=timezone.utc)
+    # Use EST timezone for week calculations to match business operations
+    from zoneinfo import ZoneInfo
+
+    est_timezone = ZoneInfo("America/New_York")
+
+    current_week_start_dt = (
+        datetime.combine(current_week_start, datetime.min.time())
+        .replace(tzinfo=est_timezone)
+        .astimezone(timezone.utc)
+    )
+    current_week_end_dt = (
+        datetime.combine(current_week_end, datetime.max.time())
+        .replace(tzinfo=est_timezone)
+        .astimezone(timezone.utc)
+    )
 
     current_week_clocks = session.exec(
         select(TimeLog)
@@ -1455,11 +1464,15 @@ async def get_employee_details(
 
     # Calculate hours and pay for previous week
     prev_week_hours = 0.0
-    prev_week_start_dt = datetime.combine(prev_week_start, datetime.min.time()).replace(
-        tzinfo=timezone.utc
+    prev_week_start_dt = (
+        datetime.combine(prev_week_start, datetime.min.time())
+        .replace(tzinfo=est_timezone)
+        .astimezone(timezone.utc)
     )
-    prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(
-        tzinfo=timezone.utc
+    prev_week_end_dt = (
+        datetime.combine(prev_week_end, datetime.max.time())
+        .replace(tzinfo=est_timezone)
+        .astimezone(timezone.utc)
     )
 
     prev_week_clocks = session.exec(
@@ -1467,13 +1480,10 @@ async def get_employee_details(
         .where(TimeLog.employee_id == employee_id)
         .where(TimeLog.timestamp >= prev_week_start_dt)
         .where(TimeLog.timestamp <= prev_week_end_dt)
-        .order_by(TimeLog.timestamp.asc())
+        .order_by(TimeLog.timestamp.asc(), TimeLog.punch_type.desc())
     ).all()
 
     # Calculate hours for previous week using helper (handles implicit clock-outs)
-    prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(
-        tzinfo=timezone.utc
-    )
     prev_week_hours = calculate_hours_from_logs(prev_week_clocks, prev_week_end_dt)
 
     prev_week_pay = prev_week_hours * hourly_wage
@@ -1669,7 +1679,7 @@ async def get_employee_details_by_date_range(
         .where(TimeLog.employee_id == employee_id)
         .where(TimeLog.timestamp >= current_week_start_dt)
         .where(TimeLog.timestamp <= current_week_end_dt)
-        .order_by(TimeLog.timestamp.asc())
+        .order_by(TimeLog.timestamp.asc(), TimeLog.punch_type.desc())
     ).all()
 
     # Calculate hours for current week using helper (handles implicit clock-outs)
