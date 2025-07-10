@@ -1,39 +1,42 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlmodel import Session, select
+from datetime import date, datetime, time, timezone
 from typing import List, Optional
-from datetime import datetime, timezone, time, date
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from models.time_log import TimeLog, PunchType
-from models.admin_time_change import AdminTimeChange, AdminTimeChangeAction
-from db.session import get_session
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
+from sqlmodel import Session, select
+
 from core.deps import require_admin_role
 from core.firebase import db as firestore_db
-from pydantic import BaseModel
+from db.session import get_session
+from models.admin_time_change import AdminTimeChange, AdminTimeChangeAction
+from models.time_log import PunchType, TimeLog
 from utils.datetime_helpers import format_utc_datetime
-
 
 router = APIRouter()
 
 # --- Pydantic Models for Admin Direct Clock Actions ---
 
+
 class AdminClockCreateRequestPayload(BaseModel):
     employee_id: str
-    day_of_punch: date     
+    day_of_punch: date
     new_start_time: str  # HH:MM format
-    new_end_time: str    # HH:MM format
+    new_end_time: str  # HH:MM format
     dealership_id: str
     reason: str
 
+
 class AdminClockEditRequestPayload(BaseModel):
     employee_id: str
-    original_clock_in_timelog_id: int 
+    original_clock_in_timelog_id: int
     original_clock_out_timelog_id: int
-    day_of_punch: date     
+    day_of_punch: date
     new_start_time: str  # HH:MM format
-    new_end_time: str    # HH:MM format
+    new_end_time: str  # HH:MM format
     dealership_id: str
     reason: str
+
 
 class AdminClockDeleteRequestPayload(BaseModel):
     employee_id: str
@@ -41,29 +44,33 @@ class AdminClockDeleteRequestPayload(BaseModel):
     clock_out_timelog_id: int
     reason: str
 
+
 # --- NEW: Single Clock Edit Payload ---
 class AdminSingleClockEditRequestPayload(BaseModel):
     employee_id: str
-    timelog_id: int            # ID of the clock punch (either clock-in or clock-out)
-    day_of_punch: date         # Date of the punch
-    new_time: str              # HH:MM format (Eastern)
-    dealership_id: str         # Dealership ID for the punch (can stay the same or change)
+    timelog_id: int  # ID of the clock punch (either clock-in or clock-out)
+    day_of_punch: date  # Date of the punch
+    new_time: str  # HH:MM format (Eastern)
+    dealership_id: str  # Dealership ID for the punch (can stay the same or change)
     reason: str
+
 
 # --- NEW: Single Clock Create Payload ---
 class AdminSingleClockCreateRequestPayload(BaseModel):
     employee_id: str
     day_of_punch: date  # Date of the punch
-    time: str           # HH:MM format (Eastern)
+    time: str  # HH:MM format (Eastern)
     punch_type: PunchType  # Either PunchType.CLOCK_IN or PunchType.CLOCK_OUT
     dealership_id: str
     reason: str
 
+
 # --- NEW: Single Clock Delete Payload ---
 class AdminSingleClockDeleteRequestPayload(BaseModel):
     employee_id: str
-    timelog_id: int          # ID of the clock punch to delete
+    timelog_id: int  # ID of the clock punch to delete
     reason: str
+
 
 # --- NEW: Change Punch Dealership Payload ---
 class AdminChangePunchDealershipRequestPayload(BaseModel):
@@ -72,35 +79,38 @@ class AdminChangePunchDealershipRequestPayload(BaseModel):
     new_dealership_id: str
     reason: str
 
-# --- Helper function to combine date and time string --- 
+
+# --- Helper function to combine date and time string ---
 def combine_date_time_str(punch_date: date, time_str: str) -> datetime:
     """
     Combine date and time string (in EST/EDT) and convert to UTC for database storage.
     """
     try:
-        parsed_time = time.fromisoformat(time_str) # Expects HH:MM or HH:MM:SS
-        
+        parsed_time = time.fromisoformat(time_str)  # Expects HH:MM or HH:MM:SS
+
         # Create datetime object in Eastern timezone (handles EST/EDT).
         # Use canonical name; fall back to legacy alias if necessary.
         try:
-            eastern = ZoneInfo('America/New_York')
+            eastern = ZoneInfo("America/New_York")
         except ZoneInfoNotFoundError:
-            eastern = ZoneInfo('US/Eastern')
+            eastern = ZoneInfo("US/Eastern")
         # Build aware datetime directly with Eastern tzinfo
         dt_eastern = datetime.combine(punch_date, parsed_time, tzinfo=eastern)
-        
+
         # Convert to UTC for database storage
         dt_utc = dt_eastern.astimezone(timezone.utc)
-        
+
         return dt_utc
-        
+
     except ValueError:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail=f"Invalid time string format: {time_str}. Expected HH:MM or HH:MM:SS."
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid time string format: {time_str}. Expected HH:MM or HH:MM:SS.",
         )
 
+
 # --- Validation Functions ---
+
 
 def validate_employee_permissions(admin: dict, employee_id: str) -> None:
     """
@@ -111,41 +121,46 @@ def validate_employee_permissions(admin: dict, employee_id: str) -> None:
     # For now, all admins can modify any employee's records
     pass
 
-def validate_time_entry_data(new_start_time: str, new_end_time: str, day_of_punch: date) -> tuple[datetime, datetime]:
+
+def validate_time_entry_data(
+    new_start_time: str, new_end_time: str, day_of_punch: date
+) -> tuple[datetime, datetime]:
     """
     Validate and convert time entry data to datetime objects.
     """
     # Parse times
     new_start_datetime = combine_date_time_str(day_of_punch, new_start_time)
     new_end_datetime = combine_date_time_str(day_of_punch, new_end_time)
-    
+
     # Validate logical order
     if new_end_datetime <= new_start_datetime:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail="End time must be after start time."
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="End time must be after start time.",
         )
-    
+
     # Validate reasonable date bounds (not too far in future/past)
     now = datetime.now(timezone.utc)
     max_past_days = 365  # 1 year
-    max_future_days = 7   # 1 week
-    
+    max_future_days = 7  # 1 week
+
     if (now.date() - day_of_punch).days > max_past_days:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot create/edit entries more than {max_past_days} days in the past."
+            detail=f"Cannot create/edit entries more than {max_past_days} days in the past.",
         )
-    
+
     if (day_of_punch - now.date()).days > max_future_days:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot create/edit entries more than {max_future_days} days in the future."
+            detail=f"Cannot create/edit entries more than {max_future_days} days in the future.",
         )
-    
+
     return new_start_datetime, new_end_datetime
 
+
 # --- Admin Endpoints ---
+
 
 @router.post("/direct-clock-creation")
 def admin_direct_clock_creation(
@@ -159,16 +174,14 @@ def admin_direct_clock_creation(
     """
     # Validate admin permissions for this employee
     validate_employee_permissions(admin, payload.employee_id)
-    
+
     # Validate and parse time data
     new_start_datetime, new_end_datetime = validate_time_entry_data(
-        payload.new_start_time, 
-        payload.new_end_time, 
-        payload.day_of_punch
+        payload.new_start_time, payload.new_end_time, payload.day_of_punch
     )
-    
+
     admin_uid = admin.get("uid", "unknown_admin")
-    
+
     try:
         # Create new CLOCK_IN entry
         new_clock_in = TimeLog(
@@ -177,12 +190,12 @@ def admin_direct_clock_creation(
             punch_type=PunchType.CLOCK_IN,
             timestamp=new_start_datetime,
             admin_notes=payload.reason,
-            admin_modifier_id=admin_uid
+            admin_modifier_id=admin_uid,
             # latitude/longitude are not part of admin requests
         )
         session.add(new_clock_in)
         session.flush()  # Get the ID without committing yet
-        
+
         # Create new CLOCK_OUT entry
         new_clock_out = TimeLog(
             employee_id=payload.employee_id,
@@ -190,15 +203,15 @@ def admin_direct_clock_creation(
             punch_type=PunchType.CLOCK_OUT,
             timestamp=new_end_datetime,
             admin_notes=payload.reason,
-            admin_modifier_id=admin_uid
+            admin_modifier_id=admin_uid,
         )
         session.add(new_clock_out)
         session.flush()  # Get the ID without committing yet
-        
+
         session.commit()
         session.refresh(new_clock_in)
         session.refresh(new_clock_out)
-        
+
         # Log the admin action
         admin_change = AdminTimeChange(
             admin_id=admin_uid,
@@ -210,11 +223,11 @@ def admin_direct_clock_creation(
             dealership_id=payload.dealership_id,
             start_time=new_start_datetime,
             end_time=new_end_datetime,
-            punch_date=payload.day_of_punch.isoformat()
+            punch_date=payload.day_of_punch.isoformat(),
         )
         session.add(admin_change)
         session.commit()
-        
+
         return {
             "success": True,
             "message": "Clock entry created successfully",
@@ -224,16 +237,17 @@ def admin_direct_clock_creation(
             "start_time": format_utc_datetime(new_start_datetime),
             "end_time": format_utc_datetime(new_end_datetime),
             "reason": payload.reason,
-            "created_by_admin": admin_uid
+            "created_by_admin": admin_uid,
         }
-        
+
     except Exception as e:
         session.rollback()
         print(f"Error during admin clock creation: {e}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-            detail=f"An unexpected error occurred while creating clock entry: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred while creating clock entry: {str(e)}",
         )
+
 
 @router.post("/direct-clock-edit")
 def admin_direct_clock_edit(
@@ -247,57 +261,55 @@ def admin_direct_clock_edit(
     """
     # Validate admin permissions for this employee
     validate_employee_permissions(admin, payload.employee_id)
-    
+
     # Validate and parse time data
     new_start_datetime, new_end_datetime = validate_time_entry_data(
-        payload.new_start_time, 
-        payload.new_end_time, 
-        payload.day_of_punch
+        payload.new_start_time, payload.new_end_time, payload.day_of_punch
     )
-    
+
     admin_uid = admin.get("uid", "unknown_admin")
-    
+
     try:
         # Validate original clock-in punch
         original_clock_in = session.get(TimeLog, payload.original_clock_in_timelog_id)
         if not original_clock_in:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail=f"Original clock-in punch with ID {payload.original_clock_in_timelog_id} not found."
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Original clock-in punch with ID {payload.original_clock_in_timelog_id} not found.",
             )
         if original_clock_in.employee_id != payload.employee_id:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, 
-                detail=f"Clock-in punch ID {payload.original_clock_in_timelog_id} does not belong to employee {payload.employee_id}."
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Clock-in punch ID {payload.original_clock_in_timelog_id} does not belong to employee {payload.employee_id}.",
             )
         if original_clock_in.punch_type != PunchType.CLOCK_IN:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, 
-                detail=f"Punch ID {payload.original_clock_in_timelog_id} is not a clock-in punch."
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Punch ID {payload.original_clock_in_timelog_id} is not a clock-in punch.",
             )
 
         # Validate original clock-out punch
         original_clock_out = session.get(TimeLog, payload.original_clock_out_timelog_id)
         if not original_clock_out:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail=f"Original clock-out punch with ID {payload.original_clock_out_timelog_id} not found."
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Original clock-out punch with ID {payload.original_clock_out_timelog_id} not found.",
             )
         if original_clock_out.employee_id != payload.employee_id:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, 
-                detail=f"Clock-out punch ID {payload.original_clock_out_timelog_id} does not belong to employee {payload.employee_id}."
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Clock-out punch ID {payload.original_clock_out_timelog_id} does not belong to employee {payload.employee_id}.",
             )
         if original_clock_out.punch_type != PunchType.CLOCK_OUT:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, 
-                detail=f"Punch ID {payload.original_clock_out_timelog_id} is not a clock-out punch."
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Punch ID {payload.original_clock_out_timelog_id} is not a clock-out punch.",
             )
-        
+
         # Store original values for response
         original_start_time = original_clock_in.timestamp
         original_end_time = original_clock_out.timestamp
-        
+
         # Update the punch records
         original_clock_in.timestamp = new_start_datetime
         original_clock_in.dealership_id = payload.dealership_id
@@ -310,11 +322,11 @@ def admin_direct_clock_edit(
         original_clock_out.admin_notes = payload.reason
         original_clock_out.admin_modifier_id = admin_uid
         session.add(original_clock_out)
-        
+
         session.commit()
         session.refresh(original_clock_in)
         session.refresh(original_clock_out)
-        
+
         # Log the admin action
         admin_change = AdminTimeChange(
             admin_id=admin_uid,
@@ -328,11 +340,11 @@ def admin_direct_clock_edit(
             end_time=new_end_datetime,
             original_start_time=original_start_time,
             original_end_time=original_end_time,
-            punch_date=payload.day_of_punch.isoformat()
+            punch_date=payload.day_of_punch.isoformat(),
         )
         session.add(admin_change)
         session.commit()
-        
+
         return {
             "success": True,
             "message": "Clock entry edited successfully",
@@ -344,9 +356,9 @@ def admin_direct_clock_edit(
             "new_start_time": format_utc_datetime(new_start_datetime),
             "new_end_time": format_utc_datetime(new_end_datetime),
             "reason": payload.reason,
-            "edited_by_admin": admin_uid
+            "edited_by_admin": admin_uid,
         }
-        
+
     except HTTPException as e:
         session.rollback()
         raise e
@@ -354,9 +366,10 @@ def admin_direct_clock_edit(
         session.rollback()
         print(f"Error during admin clock edit: {e}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-            detail=f"An unexpected error occurred while editing clock entry: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred while editing clock entry: {str(e)}",
         )
+
 
 @router.post("/direct-single-clock-edit")
 def admin_direct_single_clock_edit(
@@ -382,10 +395,16 @@ def admin_direct_single_clock_edit(
     # Fetch the punch to edit
     punch = session.get(TimeLog, payload.timelog_id)
     if not punch:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"TimeLog ID {payload.timelog_id} not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"TimeLog ID {payload.timelog_id} not found",
+        )
 
     if punch.employee_id != payload.employee_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="TimeLog does not belong to specified employee")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="TimeLog does not belong to specified employee",
+        )
 
     # Store originals for response/logging
     original_timestamp = punch.timestamp
@@ -448,7 +467,11 @@ def admin_direct_single_clock_edit(
     except Exception as e:
         session.rollback()
         print(f"Error during single clock edit: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected error while editing punch")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unexpected error while editing punch",
+        )
+
 
 @router.post("/direct-single-clock-creation")
 def admin_direct_single_clock_creation(
@@ -477,11 +500,11 @@ def admin_direct_single_clock_creation(
         .where(TimeLog.punch_type == payload.punch_type)
         .where(TimeLog.dealership_id == payload.dealership_id)
     ).first()
-    
+
     if existing_punch:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"A {payload.punch_type.value} punch already exists for {payload.employee_id} at {format_utc_datetime(new_timestamp)} at {payload.dealership_id}"
+            detail=f"A {payload.punch_type.value} punch already exists for {payload.employee_id} at {format_utc_datetime(new_timestamp)} at {payload.dealership_id}",
         )
 
     try:
@@ -533,8 +556,13 @@ def admin_direct_single_clock_creation(
         print(f"Error during single clock creation: {e}")
         print(f"Error type: {type(e)}")
         import traceback
+
         print(f"Full traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Unexpected error while creating punch: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unexpected error while creating punch: {str(e)}",
+        )
+
 
 @router.post("/direct-single-clock-delete")
 def admin_direct_single_clock_delete(
@@ -545,26 +573,83 @@ def admin_direct_single_clock_delete(
     """
     Admin endpoint to delete a **single** clock punch (either CLOCK_IN or CLOCK_OUT).
     """
-    # Validate admin permissions
-    validate_employee_permissions(admin, payload.employee_id)
+    import logging
+    import traceback
 
-    admin_uid = admin.get("uid", "unknown_admin")
-
-    # Fetch the punch
-    punch = session.get(TimeLog, payload.timelog_id)
-    if not punch:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"TimeLog ID {payload.timelog_id} not found")
-
-    if punch.employee_id != payload.employee_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="TimeLog does not belong to specified employee")
-
-    punch_type = punch.punch_type
-    punch_timestamp = punch.timestamp
-    dealership_id = punch.dealership_id
-    punch_date = punch.timestamp.date().isoformat()
+    logger = logging.getLogger(__name__)
 
     try:
+        logger.info(
+            f"Starting single clock delete - Admin: {admin.get('uid', 'unknown')}, Employee: {payload.employee_id}, TimeLog: {payload.timelog_id}"
+        )
+        logger.info(f"Payload: {payload.model_dump()}")
+
+        # Validate admin permissions
+        logger.info("Validating admin permissions...")
+        validate_employee_permissions(admin, payload.employee_id)
+        logger.info("Admin permissions validated successfully")
+
+        admin_uid = admin.get("uid", "unknown_admin")
+
+        # Fetch the punch
+        logger.info(f"Fetching TimeLog ID {payload.timelog_id}...")
+        punch = session.get(TimeLog, payload.timelog_id)
+        if not punch:
+            logger.warning(f"TimeLog ID {payload.timelog_id} not found in database")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"TimeLog ID {payload.timelog_id} not found",
+            )
+
+        logger.info(
+            f"Found punch: ID={punch.id}, Employee={punch.employee_id}, Type={punch.punch_type}, Timestamp={punch.timestamp}, Dealership={punch.dealership_id}"
+        )
+
+        if punch.employee_id != payload.employee_id:
+            logger.warning(
+                f"TimeLog belongs to employee {punch.employee_id}, but requested for employee {payload.employee_id}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="TimeLog does not belong to specified employee",
+            )
+
+        punch_type = punch.punch_type
+        punch_timestamp = punch.timestamp
+        dealership_id = punch.dealership_id
+        punch_date = punch.timestamp.date().isoformat()
+
+        logger.info(
+            f"Punch details extracted - Type: {punch_type}, Timestamp: {punch_timestamp}, Dealership: {dealership_id}, Date: {punch_date}"
+        )
+
+        # Check for linked signature photos and handle them
+        logger.info("Checking for linked signature photos...")
+        from models.signature_photo import SignaturePhoto
+
+        linked_signatures = session.exec(
+            select(SignaturePhoto).where(SignaturePhoto.time_log_id == punch.id)
+        ).all()
+
+        if linked_signatures:
+            logger.info(
+                f"Found {len(linked_signatures)} signature photos linked to this TimeLog"
+            )
+            logger.info(f"Signature photo IDs: {[sig.id for sig in linked_signatures]}")
+
+            # Unlink signature photos (set time_log_id to NULL) to preserve them for records
+            for signature in linked_signatures:
+                logger.info(
+                    f"Unlinking signature photo ID {signature.id} from TimeLog {punch.id}"
+                )
+                signature.time_log_id = None
+                session.add(signature)
+            logger.info("All signature photos unlinked successfully")
+        else:
+            logger.info("No signature photos found linked to this TimeLog")
+
         # Log admin action BEFORE deletion
+        logger.info("Creating AdminTimeChange record...")
         change_kwargs = dict(
             admin_id=admin_uid,
             employee_id=payload.employee_id,
@@ -578,14 +663,24 @@ def admin_direct_single_clock_delete(
         else:
             change_kwargs.update(clock_out_id=punch.id, end_time=punch_timestamp)
 
+        logger.info(f"AdminTimeChange kwargs: {change_kwargs}")
+
         admin_change = AdminTimeChange(**change_kwargs)
+        logger.info("AdminTimeChange object created successfully")
+
         session.add(admin_change)
+        logger.info("AdminTimeChange added to session")
 
         # Delete the punch
+        logger.info(f"Deleting TimeLog ID {punch.id}...")
         session.delete(punch)
-        session.commit()
+        logger.info("TimeLog marked for deletion")
 
-        return {
+        logger.info("Committing transaction...")
+        session.commit()
+        logger.info("Transaction committed successfully")
+
+        result = {
             "success": True,
             "message": "Punch deleted successfully",
             "deleted_timelog_id": payload.timelog_id,
@@ -597,13 +692,27 @@ def admin_direct_single_clock_delete(
             "deleted_by_admin": admin_uid,
         }
 
+        logger.info(f"Delete operation completed successfully: {result}")
+        return result
+
     except HTTPException as e:
+        logger.error(
+            f"HTTPException in single clock delete: {e.status_code} - {e.detail}"
+        )
         session.rollback()
         raise e
     except Exception as e:
         session.rollback()
-        print(f"Error during single clock delete: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected error while deleting punch")
+        logger.error(f"Unexpected error during single clock delete: {e}")
+        logger.error(f"Error type: {type(e)}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        logger.error(f"Payload that caused error: {payload.model_dump()}")
+        logger.error(f"Admin info: {admin}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unexpected error while deleting punch: {str(e)}",
+        )
+
 
 @router.post("/direct-change-punch-dealership")
 def admin_direct_change_punch_dealership(
@@ -622,16 +731,25 @@ def admin_direct_change_punch_dealership(
     # Fetch the punch
     punch = session.get(TimeLog, payload.timelog_id)
     if not punch:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"TimeLog ID {payload.timelog_id} not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"TimeLog ID {payload.timelog_id} not found",
+        )
 
     if punch.employee_id != payload.employee_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="TimeLog does not belong to specified employee")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="TimeLog does not belong to specified employee",
+        )
 
     original_dealership_id = punch.dealership_id
 
     # Avoid unnecessary updates
     if original_dealership_id == payload.new_dealership_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="New dealership is the same as the current one.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New dealership is the same as the current one.",
+        )
 
     try:
         # Update the punch
@@ -648,7 +766,7 @@ def admin_direct_change_punch_dealership(
             reason=payload.reason,
             dealership_id=payload.new_dealership_id,
             original_dealership_id=original_dealership_id,
-            punch_date=punch.timestamp.date().isoformat()
+            punch_date=punch.timestamp.date().isoformat(),
         )
         if punch.punch_type == PunchType.CLOCK_IN:
             change_kwargs.update(clock_in_id=punch.id, start_time=punch.timestamp)
@@ -669,7 +787,7 @@ def admin_direct_change_punch_dealership(
             "original_dealership_id": original_dealership_id,
             "new_dealership_id": punch.dealership_id,
             "reason": payload.reason,
-            "edited_by_admin": admin_uid
+            "edited_by_admin": admin_uid,
         }
 
     except HTTPException as e:
@@ -678,16 +796,21 @@ def admin_direct_change_punch_dealership(
     except Exception as e:
         session.rollback()
         print(f"Error during punch dealership change: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unexpected error while changing punch dealership")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unexpected error while changing punch dealership",
+        )
+
 
 # --- Helper endpoint for frontend to get employee's recent punches ---
+
 
 @router.get("/employee/{employee_id}/recent-punches")
 def get_employee_recent_punches(
     employee_id: str,
     session: Session = Depends(get_session),
     admin: dict = Depends(require_admin_role),
-    limit: Optional[int] = 20  # Changed to Optional, default 20
+    limit: Optional[int] = 20,  # Changed to Optional, default 20
 ):
     """
     Get punch entries for a specific employee.
@@ -696,36 +819,36 @@ def get_employee_recent_punches(
     """
     # Validate admin permissions for this employee
     validate_employee_permissions(admin, employee_id)
-    
+
     # Base query
     query = (
         select(TimeLog)
         .where(TimeLog.employee_id == employee_id)
         .order_by(TimeLog.timestamp.desc())
     )
-    
+
     # Apply limit if provided and greater than 0
     if limit and limit > 0:
         query = query.limit(limit)
-        
+
     recent_punches = session.exec(query).all()
-    
+
     # Format for frontend
     formatted_punches = []
     for punch in recent_punches:
-        formatted_punches.append({
-            "id": punch.id,
-            "timestamp": format_utc_datetime(punch.timestamp),
-            "punch_type": punch.punch_type.value,
-            "dealership_id": punch.dealership_id,
-            "date": punch.timestamp.date().isoformat(),
-            "time": punch.timestamp.time().strftime("%H:%M")
-        })
-    
-    return {
-        "employee_id": employee_id,
-        "recent_punches": formatted_punches
-    }
+        formatted_punches.append(
+            {
+                "id": punch.id,
+                "timestamp": format_utc_datetime(punch.timestamp),
+                "punch_type": punch.punch_type.value,
+                "dealership_id": punch.dealership_id,
+                "date": punch.timestamp.date().isoformat(),
+                "time": punch.timestamp.time().strftime("%H:%M"),
+            }
+        )
+
+    return {"employee_id": employee_id, "recent_punches": formatted_punches}
+
 
 async def get_user_name(user_id: str) -> Optional[str]:
     """Get user's display name from Firestore"""
@@ -738,62 +861,61 @@ async def get_user_name(user_id: str) -> Optional[str]:
         print(f"Error fetching user name for {user_id}: {e}")
     return None
 
+
 @router.get("/recent-entries")
 async def get_recent_global_entries(
     session: Session = Depends(get_session),
     admin: dict = Depends(require_admin_role),
-    limit: int = 50 # Default to 50 most recent entries
+    limit: int = 50,  # Default to 50 most recent entries
 ):
     """
     Get the most recent admin time changes across all employees.
     """
-    query = (
-        select(AdminTimeChange)
-        .order_by(AdminTimeChange.created_at.desc())
-    )
+    query = select(AdminTimeChange).order_by(AdminTimeChange.created_at.desc())
 
     if limit and limit > 0:
         query = query.limit(limit)
-    
+
     recent_changes = session.exec(query).all()
-    
+
     # Format for frontend
     formatted_changes = []
     for change in recent_changes:
         employee_name = await get_user_name(change.employee_id)
         admin_name = await get_user_name(change.admin_id)
-        
-        formatted_changes.append({
-            "id": change.id,
-            "employee_id": change.employee_id,
-            "employee_name": employee_name,
-            "admin_id": change.admin_id,
-            "admin_name": admin_name,
-            "action": change.action.value,
-            "reason": change.reason,
-            "created_at": format_utc_datetime(change.created_at),
-            "clock_in_id": change.clock_in_id,
-            "clock_out_id": change.clock_out_id,
-            "dealership_id": change.dealership_id,
-            "start_time": format_utc_datetime(change.start_time),
-            "end_time": format_utc_datetime(change.end_time),
-            "original_start_time": format_utc_datetime(change.original_start_time),
-            "original_end_time": format_utc_datetime(change.original_end_time),
-            "punch_date": change.punch_date,
-            "date": change.created_at.date().isoformat(),
-            "time": change.created_at.time().strftime("%H:%M")
-        })
-    
-    return {
-        "recent_changes": formatted_changes
-    }
+
+        formatted_changes.append(
+            {
+                "id": change.id,
+                "employee_id": change.employee_id,
+                "employee_name": employee_name,
+                "admin_id": change.admin_id,
+                "admin_name": admin_name,
+                "action": change.action.value,
+                "reason": change.reason,
+                "created_at": format_utc_datetime(change.created_at),
+                "clock_in_id": change.clock_in_id,
+                "clock_out_id": change.clock_out_id,
+                "dealership_id": change.dealership_id,
+                "start_time": format_utc_datetime(change.start_time),
+                "end_time": format_utc_datetime(change.end_time),
+                "original_start_time": format_utc_datetime(change.original_start_time),
+                "original_end_time": format_utc_datetime(change.original_end_time),
+                "punch_date": change.punch_date,
+                "date": change.created_at.date().isoformat(),
+                "time": change.created_at.time().strftime("%H:%M"),
+            }
+        )
+
+    return {"recent_changes": formatted_changes}
+
 
 @router.get("/employee/{employee_id}/changes")
 async def get_employee_admin_changes(
     employee_id: str,
     session: Session = Depends(get_session),
     admin: dict = Depends(require_admin_role),
-    limit: Optional[int] = 20
+    limit: Optional[int] = 20,
 ):
     """
     Get all admin time changes for a specific employee.
@@ -802,51 +924,51 @@ async def get_employee_admin_changes(
     """
     # Validate admin permissions for this employee
     validate_employee_permissions(admin, employee_id)
-    
+
     # Base query
     query = (
         select(AdminTimeChange)
         .where(AdminTimeChange.employee_id == employee_id)
         .order_by(AdminTimeChange.created_at.desc())
     )
-    
+
     # Apply limit if provided and greater than 0
     if limit and limit > 0:
         query = query.limit(limit)
-        
+
     employee_changes = session.exec(query).all()
-    
+
     # Format for frontend
     formatted_changes = []
     for change in employee_changes:
         employee_name = await get_user_name(change.employee_id)
         admin_name = await get_user_name(change.admin_id)
-        
-        formatted_changes.append({
-            "id": change.id,
-            "employee_id": change.employee_id,
-            "employee_name": employee_name,
-            "admin_id": change.admin_id,
-            "admin_name": admin_name,
-            "action": change.action.value,
-            "reason": change.reason,
-            "created_at": format_utc_datetime(change.created_at),
-            "clock_in_id": change.clock_in_id,
-            "clock_out_id": change.clock_out_id,
-            "dealership_id": change.dealership_id,
-            "start_time": format_utc_datetime(change.start_time),
-            "end_time": format_utc_datetime(change.end_time),
-            "original_start_time": format_utc_datetime(change.original_start_time),
-            "original_end_time": format_utc_datetime(change.original_end_time),
-            "punch_date": change.punch_date,
-            "date": change.created_at.date().isoformat(),
-            "time": change.created_at.time().strftime("%H:%M")
-        })
-    
-    return {
-        "employee_id": employee_id,
-        "admin_changes": formatted_changes
-    }
+
+        formatted_changes.append(
+            {
+                "id": change.id,
+                "employee_id": change.employee_id,
+                "employee_name": employee_name,
+                "admin_id": change.admin_id,
+                "admin_name": admin_name,
+                "action": change.action.value,
+                "reason": change.reason,
+                "created_at": format_utc_datetime(change.created_at),
+                "clock_in_id": change.clock_in_id,
+                "clock_out_id": change.clock_out_id,
+                "dealership_id": change.dealership_id,
+                "start_time": format_utc_datetime(change.start_time),
+                "end_time": format_utc_datetime(change.end_time),
+                "original_start_time": format_utc_datetime(change.original_start_time),
+                "original_end_time": format_utc_datetime(change.original_end_time),
+                "punch_date": change.punch_date,
+                "date": change.created_at.date().isoformat(),
+                "time": change.created_at.time().strftime("%H:%M"),
+            }
+        )
+
+    return {"employee_id": employee_id, "admin_changes": formatted_changes}
+
 
 @router.post("/direct-clock-delete")
 def admin_direct_clock_delete(
@@ -860,52 +982,52 @@ def admin_direct_clock_delete(
     """
     # Validate admin permissions for this employee
     validate_employee_permissions(admin, payload.employee_id)
-    
+
     admin_uid = admin.get("uid", "unknown_admin")
-    
+
     try:
         # Validate clock-in punch
         clock_in = session.get(TimeLog, payload.clock_in_timelog_id)
         if not clock_in:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail=f"Clock-in punch with ID {payload.clock_in_timelog_id} not found."
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Clock-in punch with ID {payload.clock_in_timelog_id} not found.",
             )
         if clock_in.employee_id != payload.employee_id:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, 
-                detail=f"Clock-in punch ID {payload.clock_in_timelog_id} does not belong to employee {payload.employee_id}."
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Clock-in punch ID {payload.clock_in_timelog_id} does not belong to employee {payload.employee_id}.",
             )
         if clock_in.punch_type != PunchType.CLOCK_IN:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, 
-                detail=f"Punch ID {payload.clock_in_timelog_id} is not a clock-in punch."
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Punch ID {payload.clock_in_timelog_id} is not a clock-in punch.",
             )
 
         # Validate clock-out punch
         clock_out = session.get(TimeLog, payload.clock_out_timelog_id)
         if not clock_out:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail=f"Clock-out punch with ID {payload.clock_out_timelog_id} not found."
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Clock-out punch with ID {payload.clock_out_timelog_id} not found.",
             )
         if clock_out.employee_id != payload.employee_id:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, 
-                detail=f"Clock-out punch ID {payload.clock_out_timelog_id} does not belong to employee {payload.employee_id}."
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Clock-out punch ID {payload.clock_out_timelog_id} does not belong to employee {payload.employee_id}.",
             )
         if clock_out.punch_type != PunchType.CLOCK_OUT:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, 
-                detail=f"Punch ID {payload.clock_out_timelog_id} is not a clock-out punch."
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Punch ID {payload.clock_out_timelog_id} is not a clock-out punch.",
             )
-        
+
         # Store info for response before deletion
         deleted_start_time = clock_in.timestamp
         deleted_end_time = clock_out.timestamp
         dealership_id = clock_in.dealership_id
         punch_date = clock_in.timestamp.date().isoformat()
-        
+
         # Log the admin action BEFORE deleting
         admin_change = AdminTimeChange(
             admin_id=admin_uid,
@@ -917,16 +1039,16 @@ def admin_direct_clock_delete(
             dealership_id=dealership_id,
             start_time=deleted_start_time,
             end_time=deleted_end_time,
-            punch_date=punch_date
+            punch_date=punch_date,
         )
         session.add(admin_change)
-        
+
         # Delete both punch records
         session.delete(clock_in)
         session.delete(clock_out)
-        
+
         session.commit()
-        
+
         return {
             "success": True,
             "message": "Clock entry deleted successfully",
@@ -937,9 +1059,9 @@ def admin_direct_clock_delete(
             "deleted_end_time": format_utc_datetime(deleted_end_time),
             "dealership_id": dealership_id,
             "reason": payload.reason,
-            "deleted_by_admin": admin_uid
+            "deleted_by_admin": admin_uid,
         }
-        
+
     except HTTPException as e:
         session.rollback()
         raise e
@@ -947,6 +1069,6 @@ def admin_direct_clock_delete(
         session.rollback()
         print(f"Error during admin clock delete: {e}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-            detail=f"An unexpected error occurred while deleting clock entry: {str(e)}"
-        ) 
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred while deleting clock entry: {str(e)}",
+        )
