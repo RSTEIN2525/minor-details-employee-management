@@ -1,5 +1,5 @@
 from datetime import date, datetime, time, timedelta, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -16,6 +16,83 @@ from utils.breaks import apply_unpaid_break
 from utils.datetime_helpers import format_utc_datetime
 
 router = APIRouter()
+
+
+def _get_daily_hours_map(punches: List[TimeLog], now: datetime) -> Dict[date, float]:
+    """
+    Processes a list of punches and returns a map of dates to raw hours worked on that day.
+    This logic is based on the robust calculations from the admin analytics to ensure consistency.
+    It correctly handles shifts crossing midnight and currently open shifts.
+    """
+    from collections import defaultdict
+
+    daily_raw_seconds: Dict[date, float] = defaultdict(float)
+    clock_in_time: Optional[datetime] = None
+
+    # Ensure punches are sorted chronologically
+    sorted_punches = sorted(punches, key=lambda p: p.timestamp)
+
+    for punch in sorted_punches:
+        punch_ts = punch.timestamp
+        if punch_ts.tzinfo is None:
+            punch_ts = punch_ts.replace(tzinfo=timezone.utc)
+
+        if punch.punch_type == PunchType.CLOCK_IN:
+            if clock_in_time:
+                # Implicit clock-out: a new CLOCK_IN starts before the previous one ended.
+                # Process the time segment from the last clock-in up to this new one.
+                end_time = punch_ts
+                current_time_segment = clock_in_time
+                while current_time_segment.date() < end_time.date():
+                    next_day_start = (current_time_segment + timedelta(days=1)).replace(
+                        hour=0, minute=0, second=0, microsecond=0
+                    )
+                    duration = (next_day_start - current_time_segment).total_seconds()
+                    daily_raw_seconds[current_time_segment.date()] += duration
+                    current_time_segment = next_day_start
+                # Add the remainder of the time on the final day of the segment
+                duration = (end_time - current_time_segment).total_seconds()
+                daily_raw_seconds[end_time.date()] += duration
+
+            clock_in_time = punch_ts
+
+        elif punch.punch_type == PunchType.CLOCK_OUT and clock_in_time:
+            end_time = punch_ts
+            current_time_segment = clock_in_time
+            # Distribute hours across days for shifts that span midnight
+            while current_time_segment.date() < end_time.date():
+                next_day_start = (current_time_segment + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                duration = (next_day_start - current_time_segment).total_seconds()
+                daily_raw_seconds[current_time_segment.date()] += duration
+                current_time_segment = next_day_start
+
+            # Add the remainder of the time on the final day of the segment
+            duration = (end_time - current_time_segment).total_seconds()
+            daily_raw_seconds[end_time.date()] += duration
+            clock_in_time = None
+
+    # Handle a currently open shift that hasn't been clocked out
+    if clock_in_time and clock_in_time < now:
+        end_time = now
+        current_time_segment = clock_in_time
+        # Distribute hours across days for the open shift
+        while current_time_segment.date() < end_time.date():
+            next_day_start = (current_time_segment + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            duration = (next_day_start - current_time_segment).total_seconds()
+            daily_raw_seconds[current_time_segment.date()] += duration
+            current_time_segment = next_day_start
+
+        # Add the final segment of the open shift
+        duration = (end_time - current_time_segment).total_seconds()
+        daily_raw_seconds[end_time.date()] += duration
+
+    # Convert seconds to hours for the final map
+    return {day: seconds / 3600 for day, seconds in daily_raw_seconds.items()}
+
 
 # --- Pydantic Models for Responses ---
 
@@ -592,113 +669,23 @@ async def get_weekly_overtime_hours(
         .order_by(TimeLog.timestamp.asc())
     ).all()
 
-    total_seconds_worked = 0
-    clock_in_time: Optional[datetime] = None
+    # Use the new centralized calculation logic
+    daily_raw_hours_map = _get_daily_hours_map(punches_this_week, now)
 
-    for punch in punches_this_week:
-        punch_timestamp = punch.timestamp
-        if punch_timestamp.tzinfo is None:
-            punch_timestamp = punch_timestamp.replace(tzinfo=timezone.utc)
-
-        if punch.punch_type == PunchType.CLOCK_IN:
-            # If there's a lingering clock_in_time, it means a missed clock_out, ignore previous.
-            clock_in_time = punch_timestamp
-        elif punch.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-            # Ensure clock_out is after clock_in to avoid negative duration if data is messy
-            if punch_timestamp > clock_in_time:
-                duration = punch_timestamp - clock_in_time
-                total_seconds_worked += duration.total_seconds()
-            clock_in_time = None  # Reset for the next pair
-
-    # If the user is currently clocked in (last punch in sequence was CLOCK_IN and within the week)
-    if (
-        clock_in_time is not None and clock_in_time < now
-    ):  # Make sure clock_in_time is in the past
-        # Ensure this clock_in_time is within the current week before adding duration to now
-        # This check is implicitly handled by the query, but explicit thought is good.
-        duration_of_current_shift = now - clock_in_time
-        total_seconds_worked += duration_of_current_shift.total_seconds()
-
-    # Calculate raw hours
-    total_raw_hours_worked = total_seconds_worked / 3600
-
-    # Apply lunch break deduction logic by calculating daily hours and applying breaks
-    # Group punches by day to apply lunch break deduction per day
-    daily_hours_map = {}
-    current_day_punches = []
-    current_date = None
-
-    for punch in punches_this_week:
-        punch_date = punch.timestamp.date()
-        if current_date != punch_date:
-            # Process previous day if any
-            if current_date is not None and current_day_punches:
-                daily_seconds = 0
-                day_clock_in_time = None
-
-                for day_punch in current_day_punches:
-                    punch_ts = day_punch.timestamp
-                    if punch_ts.tzinfo is None:
-                        punch_ts = punch_ts.replace(tzinfo=timezone.utc)
-
-                    if day_punch.punch_type == PunchType.CLOCK_IN:
-                        day_clock_in_time = punch_ts
-                    elif (
-                        day_punch.punch_type == PunchType.CLOCK_OUT
-                        and day_clock_in_time
-                    ):
-                        if punch_ts > day_clock_in_time:
-                            duration = punch_ts - day_clock_in_time
-                            daily_seconds += duration.total_seconds()
-                        day_clock_in_time = None
-
-                # Handle if still clocked in for this day
-                if day_clock_in_time is not None and current_date == now.date():
-                    duration_of_current_shift = now - day_clock_in_time
-                    daily_seconds += duration_of_current_shift.total_seconds()
-
-                daily_hours_map[current_date] = daily_seconds / 3600
-
-            # Start new day
-            current_date = punch_date
-            current_day_punches = [punch]
-        else:
-            current_day_punches.append(punch)
-
-    # Process the last day
-    if current_date is not None and current_day_punches:
-        daily_seconds = 0
-        day_clock_in_time = None
-
-        for day_punch in current_day_punches:
-            punch_ts = day_punch.timestamp
-            if punch_ts.tzinfo is None:
-                punch_ts = punch_ts.replace(tzinfo=timezone.utc)
-
-            if day_punch.punch_type == PunchType.CLOCK_IN:
-                day_clock_in_time = punch_ts
-            elif day_punch.punch_type == PunchType.CLOCK_OUT and day_clock_in_time:
-                if punch_ts > day_clock_in_time:
-                    duration = punch_ts - day_clock_in_time
-                    daily_seconds += duration.total_seconds()
-                day_clock_in_time = None
-
-        # Handle if still clocked in for this day
-        if day_clock_in_time is not None and current_date == now.date():
-            duration_of_current_shift = now - day_clock_in_time
-            daily_seconds += duration_of_current_shift.total_seconds()
-
-        daily_hours_map[current_date] = daily_seconds / 3600
+    # Calculate totals from the daily map
+    total_raw_hours_worked = sum(daily_raw_hours_map.values())
 
     # Apply lunch break deduction to each day and sum up paid hours
     total_paid_hours_worked = 0.0
-    for date, raw_hours in daily_hours_map.items():
+    for raw_hours in daily_raw_hours_map.values():
         paid_hours = apply_unpaid_break(raw_hours)
         total_paid_hours_worked += paid_hours
 
-    # Calculate overtime based on PAID hours (consistent with other endpoints)
+    # Calculate overtime based on PAID hours for consistency
     overtime_threshold = 40.0
     paid_overtime_hours_worked = max(0, total_paid_hours_worked - overtime_threshold)
+
+    # Also calculate raw overtime for the response model
     raw_overtime_hours_worked = max(0, total_raw_hours_worked - overtime_threshold)
 
     return WeeklyOvertimeHoursResponse(
@@ -1293,152 +1280,100 @@ async def get_weekly_breakdown(
         .order_by(TimeLog.timestamp.asc())
     ).all()
 
-    daily_hours_map = {
-        (week_start_date + timedelta(days=i)): {"total": 0.0, "punches": []}
-        for i in range(7)
-    }
-
-    for punch in punches:
-        punch_date = punch.timestamp.astimezone(timezone.utc).date()
-        if punch_date in daily_hours_map:
-            daily_hours_map[punch_date]["punches"].append(punch)
+    # Use the new centralized calculation logic
+    daily_raw_hours_map = _get_daily_hours_map(punches, datetime.now(timezone.utc))
 
     daily_summaries: List[SingleWeekDailySummary] = []
-    week_total_hours = 0.0
-    week_total_regular_hours = 0.0
-    week_total_overtime_hours = 0.0
-    week_total_earnings = 0.0
+    week_total_paid_hours = 0.0
+    paid_hours_so_far_this_week = 0.0
 
-    # Calculate hours per day using consistent admin logic
+    # First, calculate total paid hours for the week to determine overtime
     for day_offset in range(7):
         current_date = week_start_date + timedelta(days=day_offset)
-        day_data = daily_hours_map.get(current_date)
-        day_raw_hours = 0.0
+        raw_hours = daily_raw_hours_map.get(current_date, 0.0)
+        paid_hours = apply_unpaid_break(raw_hours)
+        week_total_paid_hours += paid_hours
 
-        if day_data:
-            day_punches = sorted(day_data["punches"], key=lambda p: p.timestamp)
-            clock_in_time: Optional[datetime] = None
+    # Determine weekly paid regular and overtime hours
+    week_paid_overtime_hours = max(0, week_total_paid_hours - overtime_threshold_hours)
+    week_paid_regular_hours = week_total_paid_hours - week_paid_overtime_hours
 
-            # Use the same logic as admin analytics for consistency
-            for punch in day_punches:
-                punch_ts = punch.timestamp
-                if punch_ts.tzinfo is None:
-                    punch_ts = punch_ts.replace(tzinfo=timezone.utc)
+    # Iterate through the week again to build daily summaries with correct overtime allocation
+    for day_offset in range(7):
+        current_date = week_start_date + timedelta(days=day_offset)
+        raw_hours_today = daily_raw_hours_map.get(current_date, 0.0)
+        paid_hours_today = apply_unpaid_break(raw_hours_today)
 
-                if punch.punch_type == PunchType.CLOCK_IN:
-                    clock_in_time = punch_ts
-                elif punch.punch_type == PunchType.CLOCK_OUT and clock_in_time:
-                    duration_hours = (punch_ts - clock_in_time).total_seconds() / 3600
-                    day_raw_hours += duration_hours
-                    clock_in_time = None
+        # Determine how many of today's paid hours are regular vs overtime
+        remaining_regular_weekly_hours = (
+            overtime_threshold_hours - paid_hours_so_far_this_week
+        )
+        if remaining_regular_weekly_hours <= 0:
+            # All of today's hours are overtime
+            daily_paid_regular = 0.0
+            daily_paid_overtime = paid_hours_today
+        elif paid_hours_today <= remaining_regular_weekly_hours:
+            # All of today's hours are regular
+            daily_paid_regular = paid_hours_today
+            daily_paid_overtime = 0.0
+        else:
+            # A mix of regular and overtime
+            daily_paid_regular = remaining_regular_weekly_hours
+            daily_paid_overtime = paid_hours_today - remaining_regular_weekly_hours
 
-            # Handle currently active shift if it exists at end of day's punches
-            if clock_in_time is not None:
-                # If the current date is today and user is still clocked in, add time until now
-                now_utc = datetime.now(timezone.utc)
-                if current_date == now_utc.date():
-                    duration_hours = (now_utc - clock_in_time).total_seconds() / 3600
-                    day_raw_hours += duration_hours
+        # Update the running total for the next day's calculation
+        paid_hours_so_far_this_week += paid_hours_today
 
-        # Apply lunch break deduction to get paid hours
-        day_paid_hours = apply_unpaid_break(day_raw_hours)
+        # Calculate earnings for the day based on paid regular and overtime hours
+        estimated_earnings = (daily_paid_regular * hourly_wage) + (
+            daily_paid_overtime * overtime_wage
+        )
 
-        week_total_hours += day_raw_hours
+        # Raw hours breakdown is for display purposes; it's less critical but good to have
+        # This part is complex and less critical than paid hours. We can approximate it
+        # based on the ratio of paid regular/overtime for the day.
+        raw_regular_hours_today = raw_hours_today
+        raw_overtime_hours_today = 0.0
+        if paid_hours_today > 0:
+            paid_regular_ratio = daily_paid_regular / paid_hours_today
+            raw_regular_hours_today = raw_hours_today * paid_regular_ratio
+            raw_overtime_hours_today = raw_hours_today - raw_regular_hours_today
 
-        # Calculate regular/overtime for this day based on weekly total so far
-        # For daily display, we need to show how much of each day is regular vs overtime
-        # But overtime is calculated on weekly basis
         daily_summaries.append(
             SingleWeekDailySummary(
                 date=current_date.isoformat(),
                 day_name=current_date.strftime("%A"),
-                raw_total_hours=round(day_raw_hours, 2),
-                paid_total_hours=round(day_paid_hours, 2),
-                raw_regular_hours=0,  # Will be calculated after we have weekly totals
-                paid_regular_hours=0,  # Will be calculated after we have weekly totals
-                raw_overtime_hours=0,  # Will be calculated after we have weekly totals
-                paid_overtime_hours=0,  # Will be calculated after we have weekly totals
-                estimated_earnings=0,  # Will be calculated after we have weekly totals
+                raw_total_hours=round(raw_hours_today, 2),
+                paid_total_hours=round(paid_hours_today, 2),
+                raw_regular_hours=round(raw_regular_hours_today, 2),
+                paid_regular_hours=round(daily_paid_regular, 2),
+                raw_overtime_hours=round(raw_overtime_hours_today, 2),
+                paid_overtime_hours=round(daily_paid_overtime, 2),
+                estimated_earnings=round(estimated_earnings, 2),
             )
         )
 
-    # Use the same overtime calculation logic as admin analytics
-    # Calculate paid week total hours for overtime calculations
-    week_paid_total_hours = sum(ds.paid_total_hours for ds in daily_summaries)
-
-    if week_paid_total_hours <= overtime_threshold_hours:
-        week_total_regular_hours = week_total_hours
-        week_total_overtime_hours = 0.0
-        week_paid_regular_hours = week_paid_total_hours
-        week_paid_overtime_hours = 0.0
-    else:
-        week_total_regular_hours = overtime_threshold_hours
-        week_total_overtime_hours = week_total_hours - overtime_threshold_hours
-        week_paid_regular_hours = overtime_threshold_hours
-        week_paid_overtime_hours = week_paid_total_hours - overtime_threshold_hours
-
-    # Calculate daily regular/overtime hours properly
-    # For weekly overtime, we need to determine which hours count as overtime
-    # Standard approach: first 40 hours are regular, rest are overtime
-    remaining_raw_regular_hours = week_total_regular_hours
-    remaining_paid_regular_hours = week_paid_regular_hours
-    total_earnings = 0.0
-
-    for ds in daily_summaries:
-        # Calculate raw hour breakdown
-        if remaining_raw_regular_hours >= ds.raw_total_hours:
-            # All raw hours for this day are regular
-            ds.raw_regular_hours = round(ds.raw_total_hours, 2)
-            ds.raw_overtime_hours = 0.0
-            remaining_raw_regular_hours -= ds.raw_total_hours
-        elif remaining_raw_regular_hours > 0:
-            # Some raw hours are regular, some are overtime
-            ds.raw_regular_hours = round(remaining_raw_regular_hours, 2)
-            ds.raw_overtime_hours = round(
-                ds.raw_total_hours - remaining_raw_regular_hours, 2
-            )
-            remaining_raw_regular_hours = 0.0
-        else:
-            # All raw hours for this day are overtime
-            ds.raw_regular_hours = 0.0
-            ds.raw_overtime_hours = round(ds.raw_total_hours, 2)
-
-        # Calculate paid hour breakdown
-        if remaining_paid_regular_hours >= ds.paid_total_hours:
-            # All paid hours for this day are regular
-            ds.paid_regular_hours = round(ds.paid_total_hours, 2)
-            ds.paid_overtime_hours = 0.0
-            remaining_paid_regular_hours -= ds.paid_total_hours
-        elif remaining_paid_regular_hours > 0:
-            # Some paid hours are regular, some are overtime
-            ds.paid_regular_hours = round(remaining_paid_regular_hours, 2)
-            ds.paid_overtime_hours = round(
-                ds.paid_total_hours - remaining_paid_regular_hours, 2
-            )
-            remaining_paid_regular_hours = 0.0
-        else:
-            # All paid hours for this day are overtime
-            ds.paid_regular_hours = 0.0
-            ds.paid_overtime_hours = round(ds.paid_total_hours, 2)
-
-        # Calculate earnings using paid hours (the actually compensated time)
-        ds.estimated_earnings = round(
-            (ds.paid_regular_hours * hourly_wage)
-            + (ds.paid_overtime_hours * overtime_wage),
-            2,
-        )
-        total_earnings += ds.estimated_earnings
-
+    # Calculate final weekly totals from the daily summaries
     weekly_total_summary = SingleWeeklyTotal(
         week_start_date=week_start_date.isoformat(),
         week_end_date=week_end_date.isoformat(),
-        raw_total_hours=round(week_total_hours, 2),
-        paid_total_hours=round(week_paid_total_hours, 2),
-        raw_total_regular_hours=round(week_total_regular_hours, 2),
-        paid_total_regular_hours=round(week_paid_regular_hours, 2),
-        raw_total_overtime_hours=round(week_total_overtime_hours, 2),
-        paid_total_overtime_hours=round(week_paid_overtime_hours, 2),
-        total_estimated_earnings=round(total_earnings, 2),
+        raw_total_hours=round(sum(ds.raw_total_hours for ds in daily_summaries), 2),
+        paid_total_hours=round(sum(ds.paid_total_hours for ds in daily_summaries), 2),
+        raw_total_regular_hours=round(
+            sum(ds.raw_regular_hours for ds in daily_summaries), 2
+        ),
+        paid_total_regular_hours=round(
+            sum(ds.paid_regular_hours for ds in daily_summaries), 2
+        ),
+        raw_total_overtime_hours=round(
+            sum(ds.raw_overtime_hours for ds in daily_summaries), 2
+        ),
+        paid_total_overtime_hours=round(
+            sum(ds.paid_overtime_hours for ds in daily_summaries), 2
+        ),
+        total_estimated_earnings=round(
+            sum(ds.estimated_earnings for ds in daily_summaries), 2
+        ),
     )
 
     return WeeklyBreakdownResponse(
