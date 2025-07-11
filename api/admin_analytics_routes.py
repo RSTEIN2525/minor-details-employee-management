@@ -2620,6 +2620,45 @@ async def get_comprehensive_labor_spend(
 
     print(f"Found {len(all_employees)} total employees assigned to {dealership_id}")
 
+    # ALSO get employees who have clocked in at this dealership recently (like active/all does)
+    # This ensures we catch employees working here who aren't formally assigned
+    lookback_date = datetime.now(timezone.utc) - timedelta(days=2)
+    recent_clocks = session.exec(
+        select(TimeLog)
+        .where(TimeLog.dealership_id == dealership_id)
+        .where(TimeLog.timestamp >= lookback_date)
+        .order_by(TimeLog.timestamp.asc())
+    ).all()
+
+    # Get unique employee IDs who have clocked at this dealership recently
+    recent_employee_ids = set(clock.employee_id for clock in recent_clocks)
+    print(
+        f"Found {len(recent_employee_ids)} employees who have clocked in at {dealership_id} recently"
+    )
+
+    # For recently clocked employees not already in our list, fetch their details
+    for employee_id in recent_employee_ids:
+        if employee_id not in all_employees:
+            # Get this employee's details from Firestore
+            try:
+                user_details = await get_user_details(employee_id)
+                all_employees[employee_id] = {
+                    "name": user_details.get("name", "Unknown"),
+                    "hourly_wage": user_details.get("hourly_wage", 0.0),
+                }
+                print(
+                    f"Added recently active employee {employee_id} ({user_details.get('name', 'Unknown')}) who isn't assigned to {dealership_id}"
+                )
+            except Exception as e:
+                print(
+                    f"Error fetching details for recently active employee {employee_id}: {e}"
+                )
+                continue
+
+    print(
+        f"Total employees to process for {dealership_id}: {len(all_employees)} (assigned + recently active)"
+    )
+
     # Get ALL time logs for THIS WEEK for ALL RELEVANT EMPLOYEES across ALL dealerships.
     # This is crucial for correctly calculating cross-dealership implicit clock-outs.
     employee_ids = list(all_employees.keys())
