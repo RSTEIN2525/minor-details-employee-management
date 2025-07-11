@@ -1,11 +1,12 @@
+from typing import Annotated, List, Optional
+
 from fastapi import APIRouter, Depends, HTTPException, status
-from typing import Annotated, List
-from core.firebase import db
-from core.deps import require_admin_role
 from google.cloud.firestore_v1.transforms import ArrayRemove
 from pydantic import BaseModel
 from pydantic import Field as PydanticField
-from typing import Optional
+
+from core.deps import require_admin_role
+from core.firebase import db
 
 # Define Router
 router = APIRouter()
@@ -114,6 +115,24 @@ async def set_or_update_user_wage(
                 detail=f"User with user_id {user_id}, does not exist.",
             )
 
+        user_data = user_doc.to_dict()
+        user_role = user_data.get("role")
+
+        # Define allowed roles for wage updates
+        allowed_roles = [
+            "employee",
+            "clockOnlyEmployee",
+            "serviceWash",
+            "lotPrep",
+            "photos",
+        ]
+
+        if user_role not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Cannot set wage for user with role '{user_role}'. Only allowed for roles: {', '.join(allowed_roles)}.",
+            )
+
         # Update the user document with the new wage
         update_results = user_ref.update({"hourlyWage": wage_data.hourlyWage})
 
@@ -145,7 +164,15 @@ async def list_all_user_wages_for_admin(
                 continue  # Should not happen if doc.exists is true, but good practice
 
             # Only include employees
-            if user_data.get("role") != "employee":
+            user_role = user_data.get("role")
+            allowed_roles = [
+                "employee",
+                "clockOnlyEmployee",
+                "serviceWash",
+                "lotPrep",
+                "photos",
+            ]
+            if user_role not in allowed_roles:
                 continue
 
             # Extract wage, ensure it's a float if present, or None
