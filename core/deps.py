@@ -1,8 +1,11 @@
-from fastapi import Depends, HTTPException, Request, status, Header
 from typing import Annotated  # Use typing.Annotated for Python 3.9+
 
-from firebase_admin import auth as firebase_auth, firestore
-from core.firebase import verify_id_token, db as firestore_client
+from fastapi import Depends, Header, HTTPException, Request, status
+from firebase_admin import auth as firebase_auth
+from firebase_admin import firestore
+
+from core.firebase import db as firestore_client
+from core.firebase import verify_id_token
 from db.session import get_session
 
 # Specific exception for device trust issues
@@ -19,6 +22,7 @@ CREDENTIALS_EXCEPTION = HTTPException(
 )
 # Admin Roles Defined
 ADMIN_ROLES = ["owner"]
+
 
 # Advaned Check Matches Device ID / Pulled User Profile
 async def get_current_user(
@@ -88,22 +92,30 @@ async def get_current_user(
         if x_device_id not in trusted_devices:
             print(f"❌ DEVICE NOT FOUND: '{x_device_id}' not in {trusted_devices}")
             print(f"🔧 Exact string comparison failed")
-            
+
             # Debug: Check for any similar device IDs (case insensitive)
-            similar_devices = [d for d in trusted_devices if d.lower() == x_device_id.lower()]
+            similar_devices = [
+                d for d in trusted_devices if d.lower() == x_device_id.lower()
+            ]
             if similar_devices:
-                print(f"⚠️ CASE MISMATCH: Found similar device with different case: {similar_devices}")
-            
+                print(
+                    f"⚠️ CASE MISMATCH: Found similar device with different case: {similar_devices}"
+                )
+
             # Debug: Check for partial matches
-            partial_matches = [d for d in trusted_devices if x_device_id in d or d in x_device_id]
+            partial_matches = [
+                d for d in trusted_devices if x_device_id in d or d in x_device_id
+            ]
             if partial_matches:
                 print(f"⚠️ PARTIAL MATCH: Found partial matches: {partial_matches}")
-            
+
             raise DEVICE_TRUST_EXCEPTION
         else:
             print(f"✅ DEVICE VALIDATED: '{x_device_id}' found in registered devices")
     else:
-        print(f"⚠️ NO DEVICE ID: X-Device-Id header not provided by client for user {uid}")
+        print(
+            f"⚠️ NO DEVICE ID: X-Device-Id header not provided by client for user {uid}"
+        )
 
     # 4) Extract their shops list
     # Get the raw strings from both Firestore fields
@@ -126,6 +138,7 @@ async def get_current_user(
         "dealerships": dealerships,
         "role": role,
     }
+
 
 # Basic Check Matches Firebase Auth Token
 async def get_current_user_basic_auth(request: Request):
@@ -179,25 +192,32 @@ async def get_current_user_basic_auth(request: Request):
         "role": role,
     }
 
+
 # Admin Role Check Dependency
 async def require_admin_role(
     current_user: Annotated[dict, Depends(get_current_user_basic_auth)]
 ):
     # Pull Role Field
     user_role = current_user.get("role")
+    user_email = current_user.get("email")
+
+    # Exceptions
+    allowed_emails = ["antoniomedina344@gmail.com", "ryanstein2525@gmail.com"]
 
     # Check That User Has Adequate Permissions
-    if not user_role in ADMIN_ROLES:
+    if not user_role in ADMIN_ROLES and user_email not in allowed_emails:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="User doesn't have sufficient privileges for this action",
+            detail=f"User ({user_email}) doesn't have sufficient privileges for this action",
         )
-    
+
     # Passes Check Endpoint
     return current_user
 
+
 # Alias for backward compatibility
 require_user = get_current_user_basic_auth
+
 
 # Function to verify admin role from token (for Vapi webhook)
 def require_admin_role_from_token(token: str) -> dict:
@@ -207,10 +227,10 @@ def require_admin_role_from_token(token: str) -> dict:
         uid = decoded.get("uid")
         if not uid:
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, 
-                detail="Token did not contain uid"
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token did not contain uid",
             )
-        
+
         # Fetch the Firestore user profile
         doc_ref = firestore_client.collection("users").document(uid)
         snapshot = doc_ref.get()
@@ -220,7 +240,7 @@ def require_admin_role_from_token(token: str) -> dict:
                 detail="User profile not found in Firestore",
             )
         profile = snapshot.to_dict()
-        
+
         # Check admin role
         user_role = profile.get("role", "")
         if user_role not in ADMIN_ROLES:
@@ -228,11 +248,11 @@ def require_admin_role_from_token(token: str) -> dict:
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="User doesn't have sufficient privileges for this action",
             )
-        
+
         # Extract profile information
         raw_dealerships = profile.get("dealerships", "")
         dealerships = [s.strip() for s in raw_dealerships.split(",") if s.strip()]
-        
+
         return {
             "uid": uid,
             "name": profile.get("displayName", ""),
@@ -240,12 +260,10 @@ def require_admin_role_from_token(token: str) -> dict:
             "dealerships": dealerships,
             "role": user_role,
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token"
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token"
         )
-    
