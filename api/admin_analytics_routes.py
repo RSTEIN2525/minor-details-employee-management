@@ -463,37 +463,47 @@ async def is_employee_currently_active(
     Returns:
         Tuple[bool, Optional[datetime]]: (is_active, most_recent_clock_in_time)
     """
-    # Get the most recent clock entry for this employee
     # Look back a reasonable amount to handle cross-day shifts
     lookback_date = datetime.now(timezone.utc) - timedelta(days=3)
 
-    query = (
+    # STEP 1: Fetch the employee's single most recent clock entry across ALL dealerships.
+    most_recent_overall_clock = session.exec(
         select(TimeLog)
         .where(TimeLog.employee_id == employee_id)
         .where(TimeLog.timestamp >= lookback_date)
-    )
-
-    # Filter by dealership if provided
-    if dealership_id:
-        query = query.where(TimeLog.dealership_id == dealership_id)
-
-    most_recent_clock = session.exec(
-        query.order_by(TimeLog.timestamp.desc()).limit(1)
+        .order_by(TimeLog.timestamp.desc())
+        .limit(1)
     ).first()
 
-    if not most_recent_clock:
+    if not most_recent_overall_clock:
+        # No recent activity at all → definitely not active
         return False, None
 
-    # Ensure timestamp is timezone aware
-    ts = most_recent_clock.timestamp
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
+    # Ensure the timestamp is timezone-aware for safety
+    ts = (
+        most_recent_overall_clock.timestamp.replace(tzinfo=timezone.utc)
+        if most_recent_overall_clock.timestamp.tzinfo is None
+        else most_recent_overall_clock.timestamp
+    )
 
-    # Simple logic: if last action was CLOCK_IN, they're active
-    if most_recent_clock.punch_type == PunchType.CLOCK_IN:
+    # If the caller cares about a specific dealership we must ensure the MOST RECENT clock-in
+    # belongs to that dealership.  (An open shift at dealership A is implicitly closed by any
+    # clock action at dealership B.)
+    if dealership_id is not None:
+        if (
+            most_recent_overall_clock.punch_type == PunchType.CLOCK_IN
+            and most_recent_overall_clock.dealership_id == dealership_id
+        ):
+            return True, ts
+        # Otherwise the employee is either clocked out, or their open shift (if any)
+        # is at a different dealership.
+        return False, None
+
+    # No dealership filter → active if the very last punch was a CLOCK_IN
+    if most_recent_overall_clock.punch_type == PunchType.CLOCK_IN:
         return True, ts
-    else:
-        return False, None
+
+    return False, None
 
 
 async def calculate_vacation_hours(
@@ -3655,7 +3665,11 @@ async def get_basic_weekly_summary(
     # Get employee wage and name info from Firestore in one pass
     users_ref = (
         firestore_db.collection("users")
-        .where("role", "in", ["employee", "clockOnlyEmployee"])
+        .where(
+            "role",
+            "in",
+            ["employee", "clockOnlyEmployee", "serviceWash", "photos", "lotPrep"],
+        )
         .stream()
     )
     employee_wages: Dict[str, Dict[str, Any]] = {}
