@@ -33,6 +33,7 @@ from api import (
     admin_transaction_routes,
     admin_user_routes,
     admin_vacation_routes,
+    background_jobs_routes,
     device_routes,
     shop_routes,
     time_routes,
@@ -162,6 +163,11 @@ app.include_router(
     admin_scheduling_routes.router,
     prefix="/admin/scheduling",
     tags=["Admin", "Employee Scheduling"],
+)
+app.include_router(
+    background_jobs_routes.router,
+    prefix="/admin/jobs",
+    tags=["Admin", "Background Jobs"],
 )
 app.include_router(
     admin_signature_router,
