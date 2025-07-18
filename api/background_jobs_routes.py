@@ -28,12 +28,18 @@ job_store: Dict[str, JobStatus] = {}
 
 
 async def run_report_generation(
-    job_id: str, start_date: date, end_date: date, session: Session, admin_user: dict
+    job_id: str, start_date: date, end_date: date, admin_user_id: str
 ):
     """
     This function runs in the background to generate the report.
     """
     try:
+        # Create a fresh database session for the background task
+        session = next(get_session())
+
+        # Create a minimal admin user dict (we just need the ID for authorization)
+        admin_user = {"uid": admin_user_id}
+
         # This is the long-running task
         report_data = await get_all_dealerships_comprehensive_labor_spend_by_range(
             start_date=start_date,
@@ -41,8 +47,19 @@ async def run_report_generation(
             session=session,
             admin_user=admin_user,
         )
-        job_store[job_id] = JobStatus(status="complete", result=report_data)
+
+        # Convert the result to a serializable format
+        serialized_data = []
+        for daily_report in report_data:
+            serialized_data.append(daily_report.model_dump())
+
+        job_store[job_id] = JobStatus(status="complete", result=serialized_data)
+
+        # Close the session
+        session.close()
+
     except Exception as e:
+        print(f"Background job {job_id} failed: {str(e)}")
         job_store[job_id] = JobStatus(status="failed", error=str(e))
 
 
@@ -62,7 +79,7 @@ async def request_labor_spend_report(
 
     # Add the long-running task to the background
     background_tasks.add_task(
-        run_report_generation, job_id, start_date, end_date, session, admin_user
+        run_report_generation, job_id, start_date, end_date, admin_user["uid"]
     )
 
     return {"job_id": job_id}

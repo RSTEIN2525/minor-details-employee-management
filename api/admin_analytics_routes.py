@@ -7,7 +7,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_serializer
 from sqlmodel import Session, func, select
 
-from core.deps import get_current_user, require_admin_role
+from core.deps import (
+    get_current_user,
+    require_admin_or_supervisor_role,
+    require_admin_role,
+)
 from core.firebase import db as firestore_db
 from db.session import get_session
 from models.shop import Shop
@@ -1242,7 +1246,7 @@ async def get_active_employees_by_dealership(
 @router.get("/active/all", response_model=List[DealershipEmployeeStatus])
 async def get_all_active_employees(
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role),
+    admin_user: dict = Depends(require_admin_or_supervisor_role),
 ):
     print(f"\n--- Processing get_all_active_employees ---")
     """

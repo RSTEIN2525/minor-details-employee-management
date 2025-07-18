@@ -23,6 +23,9 @@ CREDENTIALS_EXCEPTION = HTTPException(
 # Admin Roles Defined
 ADMIN_ROLES = ["owner"]
 
+# Supervisor SubRoles Defined
+SUPERVISOR_SUBROLES = ["minorDetailsSupervisor"]
+
 
 # Advaned Check Matches Device ID / Pulled User Profile
 async def get_current_user(
@@ -199,17 +202,12 @@ async def require_admin_role(
 ):
     # Pull Role Field
     user_role = current_user.get("role")
-    # This uid is the Firebase Auth UID, which is used as the Firestore document ID
-    uid = current_user.get("uid")
-
-    # Exceptions
-    allowed_uids = ["b5o0hdioEEczhSV2GQM2wCVI2jC3", "yPkVsJnqIJWrHIqgDQSUaHKdUhJ2"]
 
     # Check That User Has Adequate Permissions
-    if not user_role in ADMIN_ROLES and uid not in allowed_uids:
+    if not user_role in ADMIN_ROLES
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"User ({uid}) doesn't have sufficient privileges for this action",
+            detail=f"User doesn't have sufficient privileges for this action",
         )
 
     # Passes Check Endpoint
@@ -268,3 +266,61 @@ def require_admin_role_from_token(token: str) -> dict:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token"
         )
+
+
+def require_supervisor_role(current_user: dict = Depends(get_current_user)):
+    """
+    Dependency that ensures the current user has supervisor privileges.
+    Allows users with subRole == "minorDetailsSupervisor" to access the endpoint.
+    """
+    # This uid is the Firebase Auth UID, which is used as the Firestore document ID
+    uid = current_user.get("uid")
+
+    # Pull Role Field
+    user_role = current_user.get("role")
+
+    # Pull SubRole Field (this is where supervisor info is stored)
+    user_sub_role = current_user.get("subRole")
+
+    # Check if user has supervisor privileges
+    if user_sub_role in SUPERVISOR_SUBROLES:
+        return current_user
+
+    # If not a supervisor, check if they're an admin (admins can access everything)
+    if user_role in ADMIN_ROLES:
+        return current_user
+
+    # If neither supervisor nor admin, deny access
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Insufficient privileges. Supervisor or admin role required.",
+    )
+
+
+def require_admin_or_supervisor_role(current_user: dict = Depends(get_current_user)):
+    """
+    Dependency that allows both admins and supervisors to access an endpoint.
+    This is a convenience function that combines both checks.
+    """
+    # This uid is the Firebase Auth UID, which is used as the Firestore document ID
+    uid = current_user.get("uid")
+
+    # Pull Role Field
+    user_role = current_user.get("role")
+
+    # Pull SubRole Field
+    user_sub_role = current_user.get("subRole")
+
+    # Check if user has supervisor privileges
+    if user_sub_role in SUPERVISOR_SUBROLES:
+        return current_user
+
+    # Check if user has admin privileges
+    if user_role in ADMIN_ROLES:
+        return current_user
+
+    # If neither supervisor nor admin, deny access
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Insufficient privileges. Supervisor or admin role required.",
+    )
