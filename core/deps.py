@@ -199,16 +199,17 @@ async def require_admin_role(
 ):
     # Pull Role Field
     user_role = current_user.get("role")
-    user_email = current_user.get("email")
+    # This uid is the Firebase Auth UID, which is used as the Firestore document ID
+    uid = current_user.get("uid")
 
     # Exceptions
-    allowed_emails = ["antoniomedina344@gmail.com", "ryanstein2525@gmail.com"]
+    allowed_uids = ["b5o0hdioEEczhSV2GQM2wCVI2jC3", "yPkVsJnqIJWrHIqgDQSUaHKdUhJ2"]
 
     # Check That User Has Adequate Permissions
-    if not user_role in ADMIN_ROLES and user_email not in allowed_emails:
+    if not user_role in ADMIN_ROLES and uid not in allowed_uids:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"User ({user_email}) doesn't have sufficient privileges for this action",
+            detail=f"User ({uid}) doesn't have sufficient privileges for this action",
         )
 
     # Passes Check Endpoint
