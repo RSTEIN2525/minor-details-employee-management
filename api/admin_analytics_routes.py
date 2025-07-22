@@ -276,6 +276,101 @@ class AllDealershipsComprehensiveLaborSpendResponse(BaseModel):
         return format_utc_datetime(dt)
 
 
+# Flexible Date Range Labor Spend Models
+class FlexibleDateRangeSummary(BaseModel):
+    """Date range summary for flexible labor spend analysis"""
+
+    # Date range info
+    start_date: str  # ISO date string
+    end_date: str  # ISO date string
+    analysis_timestamp: datetime
+
+    # Employee counts
+    total_employees: int = 0
+    active_employees_in_range: int = 0
+
+    # Labor costs for the date range
+    total_work_hours: float = 0.0
+    total_vacation_hours: float = 0.0
+    total_combined_hours: float = 0.0
+    total_work_cost: float = 0.0
+    total_vacation_cost: float = 0.0
+    total_labor_cost: float = 0.0  # work + vacation
+
+    # Time breakdown
+    total_regular_hours: float = 0.0
+    total_overtime_hours: float = 0.0
+    total_regular_cost: float = 0.0
+    total_overtime_cost: float = 0.0
+
+    # Rates and averages
+    average_hourly_wage: float = 0.0
+    weighted_average_hourly_rate: float = 0.0
+    cost_per_employee: float = 0.0
+    hours_per_employee: float = 0.0
+
+    @field_serializer("analysis_timestamp")
+    def serialize_analysis_timestamp(self, dt: datetime) -> str:
+        """Ensure timestamp is formatted as UTC with Z suffix"""
+        return format_utc_datetime(dt)
+
+
+class FlexibleEmployeeLaborDetail(BaseModel):
+    """Employee labor details for flexible date range analysis"""
+
+    employee_id: str
+    employee_name: Optional[str] = None
+    hourly_wage: Optional[float] = None
+
+    # Date range work
+    total_hours: float = 0.0
+    regular_hours: float = 0.0
+    overtime_hours: float = 0.0
+    labor_cost: float = 0.0
+    vacation_hours: float = 0.0
+    vacation_cost: float = 0.0
+    total_cost: float = 0.0  # work + vacation
+
+    # Clock activity in range
+    total_clock_ins: int = 0
+    first_clock_in: Optional[datetime] = None
+    last_clock_out: Optional[datetime] = None
+
+    @field_serializer("first_clock_in", "last_clock_out")
+    def serialize_timestamps(self, dt: Optional[datetime]) -> Optional[str]:
+        """Ensure timestamps are formatted as UTC with Z suffix"""
+        if dt is None:
+            return None
+        return format_utc_datetime(dt)
+
+
+class FlexibleDealershipLaborSpendResponse(BaseModel):
+    """Flexible dealership labor spend response for date range analysis"""
+
+    dealership_id: str
+    summary: FlexibleDateRangeSummary
+    employees: List[FlexibleEmployeeLaborDetail]
+    top_earners: List[FlexibleEmployeeLaborDetail]
+    most_hours: List[FlexibleEmployeeLaborDetail]
+
+
+class FlexibleLaborSpendResponse(BaseModel):
+    """Response model for flexible labor spend data with date range and dealership filtering"""
+
+    start_date: str  # ISO date string
+    end_date: str  # ISO date string
+    analysis_timestamp: datetime
+    dealership_ids: List[str]  # List of requested dealerships
+    total_company_labor_cost: float
+    total_company_employees: int
+    dealerships: List[FlexibleDealershipLaborSpendResponse]
+
+    @field_serializer("analysis_timestamp")
+    def serialize_analysis_timestamp(self, dt: datetime) -> str:
+        """Ensure analysis_timestamp is formatted as UTC with Z suffix"""
+        return format_utc_datetime(dt)
+
+
 # Quick Preview Labor Spend Models
 class QuickLaborPreview(BaseModel):
     dealership_id: str
@@ -2535,7 +2630,7 @@ async def get_comprehensive_labor_spend(
     dealership_id: str,
     target_date: Optional[date] = None,
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role),
+    admin_user: dict = Depends(require_admin_or_supervisor_role),
 ):
     """
     Get absolutely comprehensive labor spend information for a dealership.
@@ -3368,7 +3463,7 @@ async def get_labor_preview(
 )
 async def get_all_dealerships_labor_costs_today(
     session: Session = Depends(get_session),
-    admin_user: dict = Depends(require_admin_role),
+    admin_user: dict = Depends(require_admin_or_supervisor_role),
 ):
     """
     Get today's total labor costs for ALL dealerships.
@@ -4206,6 +4301,536 @@ async def get_all_dealerships_comprehensive_labor_spend(
     return AllDealershipsComprehensiveLaborSpendResponse(
         analysis_date=analysis_date.isoformat(),
         analysis_timestamp=now,
+        total_company_labor_cost=total_company_cost,
+        total_company_employees=total_company_employees,
+        dealerships=dealership_results,
+    )
+
+
+def calculate_date_range_overtime(
+    logs: List[TimeLog],
+    target_dealership_id: str,
+    start_date: date,
+    end_date: date,
+    current_time: datetime,
+) -> Tuple[float, float]:
+    """
+    Calculate regular and overtime hours for a date range, properly accounting for weekly context.
+
+    This function replicates the exact overtime logic from the original endpoints but across
+    a date range that may span multiple weeks.
+
+    Returns: (regular_hours, overtime_hours)
+    """
+    if not logs:
+        return 0.0, 0.0
+
+    # Filter logs for the target dealership and sort by timestamp
+    dealership_logs = [log for log in logs if log.dealership_id == target_dealership_id]
+    if not dealership_logs:
+        return 0.0, 0.0
+
+    sorted_logs = sorted(dealership_logs, key=lambda x: x.timestamp)
+
+    total_regular_hours = 0.0
+    total_overtime_hours = 0.0
+
+    # Process each week in the date range
+    current_date = start_date
+    while current_date <= end_date:
+        # Find the start of the week (Monday) for this date
+        week_start = current_date - timedelta(days=current_date.weekday())
+        week_end = week_start + timedelta(days=6)
+
+        # Get logs for this week
+        analysis_tz = ZoneInfo("America/New_York")
+        week_start_utc = datetime.combine(
+            week_start, datetime.min.time(), tzinfo=analysis_tz
+        ).astimezone(timezone.utc)
+        week_end_utc = datetime.combine(
+            week_end, datetime.max.time(), tzinfo=analysis_tz
+        ).astimezone(timezone.utc)
+
+        week_logs = []
+        for log in sorted_logs:
+            log_ts = log.timestamp
+            if log_ts.tzinfo is None:
+                log_ts = log_ts.replace(tzinfo=timezone.utc)
+            if week_start_utc <= log_ts <= week_end_utc:
+                week_logs.append(log)
+
+        if week_logs:
+            # Process this week day by day to calculate proper overtime allocation
+            week_regular, week_overtime = calculate_weekly_overtime_by_day(
+                week_logs,
+                target_dealership_id,
+                week_start,
+                week_end,
+                start_date,
+                end_date,
+                current_time,
+            )
+            total_regular_hours += week_regular
+            total_overtime_hours += week_overtime
+
+        # Move to next week
+        current_date = week_end + timedelta(days=1)
+
+    return total_regular_hours, total_overtime_hours
+
+
+def calculate_weekly_overtime_by_day(
+    week_logs: List[TimeLog],
+    target_dealership_id: str,
+    week_start: date,
+    week_end: date,
+    analysis_start_date: date,
+    analysis_end_date: date,
+    current_time: datetime,
+) -> Tuple[float, float]:
+    """
+    Calculate overtime for a single week, processing day by day to maintain proper weekly context.
+    This replicates the exact logic from the original endpoint.
+    """
+    week_regular_hours = 0.0
+    week_overtime_hours = 0.0
+    cumulative_week_hours = 0.0  # Track total hours worked so far this week
+
+    analysis_tz = ZoneInfo("America/New_York")
+
+    # Process each day of the week
+    for day_offset in range(7):
+        current_day = week_start + timedelta(days=day_offset)
+
+        # Skip days outside our analysis range
+        if current_day < analysis_start_date or current_day > analysis_end_date:
+            continue
+
+        # Get day boundaries in UTC
+        day_start_utc = datetime.combine(
+            current_day, datetime.min.time(), tzinfo=analysis_tz
+        ).astimezone(timezone.utc)
+        day_end_utc = datetime.combine(
+            current_day, datetime.max.time(), tzinfo=analysis_tz
+        ).astimezone(timezone.utc)
+
+        # Get logs for this specific day
+        day_logs = []
+        for log in week_logs:
+            log_ts = log.timestamp
+            if log_ts.tzinfo is None:
+                log_ts = log_ts.replace(tzinfo=timezone.utc)
+            if day_start_utc <= log_ts <= day_end_utc:
+                day_logs.append(log)
+
+        if day_logs:
+            # Calculate total hours for this day using the same function as original
+            day_total_hours = calculate_hours_by_dealership_from_logs(
+                day_logs, target_dealership_id, current_time
+            )
+
+            # Apply the EXACT same overtime allocation logic as the original endpoint
+            if cumulative_week_hours >= 40.0:
+                # All of this day's hours are overtime
+                day_regular_hours = 0.0
+                day_overtime_hours = day_total_hours
+            else:
+                # Some may be regular, some overtime
+                remaining_regular_hours = 40.0 - cumulative_week_hours
+                day_regular_hours = min(day_total_hours, remaining_regular_hours)
+                day_overtime_hours = max(0.0, day_total_hours - remaining_regular_hours)
+
+            # Add to weekly totals
+            week_regular_hours += day_regular_hours
+            week_overtime_hours += day_overtime_hours
+            cumulative_week_hours += day_total_hours
+
+    return week_regular_hours, week_overtime_hours
+
+
+@router.get(
+    "/flexible-labor-spend",
+    response_model=FlexibleLaborSpendResponse,
+)
+async def get_flexible_labor_spend(
+    start_date: date,
+    end_date: date,
+    dealership_ids: Optional[str] = None,  # Comma-separated dealership IDs
+    session: Session = Depends(get_session),
+    admin_user: dict = Depends(require_admin_role),
+):
+    """
+    Get comprehensive labor spend information for specified dealerships over a date range.
+
+    This endpoint maintains the EXACT same rigorous calculation methodology as the
+    all-dealerships endpoint but adds flexibility for:
+    - Custom date ranges (start_date to end_date inclusive)
+    - Selective dealership filtering (specify as many or as few as desired)
+
+    **MAINTAINS IDENTICAL RIGOROUS CALCULATIONS:**
+    - Same precise timezone handling (America/New_York to UTC)
+    - Same overtime calculation logic with 40-hour weekly thresholds
+    - Same vacation time integration
+    - Same dealership-specific hour allocation from time logs
+    - Same regular vs overtime breakdown with 1.5x overtime rate
+
+    Parameters:
+    - start_date: Start date of analysis range (YYYY-MM-DD format)
+    - end_date: End date of analysis range (YYYY-MM-DD format, inclusive)
+    - dealership_ids: Optional comma-separated list of dealership IDs to analyze.
+                     If not provided, analyzes ALL dealerships.
+
+    Returns:
+    - Comprehensive labor data for each requested dealership
+    - Company-wide totals for the date range
+    - All employee details per dealership with same precision as individual endpoints
+    - Exact same rigorous calculations as existing endpoints
+    """
+    print(f"\n=== Starting FLEXIBLE comprehensive labor spend analysis ===")
+    print(f"Date range: {start_date} to {end_date}")
+    print(f"Dealership filter: {dealership_ids or 'ALL dealerships'}")
+
+    # Current time
+    now = datetime.now(timezone.utc)
+
+    # Validate date range
+    if start_date > end_date:
+        raise HTTPException(status_code=400, detail="start_date must be <= end_date")
+
+    # Define timezone for consistent handling
+    analysis_tz = ZoneInfo("America/New_York")
+
+    # Convert date range to UTC boundaries (same logic as original endpoint)
+    start_of_range = datetime.combine(
+        start_date, datetime.min.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+    end_of_range = datetime.combine(
+        end_date, datetime.max.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+
+    print(f"Analysis period (UTC): {start_of_range} to {end_of_range}")
+
+    # Determine which dealerships to analyze
+    if dealership_ids:
+        # Parse comma-separated dealership IDs
+        requested_dealership_ids = [
+            id.strip() for id in dealership_ids.split(",") if id.strip()
+        ]
+        print(
+            f"Analyzing {len(requested_dealership_ids)} specific dealerships: {requested_dealership_ids}"
+        )
+    else:
+        # Get ALL dealerships (same as original endpoint)
+        dealerships_ref = firestore_db.collection("dealerships").stream()
+        requested_dealership_ids = [doc.id for doc in dealerships_ref]
+        print(f"Analyzing ALL {len(requested_dealership_ids)} dealerships")
+
+    # Get ALL employees from Firestore with their dealership assignments
+    # (EXACT same logic as original endpoint)
+    users_ref = (
+        firestore_db.collection("users")
+        .where("role", "in", ["employee", "clockOnlyEmployee"])
+        .stream()
+    )
+    all_employees_by_dealership = {}  # dealership_id -> {employee_id -> employee_data}
+    all_employee_ids = set()
+
+    for doc in users_ref:
+        user_data = doc.to_dict()
+        employee_id = doc.id
+
+        # Parse dealership assignments (IDENTICAL logic)
+        raw_dealerships = user_data.get("dealerships", "")
+        if isinstance(raw_dealerships, list):
+            employee_dealerships = [str(d).strip() for d in raw_dealerships]
+        else:
+            employee_dealerships = [
+                s.strip() for s in str(raw_dealerships).split(",") if s.strip()
+            ]
+
+        raw_tc_dealers = user_data.get("timeClockDealerships", "")
+        if isinstance(raw_tc_dealers, list):
+            time_clock_dealerships = [str(d).strip() for d in raw_tc_dealers]
+        else:
+            time_clock_dealerships = [
+                s.strip() for s in str(raw_tc_dealers).split(",") if s.strip()
+            ]
+
+        combined_dealerships = set(employee_dealerships) | set(time_clock_dealerships)
+
+        # Add employee to each dealership they're assigned to, but only if it's in our requested list
+        for dealership_id in combined_dealerships:
+            if dealership_id in requested_dealership_ids:
+                if dealership_id not in all_employees_by_dealership:
+                    all_employees_by_dealership[dealership_id] = {}
+
+                all_employees_by_dealership[dealership_id][employee_id] = {
+                    "name": user_data.get("displayName", "Unknown"),
+                    "hourly_wage": (
+                        float(user_data.get("hourlyWage", 0.0))
+                        if user_data.get("hourlyWage")
+                        else 0.0
+                    ),
+                }
+                all_employee_ids.add(employee_id)
+
+    print(
+        f"Found {len(all_employee_ids)} total unique employees across requested dealerships"
+    )
+
+    # Get ALL time logs for the date range for ALL employees (single query for efficiency)
+    # This is the KEY difference - we query the FULL date range instead of just today/this week
+    if all_employee_ids:
+        all_range_logs = session.exec(
+            select(TimeLog)
+            .where(TimeLog.employee_id.in_(list(all_employee_ids)))
+            .where(TimeLog.timestamp >= start_of_range)
+            .where(TimeLog.timestamp <= end_of_range)
+            .order_by(TimeLog.timestamp.asc())
+        ).all()
+
+        print(
+            f"Found {len(all_range_logs)} time logs in date range across all employees"
+        )
+    else:
+        all_range_logs = []
+
+    # Get ALL vacation time for the date range (single query)
+    all_vacation_range = session.exec(
+        select(VacationTime)
+        .where(VacationTime.date >= start_date)
+        .where(VacationTime.date <= end_date)
+    ).all()
+
+    print(f"Found {len(all_vacation_range)} vacation entries in date range")
+
+    # Process each dealership using THE SAME RIGOROUS CALCULATION LOGIC
+    dealership_results = []
+    total_company_cost = 0.0
+    total_company_employees = 0
+
+    for dealership_id in sorted(requested_dealership_ids):
+        try:
+            print(f"\n--- Processing dealership: {dealership_id} ---")
+
+            # Get employees for this dealership
+            dealership_employees = all_employees_by_dealership.get(dealership_id, {})
+
+            if not dealership_employees:
+                print(f"No employees assigned to {dealership_id}, skipping")
+                continue
+
+            employee_ids = list(dealership_employees.keys())
+            print(f"Found {len(employee_ids)} employees assigned to {dealership_id}")
+
+            # Filter logs for this dealership's employees
+            range_logs = [
+                log for log in all_range_logs if log.employee_id in employee_ids
+            ]
+
+            # Filter vacation for this dealership
+            vacation_range = [
+                v for v in all_vacation_range if v.dealership_id == dealership_id
+            ]
+
+            # Initialize summary for this dealership
+            summary = FlexibleDateRangeSummary(
+                start_date=start_date.isoformat(),
+                end_date=end_date.isoformat(),
+                analysis_timestamp=now,
+            )
+
+            employee_details = []
+            employees_who_worked_in_range = set()
+
+            # Process each employee for this dealership using IDENTICAL CALCULATION LOGIC
+            for employee_id, employee_data in dealership_employees.items():
+                try:
+                    employee_name = employee_data["name"]
+                    hourly_wage = employee_data["hourly_wage"]
+
+                    # Initialize employee detail
+                    detail = FlexibleEmployeeLaborDetail(
+                        employee_id=employee_id,
+                        employee_name=employee_name,
+                        hourly_wage=hourly_wage,
+                    )
+
+                    # Get employee's logs in the date range
+                    employee_range_logs = [
+                        log for log in range_logs if log.employee_id == employee_id
+                    ]
+
+                    if employee_range_logs:
+                        employees_who_worked_in_range.add(employee_id)
+
+                        # Count clock-ins and find first/last (same logic as original)
+                        clock_ins = [
+                            log
+                            for log in employee_range_logs
+                            if log.punch_type == PunchType.CLOCK_IN
+                        ]
+                        clock_outs = [
+                            log
+                            for log in employee_range_logs
+                            if log.punch_type == PunchType.CLOCK_OUT
+                        ]
+
+                        detail.total_clock_ins = len(clock_ins)
+                        if clock_ins:
+                            detail.first_clock_in = min(
+                                clock_ins, key=lambda x: x.timestamp
+                            ).timestamp
+                        if clock_outs:
+                            detail.last_clock_out = max(
+                                clock_outs, key=lambda x: x.timestamp
+                            ).timestamp
+
+                        # Calculate total hours using THE SAME RIGOROUS FUNCTION
+                        detail.total_hours = calculate_hours_by_dealership_from_logs(
+                            employee_range_logs, dealership_id, now
+                        )
+
+                        # Calculate regular and overtime hours using PROPER DATE RANGE LOGIC
+                        # This is the critical fix - we need to account for weekly overtime context across the date range
+                        detail.regular_hours, detail.overtime_hours = (
+                            calculate_date_range_overtime(
+                                employee_range_logs,
+                                dealership_id,
+                                start_date,
+                                end_date,
+                                now,
+                            )
+                        )
+
+                        # Calculate labor cost using SAME PRECISE FUNCTION
+                        detail.labor_cost = calculate_pay_with_overtime(
+                            detail.regular_hours,
+                            detail.overtime_hours,
+                            hourly_wage,
+                        )
+
+                        print(
+                            f"Employee {employee_id}: {detail.total_hours:.2f} total hrs, {detail.regular_hours:.2f} reg, {detail.overtime_hours:.2f} OT, ${detail.labor_cost:.2f} cost"
+                        )
+
+                    # Process vacation for the date range (SAME LOGIC)
+                    employee_vacation_range = [
+                        v for v in vacation_range if v.employee_id == employee_id
+                    ]
+                    if employee_vacation_range:
+                        detail.vacation_hours = sum(
+                            v.hours for v in employee_vacation_range
+                        )
+                        detail.vacation_cost = detail.vacation_hours * hourly_wage
+
+                    # Calculate total cost
+                    detail.total_cost = detail.labor_cost + detail.vacation_cost
+
+                    employee_details.append(detail)
+
+                    # Add to summary totals (SAME AGGREGATION LOGIC)
+                    summary.total_work_hours += detail.total_hours
+                    summary.total_vacation_hours += detail.vacation_hours
+                    summary.total_work_cost += detail.labor_cost
+                    summary.total_vacation_cost += detail.vacation_cost
+                    summary.total_regular_hours += detail.regular_hours
+                    summary.total_overtime_hours += detail.overtime_hours
+
+                except Exception as e:
+                    print(f"Error processing employee {employee_id}: {e}")
+                    continue
+
+            # Calculate summary metrics (SAME CALCULATION LOGIC)
+            summary.total_employees = len(dealership_employees)
+            summary.active_employees_in_range = len(employees_who_worked_in_range)
+            summary.total_combined_hours = (
+                summary.total_work_hours + summary.total_vacation_hours
+            )
+            summary.total_labor_cost = (
+                summary.total_work_cost + summary.total_vacation_cost
+            )
+
+            # Calculate costs and averages (IDENTICAL LOGIC)
+            total_regular_cost = 0.0
+            total_overtime_cost = 0.0
+            total_wages = 0.0
+            total_weighted_hours = 0.0
+
+            for detail in employee_details:
+                if detail.hourly_wage and detail.hourly_wage > 0:
+                    total_wages += detail.hourly_wage
+                    if detail.total_hours > 0:
+                        total_weighted_hours += detail.total_hours * detail.hourly_wage
+
+                    total_regular_cost += detail.regular_hours * detail.hourly_wage
+                    total_overtime_cost += (
+                        detail.overtime_hours * detail.hourly_wage * 1.5
+                    )
+
+            summary.total_regular_cost = total_regular_cost
+            summary.total_overtime_cost = total_overtime_cost
+
+            # Calculate averages (SAME LOGIC)
+            if summary.total_employees > 0:
+                summary.average_hourly_wage = total_wages / summary.total_employees
+                summary.cost_per_employee = (
+                    summary.total_labor_cost / summary.total_employees
+                )
+                summary.hours_per_employee = (
+                    summary.total_combined_hours / summary.total_employees
+                )
+
+            if summary.total_combined_hours > 0:
+                summary.weighted_average_hourly_rate = (
+                    total_weighted_hours / summary.total_combined_hours
+                )
+
+            # Sort employees and get insights (SAME LOGIC)
+            employee_details.sort(key=lambda x: x.employee_name or "")
+            top_earners = sorted(
+                employee_details, key=lambda x: x.total_cost, reverse=True
+            )[:5]
+            most_hours = sorted(
+                employee_details, key=lambda x: x.total_hours, reverse=True
+            )[:5]
+
+            # Create comprehensive response for this dealership
+            dealership_result = FlexibleDealershipLaborSpendResponse(
+                dealership_id=dealership_id,
+                summary=summary,
+                employees=employee_details,
+                top_earners=top_earners,
+                most_hours=most_hours,
+            )
+
+            dealership_results.append(dealership_result)
+            total_company_cost += summary.total_labor_cost
+            total_company_employees += summary.total_employees
+
+            print(
+                f"Completed {dealership_id}: {summary.total_employees} employees, ${summary.total_labor_cost:.2f} total cost"
+            )
+
+        except Exception as e:
+            print(f"ERROR processing dealership {dealership_id}: {e}")
+            import traceback
+
+            traceback.print_exc()
+            continue
+
+    # Sort dealerships by total cost (highest first) - SAME LOGIC
+    dealership_results.sort(key=lambda x: x.summary.total_labor_cost, reverse=True)
+
+    print(
+        f"\n=== Flexible analysis complete: {len(dealership_results)} dealerships, ${total_company_cost:.2f} total cost ==="
+    )
+
+    return FlexibleLaborSpendResponse(
+        start_date=start_date.isoformat(),
+        end_date=end_date.isoformat(),
+        analysis_timestamp=now,
+        dealership_ids=requested_dealership_ids,
         total_company_labor_cost=total_company_cost,
         total_company_employees=total_company_employees,
         dealerships=dealership_results,

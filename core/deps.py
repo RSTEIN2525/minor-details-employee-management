@@ -133,6 +133,7 @@ async def get_current_user(
     name = profile.get("displayName", "")
     email = profile.get("email", "")
     role = profile.get("role", "")
+    subRole = profile.get("subRole", "")
 
     return {
         "uid": uid,
@@ -140,6 +141,7 @@ async def get_current_user(
         "email": email,
         "dealerships": dealerships,
         "role": role,
+        "subRole": subRole,
     }
 
 
@@ -204,7 +206,7 @@ async def require_admin_role(
     user_role = current_user.get("role")
 
     # Check That User Has Adequate Permissions
-    if not user_role in ADMIN_ROLES
+    if not user_role in ADMIN_ROLES:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"User doesn't have sufficient privileges for this action",
@@ -310,6 +312,8 @@ def require_admin_or_supervisor_role(current_user: dict = Depends(get_current_us
 
     # Pull SubRole Field
     user_sub_role = current_user.get("subRole")
+
+    print(f"🔍 ADMIN OR SUPERVISOR ROLE CHECK: {user_role} {user_sub_role}")
 
     # Check if user has supervisor privileges
     if user_sub_role in SUPERVISOR_SUBROLES:
