@@ -3727,14 +3727,28 @@ class BasicEmployeeWeeklySummary(BaseModel):
     "/employees/basic-weekly-summary", response_model=List[BasicEmployeeWeeklySummary]
 )
 async def get_basic_weekly_summary(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
     session: Session = Depends(get_session),
     admin_user: dict = Depends(require_admin_role),
 ):
-    """Return a fast, lightweight weekly summary for ALL employees."""
+    """Return a fast, lightweight weekly summary for ALL employees.
+
+    Optional date range parameters (UTC):
+    - start_date: Start date for analysis (defaults to start of current week)
+    - end_date: End date for analysis (defaults to end of current week)
+    """
     now = datetime.now(timezone.utc)
-    today = now.date()
-    week_start = today - timedelta(days=today.weekday())
-    week_end = week_start + timedelta(days=6)
+
+    if start_date and end_date:
+        # Use provided date range (passed in UTC)
+        week_start = start_date
+        week_end = end_date
+    else:
+        # Use current week calculation (existing logic)
+        today = now.date()
+        week_start = today - timedelta(days=today.weekday())
+        week_end = week_start + timedelta(days=6)
 
     start_dt = datetime.combine(week_start, datetime.min.time()).replace(
         tzinfo=timezone.utc

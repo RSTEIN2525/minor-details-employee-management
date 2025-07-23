@@ -1072,3 +1072,185 @@ def admin_direct_clock_delete(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred while deleting clock entry: {str(e)}",
         )
+
+
+# --- Admin Stop Shift Models ---
+
+
+class AdminStopShiftRequestPayload(BaseModel):
+    employee_id: str
+    reason: str
+    dealership_id: Optional[str] = (
+        None  # Optional - if provided, only stop shift at this dealership
+    )
+
+
+class AdminStopShiftResponse(BaseModel):
+    success: bool
+    message: str
+    employee_id: str
+    dealership_id: Optional[str] = None
+    shift_end_time: Optional[str] = None  # UTC timestamp of when shift was ended
+    shift_duration_hours: Optional[float] = None  # How long the shift was
+    created_timelog_id: Optional[int] = None  # ID of the created CLOCK_OUT entry
+    reason: str
+    admin_id: str
+
+
+# --- Admin Stop Shift Endpoint ---
+
+
+@router.post("/stop-shift", response_model=AdminStopShiftResponse)
+async def admin_stop_employee_shift(
+    payload: AdminStopShiftRequestPayload,
+    session: Session = Depends(get_session),
+    admin: dict = Depends(require_admin_role),
+):
+    """
+    Admin endpoint to stop/end a specific employee's current shift.
+
+    This endpoint:
+    1. Checks if the employee is currently clocked in
+    2. Creates a CLOCK_OUT entry with current timestamp
+    3. Logs the admin action for audit trail
+    4. Returns details about the stopped shift
+
+    Parameters:
+    - employee_id: The ID of the employee whose shift to stop
+    - reason: Admin reason for stopping the shift (required for audit trail)
+    - dealership_id: Optional - if provided, only stops shift at this specific dealership
+
+    Returns:
+    - Success/failure status
+    - Details about the stopped shift
+    - Created CLOCK_OUT entry ID for reference
+    """
+    print(f"\n=== Admin Stop Shift Request ===")
+    print(f"Admin: {admin.get('uid', 'Unknown')}")
+    print(f"Employee: {payload.employee_id}")
+    print(f"Dealership filter: {payload.dealership_id or 'Any'}")
+    print(f"Reason: {payload.reason}")
+
+    admin_uid = admin.get("uid")
+    if not admin_uid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin user ID not found"
+        )
+
+    # Validate that reason is provided
+    if not payload.reason or payload.reason.strip() == "":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Reason is required for stopping an employee's shift",
+        )
+
+    try:
+        # Import here to avoid circular imports
+        from api.admin_analytics_routes import is_employee_currently_active
+
+        # Check if employee is currently active
+        is_active, most_recent_clock_in_ts = await is_employee_currently_active(
+            session, payload.employee_id, payload.dealership_id
+        )
+
+        if not is_active or not most_recent_clock_in_ts:
+            # Employee is not currently clocked in
+            dealership_msg = (
+                f" at dealership {payload.dealership_id}"
+                if payload.dealership_id
+                else ""
+            )
+            return AdminStopShiftResponse(
+                success=False,
+                message=f"Employee {payload.employee_id} is not currently clocked in{dealership_msg}",
+                employee_id=payload.employee_id,
+                dealership_id=payload.dealership_id,
+                reason=payload.reason,
+                admin_id=admin_uid,
+            )
+
+        # Get the dealership ID from the most recent clock-in if not specified
+        if not payload.dealership_id:
+            # Find the most recent clock-in to get the dealership
+            most_recent_clock_in = session.exec(
+                select(TimeLog)
+                .where(TimeLog.employee_id == payload.employee_id)
+                .where(TimeLog.punch_type == PunchType.CLOCK_IN)
+                .order_by(TimeLog.timestamp.desc())
+                .limit(1)
+            ).first()
+
+            if most_recent_clock_in:
+                active_dealership_id = most_recent_clock_in.dealership_id
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Could not determine active dealership for employee",
+                )
+        else:
+            active_dealership_id = payload.dealership_id
+
+        # Create current timestamp for clock-out
+        now = datetime.now(timezone.utc)
+
+        # Calculate shift duration
+        shift_duration_seconds = (now - most_recent_clock_in_ts).total_seconds()
+        shift_duration_hours = shift_duration_seconds / 3600
+
+        # Create CLOCK_OUT entry
+        clock_out_entry = TimeLog(
+            employee_id=payload.employee_id,
+            dealership_id=active_dealership_id,
+            punch_type=PunchType.CLOCK_OUT,
+            timestamp=now,
+            admin_notes=f"ADMIN STOP SHIFT: {payload.reason}",
+            admin_modifier_id=admin_uid,
+            # No latitude/longitude for admin actions
+        )
+
+        session.add(clock_out_entry)
+        session.flush()  # Get the ID without committing yet
+
+        # Log the admin action
+        admin_change = AdminTimeChange(
+            admin_id=admin_uid,
+            employee_id=payload.employee_id,
+            action=AdminTimeChangeAction.CREATE,  # We're creating a clock-out entry
+            reason=f"Admin stopped shift: {payload.reason}",
+            clock_out_id=clock_out_entry.id,
+            dealership_id=active_dealership_id,
+            end_time=now,
+            punch_date=now.date().isoformat(),
+        )
+
+        session.add(admin_change)
+        session.commit()
+        session.refresh(clock_out_entry)
+
+        print(f"✅ Successfully stopped shift for employee {payload.employee_id}")
+        print(f"   Dealership: {active_dealership_id}")
+        print(f"   Shift duration: {shift_duration_hours:.2f} hours")
+        print(f"   CLOCK_OUT ID: {clock_out_entry.id}")
+
+        return AdminStopShiftResponse(
+            success=True,
+            message=f"Successfully stopped shift for employee {payload.employee_id} at dealership {active_dealership_id}",
+            employee_id=payload.employee_id,
+            dealership_id=active_dealership_id,
+            shift_end_time=format_utc_datetime(now),
+            shift_duration_hours=round(shift_duration_hours, 2),
+            created_timelog_id=clock_out_entry.id,
+            reason=payload.reason,
+            admin_id=admin_uid,
+        )
+
+    except Exception as e:
+        session.rollback()
+        print(f"❌ Error during admin stop shift: {e}")
+        import traceback
+
+        print(f"Full traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred while stopping employee shift: {str(e)}",
+        )
