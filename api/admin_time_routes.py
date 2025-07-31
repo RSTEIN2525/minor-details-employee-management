@@ -1080,6 +1080,7 @@ def admin_direct_clock_delete(
 class AdminStopShiftRequestPayload(BaseModel):
     employee_id: str
     reason: str
+    stop_time: Optional[datetime] = None  # Optional: If not provided, defaults to now
     dealership_id: Optional[str] = (
         None  # Optional - if provided, only stop shift at this dealership
     )
@@ -1111,13 +1112,14 @@ async def admin_stop_employee_shift(
 
     This endpoint:
     1. Checks if the employee is currently clocked in
-    2. Creates a CLOCK_OUT entry with current timestamp
+    2. Creates a CLOCK_OUT entry with the timestamp provided, or the current time if not
     3. Logs the admin action for audit trail
     4. Returns details about the stopped shift
 
     Parameters:
     - employee_id: The ID of the employee whose shift to stop
     - reason: Admin reason for stopping the shift (required for audit trail)
+    - stop_time: Optional datetime to set as the clock-out time. Defaults to now.
     - dealership_id: Optional - if provided, only stops shift at this specific dealership
 
     Returns:
@@ -1129,6 +1131,7 @@ async def admin_stop_employee_shift(
     print(f"Admin: {admin.get('uid', 'Unknown')}")
     print(f"Employee: {payload.employee_id}")
     print(f"Dealership filter: {payload.dealership_id or 'Any'}")
+    print(f"Stop time: {payload.stop_time or 'Now'}")
     print(f"Reason: {payload.reason}")
 
     admin_uid = admin.get("uid")
@@ -1147,6 +1150,9 @@ async def admin_stop_employee_shift(
     try:
         # Import here to avoid circular imports
         from api.admin_analytics_routes import is_employee_currently_active
+
+        # Determine the time to use for stopping the shift
+        stop_time = payload.stop_time or datetime.now(timezone.utc)
 
         # Check if employee is currently active
         is_active, most_recent_clock_in_ts = await is_employee_currently_active(
@@ -1190,11 +1196,8 @@ async def admin_stop_employee_shift(
         else:
             active_dealership_id = payload.dealership_id
 
-        # Create current timestamp for clock-out
-        now = datetime.now(timezone.utc)
-
         # Calculate shift duration
-        shift_duration_seconds = (now - most_recent_clock_in_ts).total_seconds()
+        shift_duration_seconds = (stop_time - most_recent_clock_in_ts).total_seconds()
         shift_duration_hours = shift_duration_seconds / 3600
 
         # Create CLOCK_OUT entry
@@ -1202,7 +1205,7 @@ async def admin_stop_employee_shift(
             employee_id=payload.employee_id,
             dealership_id=active_dealership_id,
             punch_type=PunchType.CLOCK_OUT,
-            timestamp=now,
+            timestamp=stop_time,
             admin_notes=f"ADMIN STOP SHIFT: {payload.reason}",
             admin_modifier_id=admin_uid,
             # No latitude/longitude for admin actions
@@ -1219,8 +1222,8 @@ async def admin_stop_employee_shift(
             reason=f"Admin stopped shift: {payload.reason}",
             clock_out_id=clock_out_entry.id,
             dealership_id=active_dealership_id,
-            end_time=now,
-            punch_date=now.date().isoformat(),
+            end_time=stop_time,
+            punch_date=stop_time.date().isoformat(),
         )
 
         session.add(admin_change)
@@ -1237,7 +1240,7 @@ async def admin_stop_employee_shift(
             message=f"Successfully stopped shift for employee {payload.employee_id} at dealership {active_dealership_id}",
             employee_id=payload.employee_id,
             dealership_id=active_dealership_id,
-            shift_end_time=format_utc_datetime(now),
+            shift_end_time=format_utc_datetime(stop_time),
             shift_duration_hours=round(shift_duration_hours, 2),
             created_timelog_id=clock_out_entry.id,
             reason=payload.reason,

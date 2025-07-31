@@ -3720,6 +3720,7 @@ class BasicEmployeeWeeklySummary(BaseModel):
     weekly_regular_hours: float = 0.0
     weekly_overtime_hours: float = 0.0
     weekly_pay: float = 0.0
+    current_clock_in_duration_hours: float = 0.0
 
 
 # --- New Endpoint ---
@@ -3795,6 +3796,36 @@ async def get_basic_weekly_summary(
             ),
         }
 
+    # Batch query to get current active status for all employees
+    lookback_date = now - timedelta(days=3)
+    all_employee_ids = list(employee_wages.keys())
+
+    # Get most recent clock entries for all employees in one query
+    recent_clocks = session.exec(
+        select(TimeLog)
+        .where(TimeLog.employee_id.in_(all_employee_ids))
+        .where(TimeLog.timestamp >= lookback_date)
+        .order_by(TimeLog.timestamp.desc())
+    ).all()
+
+    # Group by employee_id and get the most recent entry for each
+    employee_active_status = {}
+    for clock in recent_clocks:
+        if clock.employee_id not in employee_active_status:
+            # Ensure timestamp is timezone-aware
+            ts = (
+                clock.timestamp.replace(tzinfo=timezone.utc)
+                if clock.timestamp.tzinfo is None
+                else clock.timestamp
+            )
+
+            # Employee is active if their most recent clock was a CLOCK_IN
+            is_active = clock.punch_type == PunchType.CLOCK_IN
+            employee_active_status[clock.employee_id] = (
+                is_active,
+                ts if is_active else None,
+            )
+
     summaries: List[BasicEmployeeWeeklySummary] = []
 
     for employee_id, info in employee_wages.items():
@@ -3807,6 +3838,19 @@ async def get_basic_weekly_summary(
             regular_hours, overtime_hours, info["hourly_wage"]
         )
 
+        # Calculate current clock-in duration
+        current_clock_in_duration = 0.0
+        is_active, shift_start_time = employee_active_status.get(
+            employee_id, (False, None)
+        )
+
+        if is_active and shift_start_time:
+            # Ensure shift_start_time is timezone-aware
+            if shift_start_time.tzinfo is None:
+                shift_start_time = shift_start_time.replace(tzinfo=timezone.utc)
+            duration_delta = now - shift_start_time
+            current_clock_in_duration = duration_delta.total_seconds() / 3600.0
+
         summaries.append(
             BasicEmployeeWeeklySummary(
                 employee_id=employee_id,
@@ -3816,6 +3860,7 @@ async def get_basic_weekly_summary(
                 weekly_regular_hours=round(regular_hours, 2),
                 weekly_overtime_hours=round(overtime_hours, 2),
                 weekly_pay=round(weekly_pay, 2),
+                current_clock_in_duration_hours=round(current_clock_in_duration, 2),
             )
         )
 
