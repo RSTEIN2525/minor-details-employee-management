@@ -3739,7 +3739,12 @@ async def get_basic_weekly_summary(
     - start_date: Start date for analysis (defaults to start of current week)
     - end_date: End date for analysis (defaults to end of current week)
     """
+    import time
+
+    start_time = time.time()
     now = datetime.now(timezone.utc)
+    print(f"[WEEKLY_SUMMARY] Starting basic weekly summary at {now}")
+    print(f"[WEEKLY_SUMMARY] Date range: {start_date} to {end_date}")
 
     if start_date and end_date:
         # Use provided date range (passed in UTC)
@@ -3758,13 +3763,24 @@ async def get_basic_weekly_summary(
         tzinfo=timezone.utc
     )
 
+    step_time = time.time()
+    print(
+        f"[WEEKLY_SUMMARY] Date calculation completed in {step_time - start_time:.2f}s"
+    )
+
     # Fetch all time logs for the current week once
+    print(f"[WEEKLY_SUMMARY] Fetching time logs from {start_dt} to {end_dt}")
     week_logs = session.exec(
         select(TimeLog)
         .where(TimeLog.timestamp >= start_dt)
         .where(TimeLog.timestamp <= end_dt)
         .order_by(TimeLog.timestamp.asc())
     ).all()
+
+    fetch_time = time.time()
+    print(
+        f"[WEEKLY_SUMMARY] Fetched {len(week_logs)} time logs in {fetch_time - step_time:.2f}s"
+    )
 
     # Ensure timestamps are tz-aware
     for log in week_logs:
@@ -3776,7 +3792,13 @@ async def get_basic_weekly_summary(
     for log in week_logs:
         employee_logs.setdefault(log.employee_id, []).append(log)
 
+    group_time = time.time()
+    print(
+        f"[WEEKLY_SUMMARY] Grouped logs by {len(employee_logs)} employees in {group_time - fetch_time:.2f}s"
+    )
+
     # Get employee wage and name info from Firestore in one pass
+    print(f"[WEEKLY_SUMMARY] Fetching employee data from Firestore...")
     users_ref = (
         firestore_db.collection("users")
         .where(
@@ -3796,39 +3818,81 @@ async def get_basic_weekly_summary(
             ),
         }
 
+    firestore_time = time.time()
+    print(
+        f"[WEEKLY_SUMMARY] Fetched {len(employee_wages)} employee records from Firestore in {firestore_time - group_time:.2f}s"
+    )
+
     # Batch query to get current active status for all employees
     lookback_date = now - timedelta(days=3)
     all_employee_ids = list(employee_wages.keys())
 
-    # Get most recent clock entries for all employees in one query
-    recent_clocks = session.exec(
-        select(TimeLog)
-        .where(TimeLog.employee_id.in_(all_employee_ids))
-        .where(TimeLog.timestamp >= lookback_date)
-        .order_by(TimeLog.timestamp.desc())
-    ).all()
+    print(
+        f"[WEEKLY_SUMMARY] Fetching active status for {len(all_employee_ids)} employees..."
+    )
 
-    # Group by employee_id and get the most recent entry for each
+    # OPTIMIZATION: Process in smaller batches to avoid overwhelming the database
+    # Instead of one massive query, break into manageable chunks
     employee_active_status = {}
-    for clock in recent_clocks:
-        if clock.employee_id not in employee_active_status:
-            # Ensure timestamp is timezone-aware
-            ts = (
-                clock.timestamp.replace(tzinfo=timezone.utc)
-                if clock.timestamp.tzinfo is None
-                else clock.timestamp
-            )
+    batch_size = 25
 
-            # Employee is active if their most recent clock was a CLOCK_IN
-            is_active = clock.punch_type == PunchType.CLOCK_IN
-            employee_active_status[clock.employee_id] = (
-                is_active,
-                ts if is_active else None,
-            )
+    for i in range(0, len(all_employee_ids), batch_size):
+        batch_ids = all_employee_ids[i : i + batch_size]
+        batch_num = i // batch_size + 1
+        total_batches = (len(all_employee_ids) + batch_size - 1) // batch_size
+        print(
+            f"[WEEKLY_SUMMARY] Processing batch {batch_num}/{total_batches} ({len(batch_ids)} employees)"
+        )
+
+        # Get recent clocks for this batch only - much smaller query
+        batch_clocks = session.exec(
+            select(TimeLog)
+            .where(TimeLog.employee_id.in_(batch_ids))
+            .where(TimeLog.timestamp >= lookback_date)
+            .order_by(TimeLog.timestamp.desc())
+        ).all()
+
+        print(
+            f"[WEEKLY_SUMMARY] Batch {batch_num} returned {len(batch_clocks)} clock entries"
+        )
+
+        # Process this batch
+        for clock in batch_clocks:
+            if clock.employee_id not in employee_active_status:
+                # Ensure timestamp is timezone-aware
+                ts = (
+                    clock.timestamp.replace(tzinfo=timezone.utc)
+                    if clock.timestamp.tzinfo is None
+                    else clock.timestamp
+                )
+
+                # Employee is active if their most recent clock was a CLOCK_IN
+                is_active = clock.punch_type == PunchType.CLOCK_IN
+                employee_active_status[clock.employee_id] = (
+                    is_active,
+                    ts if is_active else None,
+                )
+
+    active_fetch_time = time.time()
+    print(
+        f"[WEEKLY_SUMMARY] Completed active status processing for {len(employee_active_status)} employees in {active_fetch_time - firestore_time:.2f}s"
+    )
 
     summaries: List[BasicEmployeeWeeklySummary] = []
 
+    print(
+        f"[WEEKLY_SUMMARY] Processing {len(employee_wages)} employees for summary calculations..."
+    )
+    process_start = time.time()
+    processed_count = 0
+
     for employee_id, info in employee_wages.items():
+        processed_count += 1
+        if processed_count % 50 == 0:  # Log every 50 employees processed
+            current_time = time.time()
+            print(
+                f"[WEEKLY_SUMMARY] Processed {processed_count}/{len(employee_wages)} employees in {current_time - process_start:.2f}s"
+            )
         logs = employee_logs.get(employee_id, [])
         total_hours = calculate_hours_from_logs(logs, now)
         regular_hours, overtime_hours = calculate_regular_and_overtime_hours(
@@ -3866,6 +3930,14 @@ async def get_basic_weekly_summary(
 
     # Sort alphabetically for convenience
     summaries.sort(key=lambda x: x.employee_name or "")
+
+    final_time = time.time()
+    print(
+        f"[WEEKLY_SUMMARY] Employee processing completed in {final_time - process_start:.2f}s"
+    )
+    print(f"[WEEKLY_SUMMARY] Total execution time: {final_time - start_time:.2f}s")
+    print(f"[WEEKLY_SUMMARY] Returning {len(summaries)} employee summaries")
+
     return summaries
 
 

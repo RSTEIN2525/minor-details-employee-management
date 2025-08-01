@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, field_serializer
-from sqlmodel import Session, select
+from sqlmodel import Session, asc, col, desc, select
 
 from core.deps import get_current_user
 from core.firebase import db as firestore_db
@@ -324,12 +324,19 @@ async def get_current_shift_duration(
     # Pull UID
     user_id = current_user["uid"]
 
-    # Get Last Punch From DB
-    last_punch = session.exec(
-        select(TimeLog)
-        .where(TimeLog.employee_id == user_id)
-        .order_by(TimeLog.timestamp.desc())
-    ).first()
+    try:
+        # Get Last Punch From DB
+        last_punch = session.exec(
+            select(TimeLog)
+            .where(TimeLog.employee_id == user_id)
+            .order_by(desc(TimeLog.timestamp))
+        ).first()
+    except Exception as e:
+        print(f"Database error in get_current_shift_duration for user {user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database connection error: {str(e)}",
+        )
 
     # If They Haven't Previously Punched Or Last Punch was OUt
     if not last_punch or last_punch.punch_type == PunchType.CLOCK_OUT:
@@ -408,7 +415,7 @@ async def get_current_shift_earnings(
     current_shift_start_punch = session.exec(
         select(TimeLog)
         .where(TimeLog.employee_id == user_id)
-        .order_by(TimeLog.timestamp.desc())
+        .order_by(desc(TimeLog.timestamp))
     ).first()
 
     # Make Sure Clocked In Currently
@@ -473,7 +480,7 @@ async def get_current_shift_earnings(
         .where(
             TimeLog.timestamp < current_shift_start_time
         )  # Exclude current shift's start punch
-        .order_by(TimeLog.timestamp.asc())
+        .order_by(asc(TimeLog.timestamp))
     ).all()
 
     hours_this_week_before_current_shift = 0.0
@@ -552,7 +559,7 @@ async def get_weekly_hours(
         .where(TimeLog.employee_id == user_id)
         .where(TimeLog.timestamp >= start_of_week)
         .where(TimeLog.timestamp <= end_of_week)
-        .order_by(TimeLog.timestamp.asc())
+        .order_by(asc(TimeLog.timestamp))
     ).all()
 
     # Group punches by day to apply lunch break deduction per day
@@ -666,7 +673,7 @@ async def get_weekly_overtime_hours(
         .where(
             TimeLog.timestamp < end_of_week_boundary_for_query
         )  # Use < for end of day
-        .order_by(TimeLog.timestamp.asc())
+        .order_by(asc(TimeLog.timestamp))
     ).all()
 
     # Use the new centralized calculation logic
@@ -873,7 +880,7 @@ async def get_daily_work_hours_breakdown(
         .where(TimeLog.employee_id == user_id)
         .where(TimeLog.timestamp >= start_date_for_query)
         .where(TimeLog.timestamp <= now_utc)  # Up to current moment
-        .order_by(TimeLog.timestamp.asc())
+        .order_by(asc(TimeLog.timestamp))
     ).all()
 
     # Process punches into daily summaries
@@ -1118,7 +1125,7 @@ async def get_punch_history_past_three_weeks(
         .where(TimeLog.employee_id == user_id)
         .where(TimeLog.timestamp >= three_weeks_ago)
         .order_by(
-            TimeLog.timestamp.desc()
+            desc(TimeLog.timestamp)
         )  # Typically newest first is preferred for history
     ).all()
 
@@ -1160,7 +1167,7 @@ async def debug_user_info(
     recent_punches = session.exec(
         select(TimeLog)
         .where(TimeLog.employee_id == user_id)
-        .order_by(TimeLog.timestamp.desc())
+        .order_by(desc(TimeLog.timestamp))
         .limit(10)
     ).all()
 
@@ -1168,7 +1175,7 @@ async def debug_user_info(
     admin_created_punches = session.exec(
         select(TimeLog)
         .where(TimeLog.admin_modifier_id.is_not(None))
-        .order_by(TimeLog.timestamp.desc())
+        .order_by(desc(TimeLog.timestamp))
         .limit(10)
     ).all()
 
@@ -1277,7 +1284,7 @@ async def get_weekly_breakdown(
         .where(TimeLog.employee_id == user_id)
         .where(TimeLog.timestamp >= start_datetime_utc)
         .where(TimeLog.timestamp <= end_datetime_utc)
-        .order_by(TimeLog.timestamp.asc())
+        .order_by(asc(TimeLog.timestamp))
     ).all()
 
     # Use the new centralized calculation logic
@@ -1433,7 +1440,7 @@ async def get_daily_summary(
         .where(TimeLog.employee_id == user_id)
         .where(TimeLog.timestamp >= start_datetime_utc)
         .where(TimeLog.timestamp <= end_datetime_utc)
-        .order_by(TimeLog.timestamp.asc())
+        .order_by(asc(TimeLog.timestamp))
     ).all()
 
     total_seconds_worked_today = 0
@@ -1510,7 +1517,7 @@ async def debug_weekly_breakdown_punches(
         .where(TimeLog.employee_id == user_id)
         .where(TimeLog.timestamp >= start_datetime_utc)
         .where(TimeLog.timestamp <= end_datetime_utc)
-        .order_by(TimeLog.timestamp.asc())
+        .order_by(asc(TimeLog.timestamp))
     ).all()
 
     # Format punches for display
@@ -1641,7 +1648,7 @@ async def get_user_vacation_time(
         query = query.where(VacationTime.date <= end_date)
 
     # Execute query
-    vacation_entries = session.exec(query.order_by(VacationTime.date.desc())).all()
+    vacation_entries = session.exec(query.order_by(desc(VacationTime.date))).all()
 
     # Get user's hourly wage from Firebase
     user_profile_ref = firestore_db.collection("users").document(user_id)
@@ -1704,13 +1711,13 @@ async def get_upcoming_shifts(
             .where(EmployeeScheduledShift.employee_id == user_id)
             .where(EmployeeScheduledShift.shift_date >= today)
             .where(
-                EmployeeScheduledShift.status.in_(
+                col(EmployeeScheduledShift.status).in_(
                     [ShiftStatus.SCHEDULED, ShiftStatus.CONFIRMED]
                 )
             )
             .order_by(
-                EmployeeScheduledShift.shift_date.asc(),
-                EmployeeScheduledShift.start_time.asc(),
+                asc(EmployeeScheduledShift.shift_date),
+                asc(EmployeeScheduledShift.start_time),
             )
         )
 
