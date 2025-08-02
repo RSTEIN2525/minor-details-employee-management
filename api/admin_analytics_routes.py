@@ -4556,8 +4556,12 @@ def calculate_weekly_overtime_by_day(
 
         if day_logs:
             # Calculate total hours for this day using the same function as original
+            # Use the END OF DAY as the fallback "current_time" so that
+            # unfinished shifts are capped at midnight rather than the analysis
+            # execution time (which could wrongly add hours for historical days).
+            analysis_cutoff = min(day_end_utc, current_time)
             day_total_hours = calculate_hours_by_dealership_from_logs(
-                day_logs, target_dealership_id, current_time
+                day_logs, target_dealership_id, analysis_cutoff
             )
 
             # Apply the EXACT same overtime allocation logic as the original endpoint
