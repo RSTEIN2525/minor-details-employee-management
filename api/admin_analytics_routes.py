@@ -344,6 +344,60 @@ class FlexibleEmployeeLaborDetail(BaseModel):
         return format_utc_datetime(dt)
 
 
+class DailyLaborBreakdown(BaseModel):
+    """Daily labor breakdown for a specific date"""
+
+    date: str  # ISO date string (YYYY-MM-DD)
+    daily_labor_cost: float = 0.0
+    daily_regular_cost: float = 0.0
+    daily_overtime_cost: float = 0.0
+    daily_vacation_cost: float = 0.0
+    daily_total_cost: float = 0.0  # labor + vacation
+
+    daily_hours: float = 0.0
+    daily_regular_hours: float = 0.0
+    daily_overtime_hours: float = 0.0
+    daily_vacation_hours: float = 0.0
+    daily_total_hours: float = 0.0  # work + vacation
+
+    employees_worked: int = 0
+    employees_on_vacation: int = 0
+    total_employees_active: int = 0
+
+
+class FlexibleEmployeeDailyDetail(BaseModel):
+    """Daily hours and pay breakdown for an employee"""
+
+    date: str  # ISO date string (YYYY-MM-DD)
+    hours: float = 0.0
+    regular_hours: float = 0.0
+    overtime_hours: float = 0.0
+    vacation_hours: float = 0.0
+
+    pay: float = 0.0
+    regular_pay: float = 0.0
+    overtime_pay: float = 0.0
+    vacation_pay: float = 0.0
+    total_pay: float = 0.0  # work + vacation
+
+    clock_ins: int = 0
+    first_clock_in: Optional[datetime] = None
+    last_clock_out: Optional[datetime] = None
+
+    @field_serializer("first_clock_in", "last_clock_out")
+    def serialize_timestamps(self, dt: Optional[datetime]) -> Optional[str]:
+        """Ensure timestamps are formatted as UTC with Z suffix"""
+        if dt is None:
+            return None
+        return format_utc_datetime(dt)
+
+
+class FlexibleEmployeeLaborDetailWithDaily(FlexibleEmployeeLaborDetail):
+    """Extended employee labor details with daily breakdown"""
+
+    daily_breakdown: Optional[List[FlexibleEmployeeDailyDetail]] = None
+
+
 class FlexibleDealershipLaborSpendResponse(BaseModel):
     """Flexible dealership labor spend response for date range analysis"""
 
@@ -352,6 +406,7 @@ class FlexibleDealershipLaborSpendResponse(BaseModel):
     employees: List[FlexibleEmployeeLaborDetail]
     top_earners: List[FlexibleEmployeeLaborDetail]
     most_hours: List[FlexibleEmployeeLaborDetail]
+    daily_breakdown: Optional[List[DailyLaborBreakdown]] = None
 
 
 class FlexibleLaborSpendResponse(BaseModel):
@@ -4583,6 +4638,133 @@ def calculate_weekly_overtime_by_day(
     return week_regular_hours, week_overtime_hours
 
 
+def calculate_daily_breakdown(
+    all_range_logs: list[TimeLog],
+    all_vacation_range: list[VacationTime],
+    dealership_id: str,
+    dealership_employees: dict,
+    start_date: date,
+    end_date: date,
+    current_time: datetime,
+) -> List[DailyLaborBreakdown]:
+    """
+    Calculate day-by-day labor breakdown for a dealership over a date range.
+
+    Returns actual daily labor costs instead of averaged totals.
+    """
+    daily_breakdowns = []
+    analysis_tz = ZoneInfo("America/New_York")
+
+    # Process each day in the date range
+    current_date = start_date
+    while current_date <= end_date:
+        daily_breakdown = DailyLaborBreakdown(date=current_date.isoformat())
+
+        # Get day boundaries in UTC
+        day_start_utc = datetime.combine(
+            current_date, datetime.min.time(), tzinfo=analysis_tz
+        ).astimezone(timezone.utc)
+        day_end_utc = datetime.combine(
+            current_date, datetime.max.time(), tzinfo=analysis_tz
+        ).astimezone(timezone.utc)
+
+        # Filter logs for this specific day and dealership
+        day_logs = []
+        for log in all_range_logs:
+            if log.employee_id not in dealership_employees:
+                continue
+            log_ts = log.timestamp
+            if log_ts.tzinfo is None:
+                log_ts = log_ts.replace(tzinfo=timezone.utc)
+            if day_start_utc <= log_ts <= day_end_utc:
+                day_logs.append(log)
+
+        # Filter vacation for this day and dealership
+        day_vacation = [
+            v
+            for v in all_vacation_range
+            if v.dealership_id == dealership_id and v.date == current_date
+        ]
+
+        # Track employees who worked or took vacation this day
+        employees_worked_today = set()
+        employees_on_vacation_today = set()
+
+        # Process each employee for this day
+        for employee_id, employee_data in dealership_employees.items():
+            hourly_wage = employee_data["hourly_wage"]
+
+            # Get employee's logs for this day
+            employee_day_logs = [
+                log for log in day_logs if log.employee_id == employee_id
+            ]
+
+            if employee_day_logs:
+                employees_worked_today.add(employee_id)
+
+                # Calculate hours for this employee on this day
+                # Use day_end_utc as cutoff for historical days, current_time for today
+                analysis_cutoff = min(day_end_utc, current_time)
+                day_total_hours = calculate_hours_by_dealership_from_logs(
+                    employee_day_logs, dealership_id, analysis_cutoff
+                )
+
+                # Calculate regular/overtime for this single day
+                # For daily breakdown, we need to consider weekly context
+                day_regular_hours, day_overtime_hours = calculate_date_range_overtime(
+                    employee_day_logs,
+                    dealership_id,
+                    current_date,
+                    current_date,
+                    analysis_cutoff,
+                )
+
+                # Calculate costs
+                day_regular_cost = day_regular_hours * hourly_wage
+                day_overtime_cost = day_overtime_hours * hourly_wage * 1.5
+                day_labor_cost = day_regular_cost + day_overtime_cost
+
+                # Add to daily totals
+                daily_breakdown.daily_hours += day_total_hours
+                daily_breakdown.daily_regular_hours += day_regular_hours
+                daily_breakdown.daily_overtime_hours += day_overtime_hours
+                daily_breakdown.daily_regular_cost += day_regular_cost
+                daily_breakdown.daily_overtime_cost += day_overtime_cost
+                daily_breakdown.daily_labor_cost += day_labor_cost
+
+            # Check vacation for this employee on this day
+            employee_vacation = [
+                v for v in day_vacation if v.employee_id == employee_id
+            ]
+            if employee_vacation:
+                employees_on_vacation_today.add(employee_id)
+                vacation_hours = sum(v.hours for v in employee_vacation)
+                vacation_cost = vacation_hours * hourly_wage
+
+                daily_breakdown.daily_vacation_hours += vacation_hours
+                daily_breakdown.daily_vacation_cost += vacation_cost
+
+        # Set employee counts
+        daily_breakdown.employees_worked = len(employees_worked_today)
+        daily_breakdown.employees_on_vacation = len(employees_on_vacation_today)
+        daily_breakdown.total_employees_active = len(
+            employees_worked_today | employees_on_vacation_today
+        )
+
+        # Calculate totals
+        daily_breakdown.daily_total_hours = (
+            daily_breakdown.daily_hours + daily_breakdown.daily_vacation_hours
+        )
+        daily_breakdown.daily_total_cost = (
+            daily_breakdown.daily_labor_cost + daily_breakdown.daily_vacation_cost
+        )
+
+        daily_breakdowns.append(daily_breakdown)
+        current_date += timedelta(days=1)
+
+    return daily_breakdowns
+
+
 @router.get(
     "/flexible-labor-spend",
     response_model=FlexibleLaborSpendResponse,
@@ -4591,6 +4773,7 @@ async def get_flexible_labor_spend(
     start_date: date,
     end_date: date,
     dealership_ids: Optional[str] = None,  # Comma-separated dealership IDs
+    include_daily_breakdown: bool = False,  # Whether to include daily breakdown data
     session: Session = Depends(get_session),
     admin_user: dict = Depends(require_admin_role),
 ):
@@ -4614,16 +4797,20 @@ async def get_flexible_labor_spend(
     - end_date: End date of analysis range (YYYY-MM-DD format, inclusive)
     - dealership_ids: Optional comma-separated list of dealership IDs to analyze.
                      If not provided, analyzes ALL dealerships.
+    - include_daily_breakdown: Optional flag to include day-by-day labor cost breakdown.
+                              When true, returns actual daily labor costs instead of totals only.
 
     Returns:
     - Comprehensive labor data for each requested dealership
     - Company-wide totals for the date range
     - All employee details per dealership with same precision as individual endpoints
+    - Optional daily breakdown with real daily labor costs (when include_daily_breakdown=true)
     - Exact same rigorous calculations as existing endpoints
     """
     print(f"\n=== Starting FLEXIBLE comprehensive labor spend analysis ===")
     print(f"Date range: {start_date} to {end_date}")
     print(f"Dealership filter: {dealership_ids or 'ALL dealerships'}")
+    print(f"Daily breakdown: {'ENABLED' if include_daily_breakdown else 'DISABLED'}")
 
     # Current time
     now = datetime.now(timezone.utc)
@@ -4930,6 +5117,21 @@ async def get_flexible_labor_spend(
                 employee_details, key=lambda x: x.total_hours, reverse=True
             )[:5]
 
+            # Calculate daily breakdown if requested
+            daily_breakdown = None
+            if include_daily_breakdown:
+                print(f"Calculating daily breakdown for {dealership_id}...")
+                daily_breakdown = calculate_daily_breakdown(
+                    list(all_range_logs),
+                    list(all_vacation_range),
+                    dealership_id,
+                    dealership_employees,
+                    start_date,
+                    end_date,
+                    now,
+                )
+                print(f"Generated {len(daily_breakdown)} daily breakdown entries")
+
             # Create comprehensive response for this dealership
             dealership_result = FlexibleDealershipLaborSpendResponse(
                 dealership_id=dealership_id,
@@ -4937,6 +5139,7 @@ async def get_flexible_labor_spend(
                 employees=employee_details,
                 top_earners=top_earners,
                 most_hours=most_hours,
+                daily_breakdown=daily_breakdown,
             )
 
             dealership_results.append(dealership_result)
