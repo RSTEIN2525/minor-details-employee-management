@@ -59,10 +59,8 @@ from api.shop_routes import router as shop_router
 from api.time_routes import router as time_router
 from api.user_dashboard_routes import router as user_dashboard_router
 from api.vapi_handler import router as vapi_router
-from api.admin_maintenance_routes import router as admin_maintenance_router
 from core.deps import get_session
 from db.session import engine
-from services.shift_guard import run_auto_stop_long_shifts_loop
 
 # Configure logging
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)  # Add this line
@@ -95,7 +93,6 @@ print(f"🌐 CORS: Allowing origins: {allowed_origins_list}")
 async def lifespan(app: FastAPI):
     print("INFO:     Waiting for application startup.")
     SQLModel.metadata.create_all(engine, checkfirst=True)
-    # No background processing; manual-trigger endpoints only
     yield
     print("INFO:     Shutting down application.")
 
@@ -161,11 +158,6 @@ app.include_router(
     admin_financial_router,
     prefix="/admin/financial",
     tags=["Admin", "Financial Analytics"],
-)
-app.include_router(
-    admin_maintenance_router,
-    prefix="/admin/maintenance",
-    tags=["Admin", "Maintenance"],
 )
 app.include_router(
     admin_scheduling_routes.router,
