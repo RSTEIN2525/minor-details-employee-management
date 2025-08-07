@@ -1,6 +1,8 @@
 import logging  # Add this import
 import os
 from contextlib import asynccontextmanager
+import contextlib
+import asyncio
 
 import firebase_admin
 from dotenv import load_dotenv
@@ -61,6 +63,7 @@ from api.user_dashboard_routes import router as user_dashboard_router
 from api.vapi_handler import router as vapi_router
 from core.deps import get_session
 from db.session import engine
+from services.shift_guard import run_auto_stop_long_shifts_loop
 
 # Configure logging
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)  # Add this line
@@ -93,8 +96,17 @@ print(f"🌐 CORS: Allowing origins: {allowed_origins_list}")
 async def lifespan(app: FastAPI):
     print("INFO:     Waiting for application startup.")
     SQLModel.metadata.create_all(engine, checkfirst=True)
+    # Start background task: auto stop overly long shifts
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(run_auto_stop_long_shifts_loop())
     yield
     print("INFO:     Shutting down application.")
+    try:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    except Exception:
+        pass
 
 
 # Starts Fast API Up; Init

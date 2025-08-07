@@ -24,8 +24,7 @@ CREDENTIALS_EXCEPTION = HTTPException(
 ADMIN_ROLES = ["owner"]
 
 # Supervisor SubRoles Defined
-SUPERVISOR_SUBROLES = ["minorDetailsSupervisor"]
-
+SUPERVISOR_SUBROLES = ["minorDetailsSupervisor", "minorDetailsManager"]
 
 # Advaned Check Matches Device ID / Pulled User Profile
 async def get_current_user(

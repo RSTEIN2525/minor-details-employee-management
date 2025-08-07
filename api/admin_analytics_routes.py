@@ -131,6 +131,18 @@ class EmployeeDetailResponse(BaseModel):
     todays_summary: TodaysSummary
     two_week_total_pay: float
 
+    # Aggregated totals for the entire requested date range
+    date_range_total_hours: Optional[float] = None
+    date_range_regular_hours: Optional[float] = None
+    date_range_overtime_hours: Optional[float] = None
+    date_range_total_pay: Optional[float] = None
+
+    # Aggregated totals for the entire requested date range
+    date_range_total_hours: Optional[float] = None
+    date_range_regular_hours: Optional[float] = None
+    date_range_overtime_hours: Optional[float] = None
+    date_range_total_pay: Optional[float] = None
+
 
 # New model for dealership employee hours breakdown
 class EmployeeHoursBreakdown(BaseModel):
@@ -1718,6 +1730,41 @@ async def get_employee_details(
     # Calculate total pay for both weeks
     two_week_total_pay = prev_week_pay + current_week_pay
 
+    # ------------------------------------------------------------
+    # NEW: Aggregated totals for the entire requested date range
+    # ------------------------------------------------------------
+    range_total_hours = 0.0
+    range_regular_hours = 0.0
+    range_overtime_hours = 0.0
+    range_total_pay = 0.0
+
+    # Group recent clock entries by the ISO week they belong to and compute
+    week_logs_map: Dict[date, List[TimeLog]] = {}
+    for clock in recent_clocks:
+        ts = clock.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        week_start_date = ts.date() - timedelta(days=ts.date().weekday())
+        week_logs_map.setdefault(week_start_date, []).append(clock)
+
+    for week_start_date, week_logs in week_logs_map.items():
+        week_end_dt = datetime.combine(
+            week_start_date + timedelta(days=6), datetime.max.time(), tzinfo=timezone.utc
+        )
+        week_hours = calculate_hours_from_logs_with_daily_breaks(week_logs, week_end_dt)
+        week_regular, week_overtime = calculate_regular_and_overtime_hours(week_hours)
+        week_pay = calculate_pay_with_overtime(week_regular, week_overtime, hourly_wage)
+
+        range_total_hours += week_hours
+        range_regular_hours += week_regular
+        range_overtime_hours += week_overtime
+        range_total_pay += week_pay
+
+    range_total_hours = round(range_total_hours, 2)
+    range_regular_hours = round(range_regular_hours, 2)
+    range_overtime_hours = round(range_overtime_hours, 2)
+    range_total_pay = round(range_total_pay, 2)
+
     return EmployeeDetailResponse(
         employee_id=employee_id,
         employee_name=employee_name,
@@ -1734,6 +1781,10 @@ async def get_employee_details(
             is_currently_clocked_in=is_currently_clocked_in,
         ),
         two_week_total_pay=round(two_week_total_pay, 2),
+        date_range_total_hours=range_total_hours,
+        date_range_regular_hours=range_regular_hours,
+        date_range_overtime_hours=range_overtime_hours,
+        date_range_total_pay=range_total_pay,
     )
 
 
