@@ -1,8 +1,6 @@
 import logging  # Add this import
 import os
 from contextlib import asynccontextmanager
-import contextlib
-import asyncio
 
 import firebase_admin
 from dotenv import load_dotenv
@@ -61,6 +59,7 @@ from api.shop_routes import router as shop_router
 from api.time_routes import router as time_router
 from api.user_dashboard_routes import router as user_dashboard_router
 from api.vapi_handler import router as vapi_router
+from api.admin_maintenance_routes import router as admin_maintenance_router
 from core.deps import get_session
 from db.session import engine
 from services.shift_guard import run_auto_stop_long_shifts_loop
@@ -96,17 +95,9 @@ print(f"🌐 CORS: Allowing origins: {allowed_origins_list}")
 async def lifespan(app: FastAPI):
     print("INFO:     Waiting for application startup.")
     SQLModel.metadata.create_all(engine, checkfirst=True)
-    # Start background task: auto stop overly long shifts
-    stop_event = asyncio.Event()
-    task = asyncio.create_task(run_auto_stop_long_shifts_loop())
+    # No background processing; manual-trigger endpoints only
     yield
     print("INFO:     Shutting down application.")
-    try:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-    except Exception:
-        pass
 
 
 # Starts Fast API Up; Init
@@ -170,6 +161,11 @@ app.include_router(
     admin_financial_router,
     prefix="/admin/financial",
     tags=["Admin", "Financial Analytics"],
+)
+app.include_router(
+    admin_maintenance_router,
+    prefix="/admin/maintenance",
+    tags=["Admin", "Maintenance"],
 )
 app.include_router(
     admin_scheduling_routes.router,
