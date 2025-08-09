@@ -137,12 +137,6 @@ class EmployeeDetailResponse(BaseModel):
     date_range_overtime_hours: Optional[float] = None
     date_range_total_pay: Optional[float] = None
 
-    # Aggregated totals for the entire requested date range
-    date_range_total_hours: Optional[float] = None
-    date_range_regular_hours: Optional[float] = None
-    date_range_overtime_hours: Optional[float] = None
-    date_range_total_pay: Optional[float] = None
-
 
 # New model for dealership employee hours breakdown
 class EmployeeHoursBreakdown(BaseModel):
@@ -356,27 +350,6 @@ class FlexibleEmployeeLaborDetail(BaseModel):
         return format_utc_datetime(dt)
 
 
-class DailyLaborBreakdown(BaseModel):
-    """Daily labor breakdown for a specific date"""
-
-    date: str  # ISO date string (YYYY-MM-DD)
-    daily_labor_cost: float = 0.0
-    daily_regular_cost: float = 0.0
-    daily_overtime_cost: float = 0.0
-    daily_vacation_cost: float = 0.0
-    daily_total_cost: float = 0.0  # labor + vacation
-
-    daily_hours: float = 0.0
-    daily_regular_hours: float = 0.0
-    daily_overtime_hours: float = 0.0
-    daily_vacation_hours: float = 0.0
-    daily_total_hours: float = 0.0  # work + vacation
-
-    employees_worked: int = 0
-    employees_on_vacation: int = 0
-    total_employees_active: int = 0
-
-
 class FlexibleEmployeeDailyDetail(BaseModel):
     """Daily hours and pay breakdown for an employee"""
 
@@ -407,7 +380,7 @@ class FlexibleEmployeeDailyDetail(BaseModel):
 class FlexibleEmployeeLaborDetailWithDaily(FlexibleEmployeeLaborDetail):
     """Extended employee labor details with daily breakdown"""
 
-    daily_breakdown: Optional[List[FlexibleEmployeeDailyDetail]] = None
+    daily_breakdown: Optional[List["DailyLaborBreakdown"]] = None
 
 
 class FlexibleDealershipLaborSpendResponse(BaseModel):
@@ -418,7 +391,7 @@ class FlexibleDealershipLaborSpendResponse(BaseModel):
     employees: List[FlexibleEmployeeLaborDetail]
     top_earners: List[FlexibleEmployeeLaborDetail]
     most_hours: List[FlexibleEmployeeLaborDetail]
-    daily_breakdown: Optional[List[DailyLaborBreakdown]] = None
+    daily_breakdown: Optional[List["DailyLaborBreakdown"]] = None
 
 
 class FlexibleLaborSpendResponse(BaseModel):
@@ -1749,7 +1722,9 @@ async def get_employee_details(
 
     for week_start_date, week_logs in week_logs_map.items():
         week_end_dt = datetime.combine(
-            week_start_date + timedelta(days=6), datetime.max.time(), tzinfo=timezone.utc
+            week_start_date + timedelta(days=6),
+            datetime.max.time(),
+            tzinfo=timezone.utc,
         )
         week_hours = calculate_hours_from_logs_with_daily_breaks(week_logs, week_end_dt)
         week_regular, week_overtime = calculate_regular_and_overtime_hours(week_hours)
@@ -1997,6 +1972,49 @@ async def get_employee_details_by_date_range(
     # Calculate total pay for both weeks
     two_week_total_pay = prev_week_pay + current_week_pay
 
+    # ------------------------------------------------------------
+    # Aggregated totals for the entire user-supplied date range
+    # ------------------------------------------------------------
+    range_total_hours = 0.0
+    range_regular_hours = 0.0
+    range_overtime_hours = 0.0
+    range_total_pay = 0.0
+
+    # Group the recent clock entries (already filtered by date range) by ISO week
+    from collections import defaultdict
+
+    week_logs_map: Dict[date, List[TimeLog]] = defaultdict(list)
+    for clock in recent_clocks:
+        ts = clock.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        week_start_date = ts.date() - timedelta(days=ts.date().weekday())
+        week_logs_map[week_start_date].append(clock)
+
+    # Compute hours / pay for each partial week in the range
+    for week_start_date, week_logs in week_logs_map.items():
+        week_end_dt = datetime.combine(
+            week_start_date + timedelta(days=6),
+            datetime.max.time(),
+            tzinfo=timezone.utc,
+        )
+
+        week_hours = calculate_hours_from_logs_with_daily_breaks(week_logs, week_end_dt)
+        week_regular, week_overtime = calculate_regular_and_overtime_hours(week_hours)
+        week_pay = calculate_pay_with_overtime(week_regular, week_overtime, hourly_wage)
+
+        range_total_hours += week_hours
+        range_regular_hours += week_regular
+        range_overtime_hours += week_overtime
+        range_total_pay += week_pay
+
+    # Round to 2-decimal precision for response
+    range_total_hours = round(range_total_hours, 2)
+    range_regular_hours = round(range_regular_hours, 2)
+    range_overtime_hours = round(range_overtime_hours, 2)
+    range_total_pay = round(range_total_pay, 2)
+
     return EmployeeDetailResponse(
         employee_id=employee_id,
         employee_name=employee_name,
@@ -2013,6 +2031,10 @@ async def get_employee_details_by_date_range(
             is_currently_clocked_in=is_currently_clocked_in,
         ),
         two_week_total_pay=round(two_week_total_pay, 2),
+        date_range_total_hours=range_total_hours,
+        date_range_regular_hours=range_regular_hours,
+        date_range_overtime_hours=range_overtime_hours,
+        date_range_total_pay=range_total_pay,
     )
 
 
@@ -4697,7 +4719,7 @@ def calculate_daily_breakdown(
     start_date: date,
     end_date: date,
     current_time: datetime,
-) -> List[DailyLaborBreakdown]:
+) -> List["DailyLaborBreakdown"]:
     """
     Calculate day-by-day labor breakdown for a dealership over a date range.
 
@@ -5560,3 +5582,33 @@ async def get_all_dealerships_comprehensive_labor_spend_by_range(
         current_date += timedelta(days=1)
 
     return daily_reports
+
+
+# ---------------------------------------------------------------------------
+# DailyLaborBreakdown – per-dealership aggregate used in flexible labor views
+# ---------------------------------------------------------------------------
+
+
+class DailyLaborBreakdown(BaseModel):
+    """Aggregated labor metrics for a single dealership day."""
+
+    date: str  # YYYY-MM-DD
+
+    # Hours
+    daily_hours: float = 0.0
+    daily_regular_hours: float = 0.0
+    daily_overtime_hours: float = 0.0
+    daily_vacation_hours: float = 0.0
+    daily_total_hours: float = 0.0
+
+    # Costs
+    daily_regular_cost: float = 0.0
+    daily_overtime_cost: float = 0.0
+    daily_labor_cost: float = 0.0  # regular + overtime
+    daily_vacation_cost: float = 0.0
+    daily_total_cost: float = 0.0  # labor + vacation
+
+    # Employee counts
+    employees_worked: int = 0
+    employees_on_vacation: int = 0
+    total_employees_active: int = 0
