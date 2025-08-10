@@ -2984,7 +2984,7 @@ async def get_comprehensive_labor_spend(
                 ).total_seconds() / 3600
                 employees_currently_active.add(employee_id)
 
-            # First, calculate hours worked this week BEFORE today
+            # Calculate hours worked this week BEFORE today for overtime context
             employee_week_logs = [
                 log for log in week_logs if log.employee_id == employee_id
             ]
@@ -2995,8 +2995,9 @@ async def get_comprehensive_labor_spend(
                     log_ts = log_ts.replace(tzinfo=timezone.utc)
                 if log_ts < start_of_analysis_day:
                     week_logs_before_today.append(log)
-            hours_worked_before_today = calculate_hours_by_dealership_from_logs(
-                week_logs_before_today, dealership_id, start_of_analysis_day
+            # SIMPLIFIED: Use standard calculation (no overnight complexity)
+            hours_worked_before_today = calculate_hours_from_logs(
+                week_logs_before_today, start_of_analysis_day
             )
 
             # Process today's time logs for this employee
@@ -3029,24 +3030,11 @@ async def get_comprehensive_labor_spend(
                         clock_outs, key=lambda x: x.timestamp
                     ).timestamp
 
-                # Calculate today's total hours
-                # Special handling: if the employee is currently active and their shift started before today,
-                # we need to calculate how many hours they've worked TODAY from their ongoing shift
-                if (
-                    detail.is_currently_active
-                    and detail.current_shift_start_time
-                    and detail.current_shift_start_time < start_of_analysis_day
-                ):
-                    # Employee has been clocked in since before today - calculate hours worked today only
-                    hours_since_start_of_today = (
-                        now - start_of_analysis_day
-                    ).total_seconds() / 3600
-                    detail.todays_total_hours = hours_since_start_of_today
-                else:
-                    # Standard calculation for shifts that started today
-                    detail.todays_total_hours = calculate_hours_by_dealership_from_logs(
-                        employee_today_logs, dealership_id, now
-                    )
+                # Calculate today's total hours - SIMPLIFIED (no overnight shifts)
+                # All shifts start and end within the day, so use standard calculation
+                detail.todays_total_hours = calculate_hours_by_dealership_from_logs(
+                    employee_today_logs, dealership_id, now
+                )
 
                 # Correctly allocate today's hours into regular and overtime based on weekly context
                 # If employee has already worked 40+ hours this week, all of today's hours are overtime
@@ -3069,7 +3057,7 @@ async def get_comprehensive_labor_spend(
                     hourly_wage,
                 )
 
-            # Process this week's time logs for this employee
+            # Process this week's time logs for this employee - SIMPLIFIED
             employee_week_logs = [
                 log for log in week_logs if log.employee_id == employee_id
             ]
@@ -3111,8 +3099,8 @@ async def get_comprehensive_labor_spend(
             summary.todays_regular_hours += detail.todays_regular_hours
             summary.todays_overtime_hours += detail.todays_overtime_hours
 
-            # --- Weekly Calculations ---
-            # First, calculate totals for the individual employee detail (across all dealerships)
+            # --- Weekly Calculations - SIMPLIFIED ---
+            # Calculate totals for the individual employee detail (across all dealerships)
             employee_week_logs = [
                 log for log in week_logs if log.employee_id == employee_id
             ]
@@ -3130,7 +3118,7 @@ async def get_comprehensive_labor_spend(
                     hourly_wage,
                 )
 
-            # Second, calculate the dealership-specific breakdown for the main summary
+            # Calculate the dealership-specific breakdown for the main summary
             dealership_weekly_breakdown = calculate_dealership_weekly_breakdown(
                 employee_week_logs, dealership_id, hourly_wage, now
             )
@@ -3426,6 +3414,82 @@ def calculate_hours_by_dealership_from_logs(
         raw_hours = (current_time - clock_in_ts).total_seconds() / 3600
         paid_hours = apply_unpaid_break(raw_hours)
         dealership_hours += paid_hours
+
+    return dealership_hours
+
+
+def calculate_hours_by_dealership_from_logs_with_range(
+    logs: List[TimeLog],
+    target_dealership_id: str,
+    current_time: datetime,
+    range_start: datetime,
+    range_end: datetime,
+) -> float:
+    """
+    Calculates total paid hours for a specific dealership from a list of time logs,
+    but only counts hours that fall within the specified date range.
+
+    This handles overnight shifts correctly by:
+    1. Using extended logs to detect shift boundaries
+    2. Only counting the portion of hours that fall within the target range
+    """
+    if not logs:
+        return 0.0
+
+    sorted_logs = sorted(logs, key=lambda x: x.timestamp)
+
+    dealership_hours = 0.0
+    clock_in_log: Optional[TimeLog] = None
+
+    for log in sorted_logs:
+        log_ts = log.timestamp
+        if log_ts.tzinfo is None:
+            log_ts = log_ts.replace(tzinfo=timezone.utc)
+
+        is_clock_in = log.punch_type == PunchType.CLOCK_IN
+        is_clock_out = log.punch_type == PunchType.CLOCK_OUT
+
+        if clock_in_log:
+            # A shift is currently open. This new log might close it.
+            if is_clock_out or is_clock_in:
+                # Only calculate hours if the OPEN shift belongs to the target dealership.
+                if clock_in_log.dealership_id == target_dealership_id:
+                    clock_in_ts = clock_in_log.timestamp
+                    if clock_in_ts.tzinfo is None:
+                        clock_in_ts = clock_in_ts.replace(tzinfo=timezone.utc)
+
+                    # Calculate the intersection of the shift with the target range
+                    shift_start = max(clock_in_ts, range_start)  # Start of intersection
+                    shift_end = min(log_ts, range_end)  # End of intersection
+
+                    # Only count hours if there's an actual intersection
+                    if shift_start < shift_end:
+                        raw_hours = (shift_end - shift_start).total_seconds() / 3600
+                        paid_hours = apply_unpaid_break(raw_hours)
+                        dealership_hours += paid_hours
+
+                # If this log is a clock_in, it starts the next shift. Otherwise, no shift is open.
+                clock_in_log = log if is_clock_in else None
+
+        elif is_clock_in:
+            # No shift was open, so this log starts a new one.
+            clock_in_log = log
+
+    # After the loop, check if a shift is still open.
+    if clock_in_log and clock_in_log.dealership_id == target_dealership_id:
+        clock_in_ts = clock_in_log.timestamp
+        if clock_in_ts.tzinfo is None:
+            clock_in_ts = clock_in_ts.replace(tzinfo=timezone.utc)
+
+        # Calculate the intersection of the open shift with the target range
+        shift_start = max(clock_in_ts, range_start)
+        shift_end = min(current_time, range_end)
+
+        # Only count hours if there's an actual intersection
+        if shift_start < shift_end:
+            raw_hours = (shift_end - shift_start).total_seconds() / 3600
+            paid_hours = apply_unpaid_break(raw_hours)
+            dealership_hours += paid_hours
 
     return dealership_hours
 
@@ -4638,6 +4702,76 @@ def calculate_date_range_overtime(
     return total_regular_hours, total_overtime_hours
 
 
+def calculate_date_range_overtime_with_weekly_context(
+    all_employee_logs: List[TimeLog],
+    target_dealership_id: str,
+    start_date: date,
+    end_date: date,
+    current_time: datetime,
+    range_start: datetime,
+    range_end: datetime,
+) -> Tuple[float, float]:
+    """
+    Calculate regular and overtime hours for a specific dealership within a date range,
+    but consider the employee's work at ALL dealerships for proper weekly overtime context.
+
+    This is the key fix: we need to know how many hours the employee worked at ALL
+    dealerships to properly calculate when the 40-hour weekly threshold is crossed.
+    """
+    if not all_employee_logs:
+        return 0.0, 0.0
+
+    sorted_logs = sorted(all_employee_logs, key=lambda x: x.timestamp)
+
+    total_regular_hours = 0.0
+    total_overtime_hours = 0.0
+
+    # Process each week in the date range
+    current_date = start_date
+    while current_date <= end_date:
+        # Find the start of the week (Monday) for this date
+        week_start = current_date - timedelta(days=current_date.weekday())
+        week_end = week_start + timedelta(days=6)
+
+        # Get ALL logs for this employee for this week (across all dealerships)
+        analysis_tz = ZoneInfo("America/New_York")
+        week_start_utc = datetime.combine(
+            week_start, datetime.min.time(), tzinfo=analysis_tz
+        ).astimezone(timezone.utc)
+        week_end_utc = datetime.combine(
+            week_end, datetime.max.time(), tzinfo=analysis_tz
+        ).astimezone(timezone.utc)
+
+        week_logs = []
+        for log in sorted_logs:
+            log_ts = log.timestamp
+            if log_ts.tzinfo is None:
+                log_ts = log_ts.replace(tzinfo=timezone.utc)
+            if week_start_utc <= log_ts <= week_end_utc:
+                week_logs.append(log)
+
+        if week_logs:
+            # Calculate weekly overtime with proper context
+            week_regular, week_overtime = calculate_weekly_overtime_by_day_with_context(
+                week_logs,
+                target_dealership_id,
+                week_start,
+                week_end,
+                start_date,
+                end_date,
+                current_time,
+                range_start,
+                range_end,
+            )
+            total_regular_hours += week_regular
+            total_overtime_hours += week_overtime
+
+        # Move to next week
+        current_date = week_end + timedelta(days=1)
+
+    return total_regular_hours, total_overtime_hours
+
+
 def calculate_weekly_overtime_by_day(
     week_logs: List[TimeLog],
     target_dealership_id: str,
@@ -4684,10 +4818,14 @@ def calculate_weekly_overtime_by_day(
 
         if day_logs:
             # Calculate total hours for this day using the same function as original
-            # Use the END OF DAY as the fallback "current_time" so that
-            # unfinished shifts are capped at midnight rather than the analysis
-            # execution time (which could wrongly add hours for historical days).
-            analysis_cutoff = min(day_end_utc, current_time)
+            # CRITICAL FIX: Use proper cutoff time based on whether this is historical or current
+            # For historical days, cap at end of day. For current day, use current_time.
+            if current_day < datetime.now(ZoneInfo("America/New_York")).date():
+                analysis_cutoff = day_end_utc  # Historical day - cap at midnight
+            else:
+                analysis_cutoff = min(
+                    day_end_utc, current_time
+                )  # Current day - use actual time
             day_total_hours = calculate_hours_by_dealership_from_logs(
                 day_logs, target_dealership_id, analysis_cutoff
             )
@@ -4707,6 +4845,116 @@ def calculate_weekly_overtime_by_day(
             week_regular_hours += day_regular_hours
             week_overtime_hours += day_overtime_hours
             cumulative_week_hours += day_total_hours
+
+    return week_regular_hours, week_overtime_hours
+
+
+def calculate_weekly_overtime_by_day_with_context(
+    week_logs: List[TimeLog],
+    target_dealership_id: str,
+    week_start: date,
+    week_end: date,
+    analysis_start_date: date,
+    analysis_end_date: date,
+    current_time: datetime,
+    range_start: datetime,
+    range_end: datetime,
+) -> Tuple[float, float]:
+    """
+    Calculate overtime for a single week with proper cross-dealership context.
+    This considers ALL dealerships when tracking weekly hours for overtime threshold.
+    """
+    week_regular_hours = 0.0
+    week_overtime_hours = 0.0
+    cumulative_week_hours = 0.0  # Track total hours across ALL dealerships
+
+    analysis_tz = ZoneInfo("America/New_York")
+
+    # Process each day of the week
+    for day_offset in range(7):
+        current_day = week_start + timedelta(days=day_offset)
+
+        # Skip days outside our analysis range
+        if current_day < analysis_start_date or current_day > analysis_end_date:
+            # But we still need to count hours for weekly context even outside analysis range
+            if week_start <= current_day <= week_end:
+                day_start_utc = datetime.combine(
+                    current_day, datetime.min.time(), tzinfo=analysis_tz
+                ).astimezone(timezone.utc)
+                day_end_utc = datetime.combine(
+                    current_day, datetime.max.time(), tzinfo=analysis_tz
+                ).astimezone(timezone.utc)
+
+                day_logs = []
+                for log in week_logs:
+                    log_ts = log.timestamp
+                    if log_ts.tzinfo is None:
+                        log_ts = log_ts.replace(tzinfo=timezone.utc)
+                    if day_start_utc <= log_ts <= day_end_utc:
+                        day_logs.append(log)
+
+                if day_logs:
+                    # Calculate total hours for this day across ALL dealerships for weekly context
+                    day_total_hours = calculate_hours_from_logs(day_logs, day_end_utc)
+                    cumulative_week_hours += day_total_hours
+            continue
+
+        # Get day boundaries in UTC
+        day_start_utc = datetime.combine(
+            current_day, datetime.min.time(), tzinfo=analysis_tz
+        ).astimezone(timezone.utc)
+        day_end_utc = datetime.combine(
+            current_day, datetime.max.time(), tzinfo=analysis_tz
+        ).astimezone(timezone.utc)
+
+        # Get logs for this specific day
+        day_logs = []
+        for log in week_logs:
+            log_ts = log.timestamp
+            if log_ts.tzinfo is None:
+                log_ts = log_ts.replace(tzinfo=timezone.utc)
+            if day_start_utc <= log_ts <= day_end_utc:
+                day_logs.append(log)
+
+        if day_logs:
+            # Calculate total hours for this day across ALL dealerships
+            analysis_cutoff = min(day_end_utc, current_time)
+            day_total_hours_all_dealerships = calculate_hours_from_logs(
+                day_logs, analysis_cutoff
+            )
+
+            # Calculate hours for target dealership only (for the return values)
+            day_total_hours_target_dealership = (
+                calculate_hours_by_dealership_from_logs_with_range(
+                    day_logs,
+                    target_dealership_id,
+                    analysis_cutoff,
+                    range_start,
+                    range_end,
+                )
+            )
+
+            # Apply overtime logic based on weekly context across ALL dealerships
+            if cumulative_week_hours >= 40.0:
+                # All of this day's hours (for target dealership) are overtime
+                day_regular_hours = 0.0
+                day_overtime_hours = day_total_hours_target_dealership
+            else:
+                # Some may be regular, some overtime
+                remaining_regular_hours = 40.0 - cumulative_week_hours
+                day_regular_hours = min(
+                    day_total_hours_target_dealership, remaining_regular_hours
+                )
+                day_overtime_hours = max(
+                    0.0, day_total_hours_target_dealership - remaining_regular_hours
+                )
+
+            # Add to weekly totals (target dealership only)
+            week_regular_hours += day_regular_hours
+            week_overtime_hours += day_overtime_hours
+
+            # Update cumulative hours with ALL dealerships for proper weekly context
+            cumulative_week_hours += day_total_hours_all_dealerships
 
     return week_regular_hours, week_overtime_hours
 
@@ -4776,8 +5024,13 @@ def calculate_daily_breakdown(
                 employees_worked_today.add(employee_id)
 
                 # Calculate hours for this employee on this day
-                # Use day_end_utc as cutoff for historical days, current_time for today
-                analysis_cutoff = min(day_end_utc, current_time)
+                # CRITICAL FIX: Use proper cutoff for historical vs current days
+                if current_date < datetime.now(ZoneInfo("America/New_York")).date():
+                    analysis_cutoff = day_end_utc  # Historical day - cap at midnight
+                else:
+                    analysis_cutoff = min(
+                        day_end_utc, current_time
+                    )  # Current day - use actual time
                 day_total_hours = calculate_hours_by_dealership_from_logs(
                     employee_day_logs, dealership_id, analysis_cutoff
                 )
@@ -4895,7 +5148,7 @@ async def get_flexible_labor_spend(
     # Define timezone for consistent handling
     analysis_tz = ZoneInfo("America/New_York")
 
-    # Convert date range to UTC boundaries (same logic as original endpoint)
+    # Convert date range to UTC boundaries - SIMPLIFIED for single-day shifts only
     start_of_range = datetime.combine(
         start_date, datetime.min.time(), tzinfo=analysis_tz
     ).astimezone(timezone.utc)
@@ -4973,14 +5226,24 @@ async def get_flexible_labor_spend(
         f"Found {len(all_employee_ids)} total unique employees across requested dealerships"
     )
 
-    # Get ALL time logs for the date range for ALL employees (single query for efficiency)
-    # This is the KEY difference - we query the FULL date range instead of just today/this week
+    # Get ALL time logs for the WEEK containing the date range (needed for overtime calculation)
+    # We need weekly context to properly calculate overtime
+    week_start = start_date - timedelta(days=start_date.weekday())
+    week_end = week_start + timedelta(days=6)
+
+    week_start_utc = datetime.combine(
+        week_start, datetime.min.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+    week_end_utc = datetime.combine(
+        week_end, datetime.max.time(), tzinfo=analysis_tz
+    ).astimezone(timezone.utc)
+
     if all_employee_ids:
         all_range_logs = session.exec(
             select(TimeLog)
             .where(TimeLog.employee_id.in_(list(all_employee_ids)))
-            .where(TimeLog.timestamp >= start_of_range)
-            .where(TimeLog.timestamp <= end_of_range)
+            .where(TimeLog.timestamp >= week_start_utc)  # Query full week for context
+            .where(TimeLog.timestamp <= week_end_utc)
             .order_by(TimeLog.timestamp.asc())
         ).all()
 
@@ -5051,9 +5314,18 @@ async def get_flexible_labor_spend(
                         hourly_wage=hourly_wage,
                     )
 
-                    # Get employee's logs in the date range
+                    # Get employee's logs in the TARGET date range (for hour calculation)
                     employee_range_logs = [
-                        log for log in range_logs if log.employee_id == employee_id
+                        log
+                        for log in range_logs
+                        if log.employee_id == employee_id
+                        and start_of_range
+                        <= (
+                            log.timestamp
+                            if log.timestamp.tzinfo
+                            else log.timestamp.replace(tzinfo=timezone.utc)
+                        )
+                        <= end_of_range
                     ]
 
                     if employee_range_logs:
@@ -5081,22 +5353,55 @@ async def get_flexible_labor_spend(
                                 clock_outs, key=lambda x: x.timestamp
                             ).timestamp
 
-                        # Calculate total hours using THE SAME RIGOROUS FUNCTION
+                        # Calculate total hours using SIMPLIFIED APPROACH
+                        # Since all shifts are within the day, use standard calculation
+                        analysis_cutoff = (
+                            now
+                            if end_date >= datetime.now(analysis_tz).date()
+                            else end_of_range
+                        )
                         detail.total_hours = calculate_hours_by_dealership_from_logs(
-                            employee_range_logs, dealership_id, now
+                            employee_range_logs, dealership_id, analysis_cutoff
                         )
 
-                        # Calculate regular and overtime hours using PROPER DATE RANGE LOGIC
-                        # This is the critical fix - we need to account for weekly overtime context across the date range
-                        detail.regular_hours, detail.overtime_hours = (
-                            calculate_date_range_overtime(
-                                employee_range_logs,
-                                dealership_id,
-                                start_date,
-                                end_date,
-                                now,
+                        # Calculate regular and overtime hours using SAME LOGIC AS COMPREHENSIVE
+                        # Need to consider weekly context across ALL dealerships
+
+                        # Get ALL logs for this employee for the week (across all dealerships)
+                        # We already queried the full week, so just filter by employee
+                        all_employee_week_logs = [
+                            log
+                            for log in all_range_logs
+                            if log.employee_id == employee_id
+                        ]
+
+                        # Calculate hours worked before target date for weekly context
+                        week_logs_before_target = []
+                        for log in all_employee_week_logs:
+                            log_ts = (
+                                log.timestamp
+                                if log.timestamp.tzinfo
+                                else log.timestamp.replace(tzinfo=timezone.utc)
                             )
+                            if log_ts < start_of_range:
+                                week_logs_before_target.append(log)
+
+                        hours_worked_before_target = calculate_hours_from_logs(
+                            week_logs_before_target, start_of_range
                         )
+
+                        # Apply same overtime logic as comprehensive endpoint
+                        if hours_worked_before_target >= 40.0:
+                            detail.regular_hours = 0.0
+                            detail.overtime_hours = detail.total_hours
+                        else:
+                            remaining_regular_hours = 40.0 - hours_worked_before_target
+                            detail.regular_hours = min(
+                                detail.total_hours, remaining_regular_hours
+                            )
+                            detail.overtime_hours = max(
+                                0.0, detail.total_hours - remaining_regular_hours
+                            )
 
                         # Calculate labor cost using SAME PRECISE FUNCTION
                         detail.labor_cost = calculate_pay_with_overtime(
@@ -5194,6 +5499,12 @@ async def get_flexible_labor_spend(
             daily_breakdown = None
             if include_daily_breakdown:
                 print(f"Calculating daily breakdown for {dealership_id}...")
+                # SIMPLIFIED: Use standard daily breakdown calculation
+                analysis_cutoff = (
+                    now
+                    if end_date >= datetime.now(analysis_tz).date()
+                    else end_of_range
+                )
                 daily_breakdown = calculate_daily_breakdown(
                     list(all_range_logs),
                     list(all_vacation_range),
@@ -5201,7 +5512,7 @@ async def get_flexible_labor_spend(
                     dealership_employees,
                     start_date,
                     end_date,
-                    now,
+                    analysis_cutoff,
                 )
                 print(f"Generated {len(daily_breakdown)} daily breakdown entries")
 
