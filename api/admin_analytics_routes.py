@@ -3912,7 +3912,6 @@ class BasicEmployeeWeeklySummary(BaseModel):
     weekly_regular_hours: float = 0.0
     weekly_overtime_hours: float = 0.0
     weekly_pay: float = 0.0
-    current_clock_in_duration_hours: float = 0.0
 
 
 # --- New Endpoint ---
@@ -4015,60 +4014,7 @@ async def get_basic_weekly_summary(
         f"[WEEKLY_SUMMARY] Fetched {len(employee_wages)} employee records from Firestore in {firestore_time - group_time:.2f}s"
     )
 
-    # Batch query to get current active status for all employees
-    lookback_date = now - timedelta(days=3)
-    all_employee_ids = list(employee_wages.keys())
-
-    print(
-        f"[WEEKLY_SUMMARY] Fetching active status for {len(all_employee_ids)} employees..."
-    )
-
-    # OPTIMIZATION: Process in smaller batches to avoid overwhelming the database
-    # Instead of one massive query, break into manageable chunks
-    employee_active_status = {}
-    batch_size = 25
-
-    for i in range(0, len(all_employee_ids), batch_size):
-        batch_ids = all_employee_ids[i : i + batch_size]
-        batch_num = i // batch_size + 1
-        total_batches = (len(all_employee_ids) + batch_size - 1) // batch_size
-        print(
-            f"[WEEKLY_SUMMARY] Processing batch {batch_num}/{total_batches} ({len(batch_ids)} employees)"
-        )
-
-        # Get recent clocks for this batch only - much smaller query
-        batch_clocks = session.exec(
-            select(TimeLog)
-            .where(TimeLog.employee_id.in_(batch_ids))
-            .where(TimeLog.timestamp >= lookback_date)
-            .order_by(TimeLog.timestamp.desc())
-        ).all()
-
-        print(
-            f"[WEEKLY_SUMMARY] Batch {batch_num} returned {len(batch_clocks)} clock entries"
-        )
-
-        # Process this batch
-        for clock in batch_clocks:
-            if clock.employee_id not in employee_active_status:
-                # Ensure timestamp is timezone-aware
-                ts = (
-                    clock.timestamp.replace(tzinfo=timezone.utc)
-                    if clock.timestamp.tzinfo is None
-                    else clock.timestamp
-                )
-
-                # Employee is active if their most recent clock was a CLOCK_IN
-                is_active = clock.punch_type == PunchType.CLOCK_IN
-                employee_active_status[clock.employee_id] = (
-                    is_active,
-                    ts if is_active else None,
-                )
-
-    active_fetch_time = time.time()
-    print(
-        f"[WEEKLY_SUMMARY] Completed active status processing for {len(employee_active_status)} employees in {active_fetch_time - firestore_time:.2f}s"
-    )
+    # Skipping active status and current duration calculation for speed
 
     summaries: List[BasicEmployeeWeeklySummary] = []
 
@@ -4094,19 +4040,6 @@ async def get_basic_weekly_summary(
             regular_hours, overtime_hours, info["hourly_wage"]
         )
 
-        # Calculate current clock-in duration
-        current_clock_in_duration = 0.0
-        is_active, shift_start_time = employee_active_status.get(
-            employee_id, (False, None)
-        )
-
-        if is_active and shift_start_time:
-            # Ensure shift_start_time is timezone-aware
-            if shift_start_time.tzinfo is None:
-                shift_start_time = shift_start_time.replace(tzinfo=timezone.utc)
-            duration_delta = now - shift_start_time
-            current_clock_in_duration = duration_delta.total_seconds() / 3600.0
-
         summaries.append(
             BasicEmployeeWeeklySummary(
                 employee_id=employee_id,
@@ -4116,7 +4049,6 @@ async def get_basic_weekly_summary(
                 weekly_regular_hours=round(regular_hours, 2),
                 weekly_overtime_hours=round(overtime_hours, 2),
                 weekly_pay=round(weekly_pay, 2),
-                current_clock_in_duration_hours=round(current_clock_in_duration, 2),
             )
         )
 
@@ -4131,6 +4063,139 @@ async def get_basic_weekly_summary(
     print(f"[WEEKLY_SUMMARY] Returning {len(summaries)} employee summaries")
 
     return summaries
+
+
+# --- Missing Shifts / Long-Running Shifts ---
+class MissingShiftEmployeeSummary(BaseModel):
+    employee_id: str
+    employee_name: Optional[str] = None
+    has_unmatched_punches: bool = False
+    count_unmatched_punches: int = 0
+    has_long_running_shift_over_12h: bool = False
+    long_running_duration_hours: Optional[float] = None
+    last_clock_in_at: Optional[str] = None
+
+
+@router.get(
+    "/employees/missing-shifts", response_model=List[MissingShiftEmployeeSummary]
+)
+async def get_missing_shifts_summary(
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    session: Session = Depends(get_session),
+    admin_user: dict = Depends(require_admin_role),
+):
+    """Detect employees with missing punches and long-running active shifts.
+
+    Default range is the current week (Mon-Sun). You can override with start_date/end_date (UTC dates).
+    """
+    now = datetime.now(timezone.utc)
+
+    if start_date and end_date:
+        week_start = start_date
+        week_end = end_date
+    else:
+        today = now.date()
+        week_start = today - timedelta(days=today.weekday())
+        week_end = week_start + timedelta(days=6)
+
+    start_dt = datetime.combine(week_start, datetime.min.time()).replace(
+        tzinfo=timezone.utc
+    )
+    end_dt = datetime.combine(week_end, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
+
+    # Single ordered scan across the range for all employees
+    logs = session.exec(
+        select(TimeLog)
+        .where(TimeLog.timestamp >= start_dt)
+        .where(TimeLog.timestamp <= end_dt)
+        .order_by(TimeLog.employee_id, TimeLog.timestamp)
+    ).all()
+
+    results: List[MissingShiftEmployeeSummary] = []
+
+    current_employee_id: Optional[str] = None
+    open_shift_start: Optional[datetime] = None
+    last_clock_in_at: Optional[datetime] = None
+    unmatched_count: int = 0
+
+    def flush_employee():
+        nonlocal current_employee_id, open_shift_start, unmatched_count, last_clock_in_at
+        if current_employee_id is None:
+            return
+        has_long_running = False
+        long_running_hours: Optional[float] = None
+        last_clock_in_iso: Optional[str] = (
+            last_clock_in_at.isoformat() if last_clock_in_at else None
+        )
+        if open_shift_start:
+            # Active shift; check duration
+            duration_hours = (now - open_shift_start).total_seconds() / 3600.0
+            if duration_hours > 12.0:
+                has_long_running = True
+                long_running_hours = round(duration_hours, 2)
+        if unmatched_count > 0 or has_long_running:
+            results.append(
+                MissingShiftEmployeeSummary(
+                    employee_id=current_employee_id,
+                    has_unmatched_punches=unmatched_count > 0,
+                    count_unmatched_punches=unmatched_count,
+                    has_long_running_shift_over_12h=has_long_running,
+                    long_running_duration_hours=long_running_hours,
+                    last_clock_in_at=last_clock_in_iso,
+                )
+            )
+
+    for log in logs:
+        # Ensure tz-aware
+        ts = (
+            log.timestamp
+            if log.timestamp.tzinfo
+            else log.timestamp.replace(tzinfo=timezone.utc)
+        )
+        if current_employee_id != log.employee_id:
+            # finalize previous
+            flush_employee()
+            # reset for new employee
+            current_employee_id = log.employee_id
+            open_shift_start = None
+            last_clock_in_at = None
+            unmatched_count = 0
+
+        if log.punch_type == PunchType.CLOCK_IN:
+            if open_shift_start is not None:
+                # consecutive clock-in → previous missing clock-out
+                unmatched_count += 1
+            open_shift_start = ts
+            last_clock_in_at = ts
+        else:  # CLOCK_OUT
+            if open_shift_start is None:
+                # unmatched clock-out with no preceding clock-in in range
+                unmatched_count += 1
+            else:
+                # normal close of shift
+                open_shift_start = None
+
+    # flush the final employee
+    flush_employee()
+
+    # Hydrate names (lazy fetch per anomaly to keep it light)
+    for entry in results:
+        try:
+            doc = firestore_db.collection("users").document(entry.employee_id).get()
+            if doc and doc.exists:
+                data = doc.to_dict()
+                entry.employee_name = data.get("displayName")
+        except Exception:
+            # Best-effort; keep going without name
+            pass
+
+    # Sort by name if available, else by id
+    results.sort(key=lambda e: (e.employee_name or "", e.employee_id))
+
+    return results
 
 
 @router.get(
