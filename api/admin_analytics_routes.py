@@ -4127,6 +4127,21 @@ async def get_missing_shifts_summary(
     last_clock_in_at: Optional[datetime] = None
     unmatched_count: int = 0
 
+    # Determine carry-in state: last punch before start_dt per employee
+    employee_ids_in_range = list({log.employee_id for log in logs})
+    prior_state: Dict[str, Optional[TimeLog]] = {}
+    if employee_ids_in_range:
+        prior_logs = session.exec(
+            select(TimeLog)
+            .where(TimeLog.employee_id.in_(employee_ids_in_range))
+            .where(TimeLog.timestamp < start_dt)
+            .order_by(TimeLog.employee_id, TimeLog.timestamp.desc())
+        ).all()
+        # Keep first seen (most recent) per employee due to desc order within employee grouping
+        for plog in prior_logs:
+            if plog.employee_id not in prior_state:
+                prior_state[plog.employee_id] = plog
+
     def flush_employee():
         nonlocal current_employee_id, open_shift_start, unmatched_count, last_clock_in_at
         if current_employee_id is None:
@@ -4137,9 +4152,8 @@ async def get_missing_shifts_summary(
             last_clock_in_at.isoformat() if last_clock_in_at else None
         )
         if open_shift_start:
-            # Trailing open shift within window counts as an unmatched punch
-            unmatched_count += 1
-            # Also check if it's a current long-running shift
+            # Do NOT count normal trailing open shifts as unmatched.
+            # Only flag if it's a long-running current shift (> 12 hours).
             duration_hours = (now - open_shift_start).total_seconds() / 3600.0
             if duration_hours > 12.0:
                 has_long_running = True
@@ -4168,7 +4182,18 @@ async def get_missing_shifts_summary(
             flush_employee()
             # reset for new employee
             current_employee_id = log.employee_id
-            open_shift_start = None
+            # Initialize carry-in state from prior_state
+            prev = prior_state.get(current_employee_id)
+            if prev and prev.punch_type == PunchType.CLOCK_IN:
+                # Shift was already open before window start
+                open_shift_start = (
+                    prev.timestamp
+                    if prev.timestamp.tzinfo
+                    else prev.timestamp.replace(tzinfo=timezone.utc)
+                )
+                last_clock_in_at = open_shift_start
+            else:
+                open_shift_start = None
             last_clock_in_at = None
             unmatched_count = 0
 
