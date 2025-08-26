@@ -1299,7 +1299,9 @@ async def auto_stop_overlong_shift(
     """
     admin_uid = admin.get("uid")
     if not admin_uid:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin user ID not found")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin user ID not found"
+        )
 
     try:
         # Import here to avoid circular imports
@@ -1309,7 +1311,9 @@ async def auto_stop_overlong_shift(
 
         # Determine current active status and the most recent CLOCK_IN timestamp
         is_active, clock_in_ts = await is_employee_currently_active(
-            session=session, employee_id=payload.employee_id, dealership_id=payload.dealership_id
+            session=session,
+            employee_id=payload.employee_id,
+            dealership_id=payload.dealership_id,
         )
 
         if not is_active or not clock_in_ts:
@@ -1371,9 +1375,7 @@ async def auto_stop_overlong_shift(
 
         # Create CLOCK_OUT entry
         reason_suffix = f" | {payload.reason}" if payload.reason else ""
-        admin_note = (
-            f"AUTO STOP SHIFT: Exceeded threshold {payload.threshold_hours:.2f}h (actual {duration_hours:.2f}h){reason_suffix}"
-        )
+        admin_note = f"AUTO STOP SHIFT: Exceeded threshold {payload.threshold_hours:.2f}h (actual {duration_hours:.2f}h){reason_suffix}"
 
         clock_out_entry = TimeLog(
             employee_id=payload.employee_id,
@@ -1424,8 +1426,157 @@ async def auto_stop_overlong_shift(
         session.rollback()
         print(f"❌ Error during auto-stop overlong shift: {e}")
         import traceback
+
         print(f"Full traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Unexpected error in auto-stop endpoint: {str(e)}",
         )
+
+
+# --- REPORT: Recent Auto-Stop Events ---
+
+
+class AutoStopEvent(BaseModel):
+    employee_id: str
+    employee_name: Optional[str] = None
+    admin_id: str
+    dealership_id: str
+    reason: str
+    created_at: str
+    threshold_hours: Optional[float] = None
+    shift_start_time: Optional[str] = None
+    shift_end_time: Optional[str] = None
+    shift_duration_hours: Optional[float] = None
+    clock_in_id: Optional[int] = None
+    clock_out_id: Optional[int] = None
+
+
+class AutoStopEventsResponse(BaseModel):
+    events: List[AutoStopEvent]
+
+
+@router.get("/auto-stop-events", response_model=AutoStopEventsResponse)
+async def list_auto_stop_events(
+    limit: int = 100,
+    since_iso: Optional[str] = None,
+    session: Session = Depends(get_session),
+    admin: dict = Depends(require_admin_role),
+):
+    """Return recent auto-stop events (auto-created clock-out due to overlong shift).
+
+    - Filtered by AdminTimeChange.reason prefix "AUTO STOP SHIFT".
+    - Returns employee, times, dealership, and referenced clock pair if available.
+    - Optional since_iso filters events since a UTC ISO timestamp.
+    - limit caps the number of results (default 100).
+    """
+    # Build base query on AdminTimeChange entries that our auto-stop endpoint created
+    query = select(AdminTimeChange).where(
+        AdminTimeChange.action == AdminTimeChangeAction.CREATE
+    )
+    # Use reason prefix to distinguish these auto-stops
+    # We saved admin_change.reason = admin_note which starts with "AUTO STOP SHIFT:"
+    # SQLModel doesn't have startswith across backends; fetch a recent window and filter in Python.
+
+    # Pull recent entries ordered by created_at desc
+    q = query.order_by(AdminTimeChange.created_at.desc())
+    entries = session.exec(q).all()
+
+    events: List[AutoStopEvent] = []
+
+    # Optional since filter
+    since_dt: Optional[datetime] = None
+    if since_iso:
+        try:
+            since_dt = datetime.fromisoformat(since_iso)
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid since_iso timestamp; must be ISO 8601",
+            )
+
+    for change in entries:
+        if not change.reason or not change.reason.startswith("AUTO STOP SHIFT:"):
+            continue
+        if since_dt and change.created_at < since_dt:
+            break  # entries are desc; we can stop
+
+        # Try to parse threshold and duration from reason string
+        # Format example: "AUTO STOP SHIFT: Exceeded threshold 15.00h (actual 16.25h) | extra"
+        threshold_val: Optional[float] = None
+        duration_val: Optional[float] = None
+        try:
+            import re
+
+            m1 = re.search(r"threshold\s+([0-9]+(?:\.[0-9]+)?)h", change.reason)
+            if m1:
+                threshold_val = float(m1.group(1))
+            m2 = re.search(r"actual\s+([0-9]+(?:\.[0-9]+)?)h", change.reason)
+            if m2:
+                duration_val = float(m2.group(1))
+        except Exception:
+            pass
+
+        # Attempt to find the associated clock-in (the last CLOCK_IN before end_time)
+        clock_in_id: Optional[int] = None
+        shift_start_iso: Optional[str] = None
+        if change.end_time:
+            last_clock_in = session.exec(
+                select(TimeLog)
+                .where(TimeLog.employee_id == change.employee_id)
+                .where(TimeLog.punch_type == PunchType.CLOCK_IN)
+                .where(TimeLog.timestamp <= change.end_time)
+                .order_by(TimeLog.timestamp.desc())
+                .limit(1)
+            ).first()
+            if last_clock_in:
+                clock_in_id = last_clock_in.id
+                # Ensure tz-aware ISO
+                ts = last_clock_in.timestamp
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                shift_start_iso = ts.isoformat()
+
+        # Derived end time ISO
+        shift_end_iso: Optional[str] = None
+        if change.end_time:
+            ts_end = (
+                change.end_time
+                if change.end_time.tzinfo
+                else change.end_time.replace(tzinfo=timezone.utc)
+            )
+            shift_end_iso = ts_end.isoformat()
+
+        # Enrich employee name (best-effort)
+        employee_name: Optional[str] = None
+        try:
+            doc = firestore_db.collection("users").document(change.employee_id).get()
+            if doc and doc.exists:
+                data = doc.to_dict()
+                employee_name = data.get("displayName")
+        except Exception:
+            pass
+
+        events.append(
+            AutoStopEvent(
+                employee_id=change.employee_id,
+                employee_name=employee_name,
+                admin_id=change.admin_id,
+                dealership_id=change.dealership_id,
+                reason=change.reason,
+                created_at=change.created_at.isoformat(),
+                threshold_hours=threshold_val,
+                shift_start_time=shift_start_iso,
+                shift_end_time=shift_end_iso,
+                shift_duration_hours=duration_val,
+                clock_in_id=clock_in_id,
+                clock_out_id=change.clock_out_id,
+            )
+        )
+
+        if len(events) >= limit:
+            break
+
+    return AutoStopEventsResponse(events=events)
