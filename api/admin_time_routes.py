@@ -1,4 +1,4 @@
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import List, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -1373,7 +1373,8 @@ async def auto_stop_overlong_shift(
         else:
             active_dealership_id = payload.dealership_id
 
-        # Create CLOCK_OUT entry
+        # Create CLOCK_OUT entry at shift_start + threshold_hours (not current time)
+        cutoff_time = clock_in_ts + timedelta(hours=payload.threshold_hours)
         reason_suffix = f" | {payload.reason}" if payload.reason else ""
         admin_note = f"AUTO STOP SHIFT: Exceeded threshold {payload.threshold_hours:.2f}h (actual {duration_hours:.2f}h){reason_suffix}"
 
@@ -1381,7 +1382,7 @@ async def auto_stop_overlong_shift(
             employee_id=payload.employee_id,
             dealership_id=active_dealership_id,
             punch_type=PunchType.CLOCK_OUT,
-            timestamp=now_utc,
+            timestamp=cutoff_time,
             admin_notes=admin_note,
             admin_modifier_id=admin_uid,
         )
@@ -1396,8 +1397,8 @@ async def auto_stop_overlong_shift(
             reason=admin_note,
             clock_out_id=clock_out_entry.id,
             dealership_id=active_dealership_id,
-            end_time=now_utc,
-            punch_date=now_utc.date().isoformat(),
+            end_time=cutoff_time,
+            punch_date=cutoff_time.date().isoformat(),
         )
         session.add(admin_change)
         session.commit()
@@ -1413,7 +1414,7 @@ async def auto_stop_overlong_shift(
             is_over_threshold=True,
             was_clock_out_created=True,
             shift_start_time=format_utc_datetime(clock_in_ts),
-            shift_end_time=format_utc_datetime(now_utc),
+            shift_end_time=format_utc_datetime(cutoff_time),
             shift_duration_hours=round(duration_hours, 2),
             dealership_id=active_dealership_id,
             created_timelog_id=clock_out_entry.id,
@@ -1580,3 +1581,173 @@ async def list_auto_stop_events(
             break
 
     return AutoStopEventsResponse(events=events)
+
+
+# --- BULK AUTO-STOP: scan all employees and stop overlong active shifts ---
+
+
+class AutoStopBulkRequestPayload(BaseModel):
+    threshold_hours: float = 15.0
+    dealership_id: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class AutoStopBulkResultItem(BaseModel):
+    employee_id: str
+    employee_name: Optional[str] = None
+    dealership_id: Optional[str] = None
+    was_clock_out_created: bool
+    shift_start_time: Optional[str] = None
+    shift_end_time: Optional[str] = None
+    shift_duration_hours: Optional[float] = None
+    created_timelog_id: Optional[int] = None
+    message: str
+
+
+class AutoStopBulkResponse(BaseModel):
+    success: bool
+    total_candidates: int
+    total_stopped: int
+    results: List[AutoStopBulkResultItem]
+
+
+@router.post("/auto-stop-overlong-shifts", response_model=AutoStopBulkResponse)
+async def auto_stop_overlong_shifts(
+    payload: AutoStopBulkRequestPayload,
+    session: Session = Depends(get_session),
+    admin: dict = Depends(require_admin_role),
+):
+    """Scan all employees for active shifts over threshold and auto-stop them.
+
+    - Without requiring employee_id. Optionally filter by dealership_id.
+    - Uses last CLOCK_IN within a short lookback window (3d) to determine active shifts.
+    - Creates CLOCK_OUT entries and logs AdminTimeChange for each stopped shift.
+    """
+    admin_uid = admin.get("uid")
+    if not admin_uid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin user ID not found"
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    lookback_date = now_utc - timedelta(days=3)
+
+    # One pass to get each employee's most recent punch in the lookback window
+    recent_logs = session.exec(
+        select(TimeLog)
+        .where(TimeLog.timestamp >= lookback_date)
+        .order_by(TimeLog.employee_id.asc(), TimeLog.timestamp.desc())
+    ).all()
+
+    last_by_employee: dict[str, TimeLog] = {}
+    for log in recent_logs:
+        if log.employee_id not in last_by_employee:
+            last_by_employee[log.employee_id] = log
+
+    results: List[AutoStopBulkResultItem] = []
+    total_candidates = 0
+    total_stopped = 0
+
+    for employee_id, last_log in last_by_employee.items():
+        # Consider only those whose most recent punch is a CLOCK_IN (currently active)
+        if last_log.punch_type != PunchType.CLOCK_IN:
+            continue
+
+        # Dealership filter (if provided)
+        if payload.dealership_id and last_log.dealership_id != payload.dealership_id:
+            continue
+
+        # Compute duration since last CLOCK_IN
+        ts = (
+            last_log.timestamp
+            if last_log.timestamp.tzinfo
+            else last_log.timestamp.replace(tzinfo=timezone.utc)
+        )
+        duration_hours = (now_utc - ts).total_seconds() / 3600.0
+
+        if duration_hours <= payload.threshold_hours:
+            continue
+
+        total_candidates += 1
+
+        # Determine dealership for clock-out
+        active_dealership_id = payload.dealership_id or last_log.dealership_id
+
+        # Compose admin note consistent with single endpoint
+        cutoff_time = ts + timedelta(hours=payload.threshold_hours)
+        reason_suffix = f" | {payload.reason}" if payload.reason else ""
+        admin_note = f"AUTO STOP SHIFT: Exceeded threshold {payload.threshold_hours:.2f}h (actual {duration_hours:.2f}h){reason_suffix}"
+
+        try:
+            # Create CLOCK_OUT entry at shift_start + threshold_hours
+            clock_out_entry = TimeLog(
+                employee_id=employee_id,
+                dealership_id=active_dealership_id,
+                punch_type=PunchType.CLOCK_OUT,
+                timestamp=cutoff_time,
+                admin_notes=admin_note,
+                admin_modifier_id=admin_uid,
+            )
+            session.add(clock_out_entry)
+            session.flush()
+
+            # Log the admin action
+            admin_change = AdminTimeChange(
+                admin_id=admin_uid,
+                employee_id=employee_id,
+                action=AdminTimeChangeAction.CREATE,
+                reason=admin_note,
+                clock_out_id=clock_out_entry.id,
+                dealership_id=active_dealership_id,
+                end_time=cutoff_time,
+                punch_date=cutoff_time.date().isoformat(),
+            )
+            session.add(admin_change)
+            session.commit()
+
+            # Hydrate employee name (best-effort)
+            employee_name: Optional[str] = None
+            try:
+                doc = firestore_db.collection("users").document(employee_id).get()
+                if doc and doc.exists:
+                    data = doc.to_dict()
+                    employee_name = data.get("displayName")
+            except Exception:
+                pass
+
+            total_stopped += 1
+            results.append(
+                AutoStopBulkResultItem(
+                    employee_id=employee_id,
+                    employee_name=employee_name,
+                    dealership_id=active_dealership_id,
+                    was_clock_out_created=True,
+                    shift_start_time=ts.isoformat(),
+                    shift_end_time=cutoff_time.isoformat(),
+                    shift_duration_hours=round(duration_hours, 2),
+                    created_timelog_id=clock_out_entry.id,
+                    message="Auto-stopped overlong shift",
+                )
+            )
+        except Exception as e:
+            session.rollback()
+            results.append(
+                AutoStopBulkResultItem(
+                    employee_id=employee_id,
+                    employee_name=None,
+                    dealership_id=active_dealership_id,
+                    was_clock_out_created=False,
+                    shift_start_time=ts.isoformat(),
+                    shift_end_time=None,
+                    shift_duration_hours=round(duration_hours, 2),
+                    created_timelog_id=None,
+                    message=f"Failed to auto-stop: {str(e)}",
+                )
+            )
+
+    return AutoStopBulkResponse(
+        success=True,
+        total_candidates=total_candidates,
+        total_stopped=total_stopped,
+        results=results,
+    )
