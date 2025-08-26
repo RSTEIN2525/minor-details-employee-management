@@ -14,6 +14,7 @@ from core.deps import (
 )
 from core.firebase import db as firestore_db
 from db.session import get_session
+from models.admin_time_change import AdminTimeChange, AdminTimeChangeAction
 from models.shop import Shop
 from models.time_log import PunchType, TimeLog
 from models.vacation_time import VacationTime
@@ -4074,6 +4075,10 @@ class MissingShiftEmployeeSummary(BaseModel):
     has_long_running_shift_over_12h: bool = False
     long_running_duration_hours: Optional[float] = None
     last_clock_in_at: Optional[str] = None
+    was_auto_stopped_recently: bool = False
+    auto_stop_count: int = 0
+    latest_auto_stop_time: Optional[str] = None
+    auto_stop_threshold_hours: Optional[float] = None
 
 
 @router.get(
@@ -4087,22 +4092,23 @@ async def get_missing_shifts_summary(
 ):
     """Detect employees with missing punches and long-running active shifts.
 
-    Default range is the current week (Mon-Sun). You can override with start_date/end_date (UTC dates).
+    Default range is the past 4 weeks (last 28 days ending today) in UTC.
+    You can override by passing both start_date and end_date (UTC dates, YYYY-MM-DD).
     """
     now = datetime.now(timezone.utc)
 
     if start_date and end_date:
-        week_start = start_date
-        week_end = end_date
+        range_start = start_date
+        range_end = end_date
     else:
         today = now.date()
-        week_start = today - timedelta(days=today.weekday())
-        week_end = week_start + timedelta(days=6)
+        range_start = today - timedelta(days=27)  # last 28 days including today
+        range_end = today
 
-    start_dt = datetime.combine(week_start, datetime.min.time()).replace(
+    start_dt = datetime.combine(range_start, datetime.min.time()).replace(
         tzinfo=timezone.utc
     )
-    end_dt = datetime.combine(week_end, datetime.max.time()).replace(
+    end_dt = datetime.combine(range_end, datetime.max.time()).replace(
         tzinfo=timezone.utc
     )
 
@@ -4131,7 +4137,9 @@ async def get_missing_shifts_summary(
             last_clock_in_at.isoformat() if last_clock_in_at else None
         )
         if open_shift_start:
-            # Active shift; check duration
+            # Trailing open shift within window counts as an unmatched punch
+            unmatched_count += 1
+            # Also check if it's a current long-running shift
             duration_hours = (now - open_shift_start).total_seconds() / 3600.0
             if duration_hours > 12.0:
                 has_long_running = True
@@ -4180,6 +4188,48 @@ async def get_missing_shifts_summary(
 
     # flush the final employee
     flush_employee()
+
+    # Augment with recent auto-stop events within the same window
+    auto_changes = session.exec(
+        select(AdminTimeChange)
+        .where(AdminTimeChange.action == AdminTimeChangeAction.CREATE)
+        .where(AdminTimeChange.created_at >= start_dt)
+        .where(AdminTimeChange.created_at <= end_dt)
+        .order_by(AdminTimeChange.created_at.desc())
+    ).all()
+
+    # Build map for quick lookup
+    by_employee: Dict[str, MissingShiftEmployeeSummary] = {
+        e.employee_id: e for e in results
+    }
+
+    for change in auto_changes:
+        reason = change.reason or ""
+        if not reason.startswith("AUTO STOP SHIFT:"):
+            continue
+        entry = by_employee.get(change.employee_id)
+        if not entry:
+            entry = MissingShiftEmployeeSummary(
+                employee_id=change.employee_id,
+            )
+            results.append(entry)
+            by_employee[change.employee_id] = entry
+        entry.was_auto_stopped_recently = True
+        entry.auto_stop_count += 1
+        # Keep latest autostop time
+        ts_end = change.end_time or change.created_at
+        if ts_end:
+            ts_end = ts_end if ts_end.tzinfo else ts_end.replace(tzinfo=timezone.utc)
+            entry.latest_auto_stop_time = ts_end.isoformat()
+        # Parse threshold from reason if present
+        try:
+            import re
+
+            m = re.search(r"threshold\s+([0-9]+(?:\.[0-9]+)?)h", reason)
+            if m:
+                entry.auto_stop_threshold_hours = float(m.group(1))
+        except Exception:
+            pass
 
     # Hydrate names (lazy fetch per anomaly to keep it light)
     for entry in results:
