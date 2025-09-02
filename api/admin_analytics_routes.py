@@ -5312,24 +5312,17 @@ async def get_flexible_labor_spend(
         f"Found {len(all_employee_ids)} total unique employees across requested dealerships"
     )
 
-    # Get ALL time logs for the WEEK containing the date range (needed for overtime calculation)
-    # We need weekly context to properly calculate overtime
-    week_start = start_date - timedelta(days=start_date.weekday())
-    week_end = week_start + timedelta(days=6)
-
-    week_start_utc = datetime.combine(
-        week_start, datetime.min.time(), tzinfo=analysis_tz
-    ).astimezone(timezone.utc)
-    week_end_utc = datetime.combine(
-        week_end, datetime.max.time(), tzinfo=analysis_tz
-    ).astimezone(timezone.utc)
+    # Get ALL time logs for the ENTIRE date range (not just the first week!)
+    # We need to fetch logs for the full requested range, not just the week containing start_date
+    query_start_utc = start_of_range
+    query_end_utc = end_of_range
 
     if all_employee_ids:
         all_range_logs = session.exec(
             select(TimeLog)
             .where(TimeLog.employee_id.in_(list(all_employee_ids)))
-            .where(TimeLog.timestamp >= week_start_utc)  # Query full week for context
-            .where(TimeLog.timestamp <= week_end_utc)
+            .where(TimeLog.timestamp >= query_start_utc)  # Query full requested range
+            .where(TimeLog.timestamp <= query_end_utc)
             .order_by(TimeLog.timestamp.asc())
         ).all()
 
@@ -5400,18 +5393,9 @@ async def get_flexible_labor_spend(
                         hourly_wage=hourly_wage,
                     )
 
-                    # Get employee's logs in the TARGET date range (for hour calculation)
+                    # Get employee's logs (range_logs is already filtered to target date range and dealership employees)
                     employee_range_logs = [
-                        log
-                        for log in range_logs
-                        if log.employee_id == employee_id
-                        and start_of_range
-                        <= (
-                            log.timestamp
-                            if log.timestamp.tzinfo
-                            else log.timestamp.replace(tzinfo=timezone.utc)
-                        )
-                        <= end_of_range
+                        log for log in range_logs if log.employee_id == employee_id
                     ]
 
                     if employee_range_logs:
@@ -5450,44 +5434,11 @@ async def get_flexible_labor_spend(
                             employee_range_logs, dealership_id, analysis_cutoff
                         )
 
-                        # Calculate regular and overtime hours using SAME LOGIC AS COMPREHENSIVE
-                        # Need to consider weekly context across ALL dealerships
-
-                        # Get ALL logs for this employee for the week (across all dealerships)
-                        # We already queried the full week, so just filter by employee
-                        all_employee_week_logs = [
-                            log
-                            for log in all_range_logs
-                            if log.employee_id == employee_id
-                        ]
-
-                        # Calculate hours worked before target date for weekly context
-                        week_logs_before_target = []
-                        for log in all_employee_week_logs:
-                            log_ts = (
-                                log.timestamp
-                                if log.timestamp.tzinfo
-                                else log.timestamp.replace(tzinfo=timezone.utc)
-                            )
-                            if log_ts < start_of_range:
-                                week_logs_before_target.append(log)
-
-                        hours_worked_before_target = calculate_hours_from_logs(
-                            week_logs_before_target, start_of_range
+                        # Calculate regular and overtime hours using SIMPLE approach
+                        # For multi-day/week ranges, just apply 40hr rule to total hours
+                        detail.regular_hours, detail.overtime_hours = (
+                            calculate_regular_and_overtime_hours(detail.total_hours)
                         )
-
-                        # Apply same overtime logic as comprehensive endpoint
-                        if hours_worked_before_target >= 40.0:
-                            detail.regular_hours = 0.0
-                            detail.overtime_hours = detail.total_hours
-                        else:
-                            remaining_regular_hours = 40.0 - hours_worked_before_target
-                            detail.regular_hours = min(
-                                detail.total_hours, remaining_regular_hours
-                            )
-                            detail.overtime_hours = max(
-                                0.0, detail.total_hours - remaining_regular_hours
-                            )
 
                         # Calculate labor cost using SAME PRECISE FUNCTION
                         detail.labor_cost = calculate_pay_with_overtime(
