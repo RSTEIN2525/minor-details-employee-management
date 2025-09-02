@@ -3996,7 +3996,14 @@ async def get_basic_weekly_summary(
         .where(
             "role",
             "in",
-            ["employee", "clockOnlyEmployee", "serviceWash", "photos", "lotPrep"],
+            [
+                "employee",
+                "clockOnlyEmployee",
+                "serviceWash",
+                "photos",
+                "lotPrep",
+                "deleted",
+            ],
         )
         .stream()
     )
