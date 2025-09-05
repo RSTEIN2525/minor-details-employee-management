@@ -1924,9 +1924,11 @@ async def get_employee_details_by_date_range(
         .order_by(TimeLog.timestamp.asc(), TimeLog.punch_type.desc())
     ).all()
 
-    # Calculate hours for current week using helper (handles implicit clock-outs)
-    current_week_hours = calculate_hours_from_logs_with_daily_breaks(
-        current_week_clocks, now
+    # Calculate hours for current week allowing an open shift that STARTED TODAY (EST)
+    current_week_hours, _ = (
+        calculate_hours_from_logs_with_daily_breaks_allow_today_open(
+            list(current_week_clocks), now, est_timezone
+        )
     )
 
     current_week_pay = current_week_hours * hourly_wage
@@ -1948,12 +1950,12 @@ async def get_employee_details_by_date_range(
         .order_by(TimeLog.timestamp.asc(), TimeLog.punch_type.desc())
     ).all()
 
-    # Calculate hours for previous week using helper (handles implicit clock-outs)
+    # Calculate hours for previous week using paired-only (drop unpaired, never count open)
     prev_week_end_dt = datetime.combine(prev_week_end, datetime.max.time()).replace(
         tzinfo=timezone.utc
     )
-    prev_week_hours = calculate_hours_from_logs_with_daily_breaks(
-        prev_week_clocks, prev_week_end_dt
+    prev_week_hours, _ = calculate_hours_from_logs_with_daily_breaks_paired_only(
+        list(prev_week_clocks)
     )
 
     prev_week_pay = prev_week_hours * hourly_wage
@@ -2048,7 +2050,17 @@ async def get_employee_details_by_date_range(
             tzinfo=timezone.utc,
         )
 
-        week_hours = calculate_hours_from_logs_with_daily_breaks(week_logs, week_end_dt)
+        # For the current week, allow today's open shift started today (EST)
+        if week_start_date == current_week_start:
+            week_hours, _ = (
+                calculate_hours_from_logs_with_daily_breaks_allow_today_open(
+                    list(week_logs), now, est_timezone
+                )
+            )
+        else:
+            week_hours, _ = calculate_hours_from_logs_with_daily_breaks_paired_only(
+                list(week_logs)
+            )
         week_regular, week_overtime = calculate_regular_and_overtime_hours(week_hours)
         week_pay = calculate_pay_with_overtime(week_regular, week_overtime, hourly_wage)
 
