@@ -138,6 +138,10 @@ class EmployeeDetailResponse(BaseModel):
     date_range_overtime_hours: Optional[float] = None
     date_range_total_pay: Optional[float] = None
 
+    # Flag indicating that unpaired punches (e.g., IN without OUT or orphan OUT)
+    # were detected and excluded from hour/pay calculations in this response
+    has_unpaired_punches: bool = False
+
 
 # New model for dealership employee hours breakdown
 class EmployeeHoursBreakdown(BaseModel):
@@ -1607,9 +1611,12 @@ async def get_employee_details(
         .order_by(TimeLog.timestamp.asc())
     ).all()
 
-    # Calculate hours for current week using helper (handles implicit clock-outs)
-    current_week_hours = calculate_hours_from_logs_with_daily_breaks(
-        current_week_clocks, now
+    # Calculate hours for current week allowing an open shift that STARTED TODAY (EST)
+    # to count until now; otherwise drop unpaired punches
+    current_week_hours, has_unpaired_current_week = (
+        calculate_hours_from_logs_with_daily_breaks_allow_today_open(
+            list(current_week_clocks), now, est_timezone
+        )
     )
 
     current_week_pay = current_week_hours * hourly_wage
@@ -1635,9 +1642,9 @@ async def get_employee_details(
         .order_by(TimeLog.timestamp.asc(), TimeLog.punch_type.desc())
     ).all()
 
-    # Calculate hours for previous week using helper (handles implicit clock-outs)
-    prev_week_hours = calculate_hours_from_logs_with_daily_breaks(
-        prev_week_clocks, prev_week_end_dt
+    # Calculate hours for previous week using paired-only helper (drops unpaired)
+    prev_week_hours, has_unpaired_prev_week = (
+        calculate_hours_from_logs_with_daily_breaks_paired_only(list(prev_week_clocks))
     )
 
     prev_week_pay = prev_week_hours * hourly_wage
@@ -1657,9 +1664,30 @@ async def get_employee_details(
         current_week_regular, current_week_overtime, hourly_wage
     )
 
-    # Calculate today's hours and clock status
-    todays_hours, is_currently_clocked_in = await calculate_todays_hours_and_status(
+    # Calculate today's hours (paired-only) and current clock status
+    # Status: use robust active detection
+    is_currently_clocked_in, _ = await is_employee_currently_active(
         session, employee_id
+    )
+    # Hours: restrict to today's window and drop unpaired
+    start_of_day = datetime.combine(today, datetime.min.time()).replace(
+        tzinfo=timezone.utc
+    )
+    end_of_day = datetime.combine(today, datetime.max.time()).replace(
+        tzinfo=timezone.utc
+    )
+    todays_clocks = session.exec(
+        select(TimeLog)
+        .where(TimeLog.employee_id == employee_id)
+        .where(TimeLog.timestamp >= start_of_day)
+        .where(TimeLog.timestamp <= end_of_day)
+        .order_by(TimeLog.timestamp.asc())
+    ).all()
+    # Allow today's open shift (if started today in EST) to count until now
+    todays_hours, has_unpaired_today = (
+        calculate_hours_from_logs_with_daily_breaks_allow_today_open(
+            list(todays_clocks), now, est_timezone
+        )
     )
     todays_regular, todays_overtime = calculate_regular_and_overtime_hours(todays_hours)
     todays_pay = calculate_pay_with_overtime(
@@ -1712,7 +1740,7 @@ async def get_employee_details(
     range_overtime_hours = 0.0
     range_total_pay = 0.0
 
-    # Group recent clock entries by the ISO week they belong to and compute
+    # Group recent clock entries by the ISO week they belong to and compute (paired-only)
     week_logs_map: Dict[date, List[TimeLog]] = {}
     for clock in recent_clocks:
         ts = clock.timestamp
@@ -1727,7 +1755,17 @@ async def get_employee_details(
             datetime.max.time(),
             tzinfo=timezone.utc,
         )
-        week_hours = calculate_hours_from_logs_with_daily_breaks(week_logs, week_end_dt)
+        # For the current week, allow today's open shift to count; others paired-only
+        if week_start_date == current_week_start:
+            week_hours, _ = (
+                calculate_hours_from_logs_with_daily_breaks_allow_today_open(
+                    list(week_logs), now, est_timezone
+                )
+            )
+        else:
+            week_hours, _ = calculate_hours_from_logs_with_daily_breaks_paired_only(
+                list(week_logs)
+            )
         week_regular, week_overtime = calculate_regular_and_overtime_hours(week_hours)
         week_pay = calculate_pay_with_overtime(week_regular, week_overtime, hourly_wage)
 
@@ -1740,6 +1778,14 @@ async def get_employee_details(
     range_regular_hours = round(range_regular_hours, 2)
     range_overtime_hours = round(range_overtime_hours, 2)
     range_total_pay = round(range_total_pay, 2)
+
+    # Determine if any unpaired punches were encountered in this response
+    any_unpaired = (
+        has_unpaired_current_week
+        or has_unpaired_prev_week
+        or has_unpaired_today
+        or _pair_shifts(list(recent_clocks))[1]
+    )
 
     return EmployeeDetailResponse(
         employee_id=employee_id,
@@ -1761,6 +1807,7 @@ async def get_employee_details(
         date_range_regular_hours=range_regular_hours,
         date_range_overtime_hours=range_overtime_hours,
         date_range_total_pay=range_total_pay,
+        has_unpaired_punches=any_unpaired,
     )
 
 
@@ -3355,6 +3402,163 @@ def calculate_hours_from_logs_with_daily_breaks(
     from utils.breaks import calculate_daily_hours_with_breaks
 
     return calculate_daily_hours_with_breaks(shifts_by_day)
+
+
+def _pair_shifts(
+    logs: List[TimeLog],
+) -> Tuple[List[Tuple[datetime, datetime, str]], bool]:
+    """Create paired CLOCK_IN/CLOCK_OUT shifts from logs, dropping unpaired.
+
+    Returns:
+        (list of (start_ts, end_ts, dealership_id), has_unpaired)
+    """
+    if not logs:
+        return [], False
+
+    # Ensure deterministic order
+    sorted_logs = sorted(logs, key=lambda x: x.timestamp)
+
+    open_clock_in_ts: Optional[datetime] = None
+    open_clock_in_dealership: Optional[str] = None
+    has_unpaired = False
+    pairs: List[Tuple[datetime, datetime, str]] = []
+
+    for log in sorted_logs:
+        ts = log.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        if log.punch_type == PunchType.CLOCK_IN:
+            # If there's already an open IN, it was unpaired. Drop it and start a new one.
+            if open_clock_in_ts is not None:
+                has_unpaired = True
+            open_clock_in_ts = ts
+            open_clock_in_dealership = log.dealership_id
+        elif log.punch_type == PunchType.CLOCK_OUT:
+            # If there's no open IN, this OUT is orphaned → unpaired, drop it
+            if open_clock_in_ts is None:
+                has_unpaired = True
+                continue
+            # Normal pair
+            start_ts = open_clock_in_ts
+            end_ts = ts
+            # Only accept if end is after start
+            if end_ts > start_ts:
+                pairs.append((start_ts, end_ts, open_clock_in_dealership or ""))
+            else:
+                # Negative/zero duration → treat as unpaired anomaly
+                has_unpaired = True
+            # Close current open shift
+            open_clock_in_ts = None
+            open_clock_in_dealership = None
+
+    # Trailing open IN → unpaired, drop it
+    if open_clock_in_ts is not None:
+        has_unpaired = True
+
+    return pairs, has_unpaired
+
+
+def calculate_hours_from_logs_paired_only(logs: List[TimeLog]) -> Tuple[float, bool]:
+    """Calculate paid hours counting only properly paired IN/OUT shifts.
+
+    Applies unpaid-break per shift.
+    Returns (total_hours, has_unpaired_punches).
+    """
+    pairs, has_unpaired = _pair_shifts(logs)
+    total_hours = 0.0
+    for start_ts, end_ts, _ in pairs:
+        raw_hours = (end_ts - start_ts).total_seconds() / 3600
+        paid_hours = apply_unpaid_break(raw_hours)
+        total_hours += paid_hours
+    return total_hours, has_unpaired
+
+
+def calculate_hours_from_logs_with_daily_breaks_paired_only(
+    logs: List[TimeLog],
+) -> Tuple[float, bool]:
+    """Calculate paid hours with daily break rule, using only paired shifts.
+
+    Returns (total_hours, has_unpaired_punches).
+    """
+    pairs, has_unpaired = _pair_shifts(logs)
+    if not pairs:
+        return 0.0, has_unpaired
+
+    # Build shifts_by_day as in the original helper, using shift start date
+    shifts_by_day: Dict[date, List[Tuple[float, Optional[str]]]] = {}
+    for start_ts, end_ts, dealership_id in pairs:
+        shift_date = start_ts.date()
+        raw_hours = (end_ts - start_ts).total_seconds() / 3600
+        shifts_by_day.setdefault(shift_date, []).append((raw_hours, dealership_id))
+
+    total = calculate_daily_hours_with_breaks(shifts_by_day)
+    return total, has_unpaired
+
+
+def calculate_hours_from_logs_with_daily_breaks_allow_today_open(
+    logs: List[TimeLog], now: datetime, analysis_tz: ZoneInfo
+) -> Tuple[float, bool]:
+    """Calculate hours using only paired shifts, except allow an open shift that started today (EST) to count until now.
+
+    Returns (total_hours, has_unpaired_punches).
+    """
+    if not logs:
+        return 0.0, False
+
+    sorted_logs = sorted(logs, key=lambda x: x.timestamp)
+
+    has_unpaired = False
+    open_clock_in_ts: Optional[datetime] = None
+    open_clock_in_dealership: Optional[str] = None
+    shifts_by_day: Dict[date, List[Tuple[float, Optional[str]]]] = {}
+
+    for log in sorted_logs:
+        ts = log.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        if log.punch_type == PunchType.CLOCK_IN:
+            if open_clock_in_ts is not None:
+                # consecutive IN → previous open is unpaired
+                has_unpaired = True
+            open_clock_in_ts = ts
+            open_clock_in_dealership = log.dealership_id
+        elif log.punch_type == PunchType.CLOCK_OUT:
+            if open_clock_in_ts is None:
+                # orphan OUT
+                has_unpaired = True
+                continue
+            # pair
+            start_ts = open_clock_in_ts
+            end_ts = ts
+            if end_ts > start_ts:
+                shift_date_est = start_ts.astimezone(analysis_tz).date()
+                raw_hours = (end_ts - start_ts).total_seconds() / 3600
+                shifts_by_day.setdefault(shift_date_est, []).append(
+                    (raw_hours, open_clock_in_dealership)
+                )
+            else:
+                has_unpaired = True
+            open_clock_in_ts = None
+            open_clock_in_dealership = None
+
+    # trailing open shift
+    if open_clock_in_ts is not None:
+        has_unpaired = True
+        est_today = now.astimezone(analysis_tz).date()
+        start_date_est = open_clock_in_ts.astimezone(analysis_tz).date()
+        if start_date_est == est_today:
+            # count until now
+            shift_date_est = start_date_est
+            raw_hours = (now - open_clock_in_ts).total_seconds() / 3600
+            if raw_hours > 0:
+                shifts_by_day.setdefault(shift_date_est, []).append(
+                    (raw_hours, open_clock_in_dealership)
+                )
+
+    total = calculate_daily_hours_with_breaks(shifts_by_day)
+    return total, has_unpaired
 
 
 def calculate_hours_by_dealership_from_logs(

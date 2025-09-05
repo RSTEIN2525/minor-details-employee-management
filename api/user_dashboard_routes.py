@@ -2,7 +2,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, field_serializer
 from sqlmodel import Session, asc, col, desc, select
 
@@ -10,12 +10,19 @@ from core.deps import get_current_user
 from core.firebase import db as firestore_db
 from db.session import get_session
 from models.employee_schedule import EmployeeScheduledShift, ShiftStatus
+from models.shop import Shop
 from models.time_log import PunchType, TimeLog
 from models.vacation_time import VacationTime
 from utils.breaks import apply_unpaid_break
 from utils.datetime_helpers import format_utc_datetime
+from utils.geofence import haversine_dist, is_within_radius
 
 router = APIRouter()
+# --- Geofence heartbeat config ---
+GEOFENCE_GRACE_MINUTES_DEFAULT = (
+    0  # set >0 to require time-based grace before auto-stop
+)
+MIN_ACCURACY_METERS_FOR_DECISION_DEFAULT = 150  # advisory threshold only
 
 
 def _get_daily_hours_map(punches: List[TimeLog], now: datetime) -> Dict[date, float]:
@@ -358,6 +365,280 @@ async def get_current_shift_duration(
         shift_duration_seconds=duration.total_seconds(),
         shift_start_time=shift_start_time,
         message="Current shift duration calculated.",
+    )
+
+
+# --- Geofence Check Model ---
+class GeofenceCheckResponse(BaseModel):
+    in_geofence: bool
+    matched_dealership_id: Optional[str] = None
+    message: str
+
+
+class GeofenceCheckRequest(BaseModel):
+    latitude: float
+    longitude: float
+
+
+class GeofenceHeartbeatRequest(BaseModel):
+    latitude: float
+    longitude: float
+    accuracy: Optional[float] = None
+    captured_at: Optional[datetime] = None
+
+
+class GeofenceStateResponse(BaseModel):
+    in_geofence: bool
+    matched_dealership_id: Optional[str]
+    distance_meters: Optional[float]
+    accuracy_meters: Optional[float]
+    checked_at: datetime
+    consecutive_out_count: int
+    first_out_detected_at: Optional[datetime]
+    should_notify: bool
+    should_auto_stop: bool
+    message: str
+
+
+@router.post("/geofence/check", response_model=GeofenceCheckResponse)
+async def check_geofence(
+    payload: GeofenceCheckRequest,
+    session: Session = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+
+    user_dealership_ids = current_user.get("dealerships") or []
+
+    if not user_dealership_ids:
+        return GeofenceCheckResponse(
+            in_geofence=False,
+            matched_dealership_id=None,
+            message="User has no assigned dealerships to validate against.",
+        )
+
+    lat = payload.latitude
+    lng = payload.longitude
+
+    # Validate against each assigned shop; return on first match
+    for shop_id in user_dealership_ids:
+        shop = session.get(Shop, shop_id)
+        if not shop:
+            continue
+        if is_within_radius(
+            lat, lng, shop.center_lat, shop.center_lng, shop.radius_meters
+        ):
+            return GeofenceCheckResponse(
+                in_geofence=True,
+                matched_dealership_id=shop.id,
+                message="Within geofence of an assigned dealership.",
+            )
+
+    return GeofenceCheckResponse(
+        in_geofence=False,
+        matched_dealership_id=None,
+        message="Not within the geofence of any assigned dealership.",
+    )
+
+
+@router.post("/geofence/heartbeat", response_model=GeofenceStateResponse)
+async def geofence_heartbeat(
+    payload: GeofenceHeartbeatRequest,
+    session: Session = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+    device_id: Optional[str] = Header(default=None, alias="X-Device-Id"),
+):
+
+    user_id = current_user["uid"]
+    user_dealership_ids = current_user.get("dealerships") or []
+
+    now_utc = datetime.now(timezone.utc)
+    checked_at = (
+        payload.captured_at.replace(tzinfo=timezone.utc)
+        if payload.captured_at
+        else now_utc
+    )
+
+    # Default state if no dealerships assigned
+    if not user_dealership_ids:
+        state = {
+            "in_geofence": False,
+            "matched_dealership_id": None,
+            "distance_meters": None,
+            "accuracy_meters": (
+                float(payload.accuracy) if payload.accuracy is not None else None
+            ),
+            "checked_at": checked_at,
+            "consecutive_out_count": 0,
+            "first_out_detected_at": None,
+            "should_notify": False,
+            "should_auto_stop": False,
+            "message": "User has no assigned dealerships to validate against.",
+            # extras persisted
+            "employee_id": user_id,
+            "last_lat": payload.latitude,
+            "last_lng": payload.longitude,
+            "device_id": device_id,
+        }
+        firestore_db.collection("employee_geofence_state").document(user_id).set(state)
+        return GeofenceStateResponse(**state)
+
+    lat = payload.latitude
+    lng = payload.longitude
+    accuracy_m = float(payload.accuracy) if payload.accuracy is not None else None
+
+    # Find nearest assigned shop and whether inside any geofence
+    nearest_distance = None
+    nearest_shop_id: Optional[str] = None
+    matched_dealership_id: Optional[str] = None
+    in_geofence = False
+
+    for shop_id in user_dealership_ids:
+        shop = session.get(Shop, shop_id)
+        if not shop:
+            continue
+        # distance to this shop center
+        distance = haversine_dist(lat, lng, shop.center_lat, shop.center_lng)
+        if nearest_distance is None or distance < nearest_distance:
+            nearest_distance = distance
+            nearest_shop_id = shop.id
+        # check inside radius
+        if not in_geofence and is_within_radius(
+            lat, lng, shop.center_lat, shop.center_lng, shop.radius_meters
+        ):
+            in_geofence = True
+            matched_dealership_id = shop.id
+
+    # Load previous cached state
+    state_ref = firestore_db.collection("employee_geofence_state").document(user_id)
+    prev_doc = state_ref.get()
+    prev_state = prev_doc.to_dict() if prev_doc.exists else None
+
+    prev_in = prev_state.get("in_geofence") if prev_state else None
+    prev_consecutive_out = (
+        int(prev_state.get("consecutive_out_count", 0)) if prev_state else 0
+    )
+    prev_first_out_at = prev_state.get("first_out_detected_at") if prev_state else None
+
+    # Normalize prev_first_out_at to datetime if it is a string
+    if isinstance(prev_first_out_at, str):
+        try:
+            prev_first_out_at = datetime.fromisoformat(prev_first_out_at)
+            if prev_first_out_at.tzinfo is None:
+                prev_first_out_at = prev_first_out_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            prev_first_out_at = None
+
+    should_notify = False
+    should_auto_stop = False
+    consecutive_out_count = 0
+    first_out_detected_at = None
+
+    if in_geofence:
+        consecutive_out_count = 0
+        first_out_detected_at = None
+        should_notify = False
+        should_auto_stop = False
+    else:
+        if prev_in is True or prev_in is None:
+            consecutive_out_count = 1
+            first_out_detected_at = checked_at
+            should_notify = True
+        else:
+            consecutive_out_count = prev_consecutive_out + 1
+            first_out_detected_at = prev_first_out_at or checked_at
+            should_notify = False
+
+        # auto stop when out twice in a row (with optional grace)
+        if consecutive_out_count >= 2:
+            if GEOFENCE_GRACE_MINUTES_DEFAULT and first_out_detected_at is not None:
+                elapsed = (checked_at - first_out_detected_at).total_seconds() / 60.0
+                should_auto_stop = elapsed >= float(GEOFENCE_GRACE_MINUTES_DEFAULT)
+            else:
+                should_auto_stop = True
+
+    # Build message with accuracy hints
+    message_parts = []
+    if in_geofence:
+        message_parts.append("Within geofence of an assigned dealership.")
+    else:
+        message_parts.append("Outside all assigned dealership geofences.")
+    if accuracy_m is not None:
+        if accuracy_m > 1000:
+            message_parts.append("Reported accuracy is very low (>1000m).")
+        elif accuracy_m > MIN_ACCURACY_METERS_FOR_DECISION_DEFAULT:
+            message_parts.append("Accuracy is worse than recommended threshold.")
+    message = " ".join(message_parts)
+
+    state = {
+        "in_geofence": in_geofence,
+        "matched_dealership_id": matched_dealership_id,
+        "distance_meters": (
+            float(nearest_distance) if nearest_distance is not None else None
+        ),
+        "accuracy_meters": accuracy_m,
+        "checked_at": checked_at,
+        "consecutive_out_count": int(consecutive_out_count),
+        "first_out_detected_at": first_out_detected_at,
+        "should_notify": should_notify,
+        "should_auto_stop": should_auto_stop,
+        "message": message,
+        # extras persisted
+        "employee_id": user_id,
+        "last_lat": lat,
+        "last_lng": lng,
+        "device_id": device_id,
+        "nearest_dealership_id": nearest_shop_id,
+    }
+
+    state_ref.set(state)
+
+    return GeofenceStateResponse(**state)
+
+
+@router.get("/geofence/status", response_model=GeofenceStateResponse)
+async def geofence_status(
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = current_user["uid"]
+    state_ref = firestore_db.collection("employee_geofence_state").document(user_id)
+    doc = state_ref.get()
+    if not doc.exists:
+        now_utc = datetime.now(timezone.utc)
+        return GeofenceStateResponse(
+            in_geofence=False,
+            matched_dealership_id=None,
+            distance_meters=None,
+            accuracy_meters=None,
+            checked_at=now_utc,
+            consecutive_out_count=0,
+            first_out_detected_at=None,
+            should_notify=False,
+            should_auto_stop=False,
+            message="No heartbeat yet.",
+        )
+
+    payload = doc.to_dict() or {}
+
+    # Ensure required fields with sensible defaults
+    return GeofenceStateResponse(
+        in_geofence=bool(payload.get("in_geofence", False)),
+        matched_dealership_id=payload.get("matched_dealership_id"),
+        distance_meters=(
+            float(payload.get("distance_meters"))
+            if payload.get("distance_meters") is not None
+            else None
+        ),
+        accuracy_meters=(
+            float(payload.get("accuracy_meters"))
+            if payload.get("accuracy_meters") is not None
+            else None
+        ),
+        checked_at=payload.get("checked_at", datetime.now(timezone.utc)),
+        consecutive_out_count=int(payload.get("consecutive_out_count", 0)),
+        first_out_detected_at=payload.get("first_out_detected_at"),
+        should_notify=bool(payload.get("should_notify", False)),
+        should_auto_stop=bool(payload.get("should_auto_stop", False)),
+        message=payload.get("message", "OK"),
     )
 
 
