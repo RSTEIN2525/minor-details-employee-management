@@ -4290,6 +4290,18 @@ async def get_basic_weekly_summary(
 
 
 # --- Missing Shifts / Long-Running Shifts ---
+
+
+class MissingShiftEvent(BaseModel):
+    event_type: str  # "missing_out" or "missing_in"
+    timestamp: datetime
+    dealership_id: Optional[str] = None
+
+    @field_serializer("timestamp")
+    def serialize_timestamp(self, dt: datetime) -> str:
+        return format_utc_datetime(dt)
+
+
 class MissingShiftEmployeeSummary(BaseModel):
     employee_id: str
     employee_name: Optional[str] = None
@@ -4300,6 +4312,7 @@ class MissingShiftEmployeeSummary(BaseModel):
     last_known_clock_in_at: Optional[str] = None
     was_auto_stopped_recently: bool = False
     auto_stop_count: int = 0
+    missing_events: List[MissingShiftEvent] = []
 
 
 def _detect_missing_shifts_for_employee(
@@ -4309,7 +4322,7 @@ def _detect_missing_shifts_for_employee(
     end_dt: datetime,
     now: datetime,
     analysis_tz: ZoneInfo,
-) -> Tuple[int, int, Optional[str], bool, Optional[float]]:
+) -> Tuple[int, int, Optional[str], bool, Optional[float], List[MissingShiftEvent]]:
     """Detect unpaired punches using robust pairing logic with window/carry-in context.
 
     Returns:
@@ -4322,16 +4335,18 @@ def _detect_missing_shifts_for_employee(
         ordered.append(carry_in_punch)
     ordered.extend(in_window_punches)
     if not ordered:
-        return 0, 0, None, False, None
+        return 0, 0, None, False, None, []
 
     ordered.sort(key=lambda x: x.timestamp)
 
     open_clock_in_ts: Optional[datetime] = None
+    open_clock_in_dealership: Optional[str] = None
     missing_in = 0
     missing_out = 0
     last_known_clock_in_iso: Optional[str] = None
     has_long_running = False
     long_running_hours: Optional[float] = None
+    events: List[MissingShiftEvent] = []
 
     today_est = now.astimezone(analysis_tz).date()
 
@@ -4347,7 +4362,15 @@ def _detect_missing_shifts_for_employee(
                 # Consecutive IN → previous open shift missing OUT
                 if is_in_window:
                     missing_out += 1
+                    events.append(
+                        MissingShiftEvent(
+                            event_type="missing_out",
+                            timestamp=open_clock_in_ts,
+                            dealership_id=open_clock_in_dealership,
+                        )
+                    )
             open_clock_in_ts = ts
+            open_clock_in_dealership = punch.dealership_id
             if is_in_window:
                 last_known_clock_in_iso = ts.isoformat()
         elif punch.punch_type == PunchType.CLOCK_OUT:
@@ -4355,9 +4378,17 @@ def _detect_missing_shifts_for_employee(
                 # Orphan OUT
                 if is_in_window:
                     missing_in += 1
+                    events.append(
+                        MissingShiftEvent(
+                            event_type="missing_in",
+                            timestamp=ts,
+                            dealership_id=punch.dealership_id,
+                        )
+                    )
             else:
                 # Normal pair
                 open_clock_in_ts = None
+                open_clock_in_dealership = None
 
     # Trailing open shift: count as missing OUT only if it started before today (EST)
     if open_clock_in_ts is not None:
@@ -4373,6 +4404,13 @@ def _detect_missing_shifts_for_employee(
             # Count it if the open IN started within window or the window includes today
             if open_clock_in_ts >= start_dt and open_clock_in_ts <= end_dt:
                 missing_out += 1
+                events.append(
+                    MissingShiftEvent(
+                        event_type="missing_out",
+                        timestamp=open_clock_in_ts,
+                        dealership_id=open_clock_in_dealership,
+                    )
+                )
 
     return (
         missing_in,
@@ -4380,6 +4418,7 @@ def _detect_missing_shifts_for_employee(
         last_known_clock_in_iso,
         has_long_running,
         long_running_hours,
+        events,
     )
 
 
@@ -4458,7 +4497,7 @@ async def get_missing_shifts_summary(
         in_window = punches_by_employee.get(emp_id, [])
         carry_in = carry_in_state.get(emp_id)
 
-        missing_in, missing_out, last_in_iso, has_long_run, long_hours = (
+        missing_in, missing_out, last_in_iso, has_long_run, long_hours, events = (
             _detect_missing_shifts_for_employee(
                 in_window, carry_in, start_dt, end_dt, now, analysis_tz
             )
@@ -4473,6 +4512,7 @@ async def get_missing_shifts_summary(
                     has_long_running_shift_over_12h=has_long_run,
                     long_running_duration_hours=long_hours,
                     last_known_clock_in_at=last_in_iso,
+                    missing_events=events,
                 )
             )
 
