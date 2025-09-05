@@ -4302,6 +4302,87 @@ class MissingShiftEmployeeSummary(BaseModel):
     auto_stop_count: int = 0
 
 
+def _detect_missing_shifts_for_employee(
+    in_window_punches: List[TimeLog],
+    carry_in_punch: Optional[TimeLog],
+    start_dt: datetime,
+    end_dt: datetime,
+    now: datetime,
+    analysis_tz: ZoneInfo,
+) -> Tuple[int, int, Optional[str], bool, Optional[float]]:
+    """Detect unpaired punches using robust pairing logic with window/carry-in context.
+
+    Returns:
+        (missing_clock_ins, missing_clock_outs, last_known_clock_in_iso,
+         has_long_running_shift_over_12h, long_running_duration_hours)
+    """
+    # Build ordered list including carry-in (if provided)
+    ordered: List[TimeLog] = []
+    if carry_in_punch is not None:
+        ordered.append(carry_in_punch)
+    ordered.extend(in_window_punches)
+    if not ordered:
+        return 0, 0, None, False, None
+
+    ordered.sort(key=lambda x: x.timestamp)
+
+    open_clock_in_ts: Optional[datetime] = None
+    missing_in = 0
+    missing_out = 0
+    last_known_clock_in_iso: Optional[str] = None
+    has_long_running = False
+    long_running_hours: Optional[float] = None
+
+    today_est = now.astimezone(analysis_tz).date()
+
+    for punch in ordered:
+        ts = punch.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+
+        is_in_window = start_dt <= ts <= end_dt
+
+        if punch.punch_type == PunchType.CLOCK_IN:
+            if open_clock_in_ts is not None:
+                # Consecutive IN → previous open shift missing OUT
+                if is_in_window:
+                    missing_out += 1
+            open_clock_in_ts = ts
+            if is_in_window:
+                last_known_clock_in_iso = ts.isoformat()
+        elif punch.punch_type == PunchType.CLOCK_OUT:
+            if open_clock_in_ts is None:
+                # Orphan OUT
+                if is_in_window:
+                    missing_in += 1
+            else:
+                # Normal pair
+                open_clock_in_ts = None
+
+    # Trailing open shift: count as missing OUT only if it started before today (EST)
+    if open_clock_in_ts is not None:
+        start_date_est = open_clock_in_ts.astimezone(analysis_tz).date()
+        # Long-running detection
+        duration = (now - open_clock_in_ts).total_seconds() / 3600
+        if duration > 12.0:
+            has_long_running = True
+            long_running_hours = round(duration, 2)
+
+        if start_date_est < today_est:
+            # Not today → treat as missing OUT
+            # Count it if the open IN started within window or the window includes today
+            if open_clock_in_ts >= start_dt and open_clock_in_ts <= end_dt:
+                missing_out += 1
+
+    return (
+        missing_in,
+        missing_out,
+        last_known_clock_in_iso,
+        has_long_running,
+        long_running_hours,
+    )
+
+
 @router.get(
     "/employees/missing-shifts", response_model=List[MissingShiftEmployeeSummary]
 )
@@ -4368,59 +4449,30 @@ async def get_missing_shifts_summary(
         for log in carry_in_logs:
             carry_in_state[log.employee_id] = log
 
-    # Process each employee
+    # Process each employee using robust pairing with EST semantics
     anomalies: List[MissingShiftEmployeeSummary] = []
+    analysis_tz = ZoneInfo("America/New_York")
+    now = datetime.now(timezone.utc)
+
     for emp_id in employee_ids:
-        # Get all punches for this employee
-        all_employee_punches = []
+        in_window = punches_by_employee.get(emp_id, [])
+        carry_in = carry_in_state.get(emp_id)
 
-        # Add carry-in punch if exists
-        if emp_id in carry_in_state:
-            all_employee_punches.append(carry_in_state[emp_id])
+        missing_in, missing_out, last_in_iso, has_long_run, long_hours = (
+            _detect_missing_shifts_for_employee(
+                in_window, carry_in, start_dt, end_dt, now, analysis_tz
+            )
+        )
 
-        # Add in-window punches
-        all_employee_punches.extend(punches_by_employee.get(emp_id, []))
-
-        # Sort by timestamp
-        sorted_punches = sorted(all_employee_punches, key=lambda x: x.timestamp)
-
-        # Simple pairing logic
-        missing_in = 0
-        missing_out = 0
-        clock_in_time = None
-        last_clock_in_time = None
-
-        for punch in sorted_punches:
-            punch_ts = punch.timestamp
-            if punch_ts.tzinfo is None:
-                punch_ts = punch_ts.replace(tzinfo=timezone.utc)
-
-            is_in_window = start_dt <= punch_ts <= end_dt
-
-            if punch.punch_type == PunchType.CLOCK_IN:
-                if clock_in_time is not None and is_in_window:
-                    missing_out += 1  # Consecutive INs
-                clock_in_time = punch_ts
-                if is_in_window:
-                    last_clock_in_time = punch_ts
-            elif punch.punch_type == PunchType.CLOCK_OUT:
-                if clock_in_time is None and is_in_window:
-                    missing_in += 1  # Orphan OUT
-                else:
-                    clock_in_time = None  # Normal pair
-
-        # SIMPLIFIED: Don't flag trailing open shifts (too many false positives)
-        # Only flag clear consecutive INs and orphan OUTs
-
-        if missing_in > 0 or missing_out > 0:
+        if missing_in > 0 or missing_out > 0 or has_long_run:
             anomalies.append(
                 MissingShiftEmployeeSummary(
                     employee_id=emp_id,
                     missing_clock_ins=missing_in,
                     missing_clock_outs=missing_out,
-                    last_known_clock_in_at=(
-                        last_clock_in_time.isoformat() if last_clock_in_time else None
-                    ),
+                    has_long_running_shift_over_12h=has_long_run,
+                    long_running_duration_hours=long_hours,
+                    last_known_clock_in_at=last_in_iso,
                 )
             )
 
