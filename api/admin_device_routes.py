@@ -1,18 +1,19 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Query
-from fastapi.responses import Response
-from typing import Annotated
-from datetime import datetime, timezone, timedelta
-from core.firebase import db
-from google.cloud.firestore_v1.transforms import ArrayUnion, ArrayRemove
-from google.cloud.firestore_v1.base_query import FieldFilter
-from core.deps import require_admin_role, get_current_user_basic_auth
-from pydantic import BaseModel, field_serializer
-from typing import List
-from google.cloud import storage
 import os
-from utils.storage import debug_file_metadata, remove_download_tokens_from_file
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, List
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import Response
+from google.cloud import storage
+from google.cloud.firestore_v1.base_query import FieldFilter
+from google.cloud.firestore_v1.transforms import ArrayRemove, ArrayUnion
+from pydantic import BaseModel, field_serializer
+
+from core.deps import get_current_user_basic_auth, require_admin_role
+from core.firebase import db
 from utils.database_storage import get_device_photo_from_db, photo_to_base64
 from utils.datetime_helpers import format_utc_datetime
+from utils.storage import debug_file_metadata, remove_download_tokens_from_file
 
 router = APIRouter()
 
@@ -32,7 +33,7 @@ class DeviceRequestHistory(BaseModel):
     processedByUid: str | None
     processedByEmail: str | None
 
-    @field_serializer('requestedAt', 'processedAt')
+    @field_serializer("requestedAt", "processedAt")
     def serialize_timestamps(self, dt: datetime | str | None) -> str | None:
         """Ensure timestamps are formatted as UTC with Z suffix"""
         if dt is None:
@@ -47,7 +48,7 @@ class DeviceRequestSummary(BaseModel):
     totalRequests: int
     lastRequestedAt: datetime | str | None
 
-    @field_serializer('lastRequestedAt')
+    @field_serializer("lastRequestedAt")
     def serialize_last_requested_at(self, dt: datetime | str | None) -> str | None:
         """Ensure lastRequestedAt is formatted as UTC with Z suffix"""
         if dt is None:
@@ -77,7 +78,7 @@ async def list_pending_device_requests(
 
         for doc in request_query.stream():
             request_data = doc.to_dict()
-            
+
             # Ensure essential fields are present and formatted for consistent API response
             processed_request = {
                 "id": doc.id,
@@ -86,7 +87,9 @@ async def list_pending_device_requests(
                 "userName": request_data.get("userName"),
                 "deviceId": request_data.get("deviceId"),
                 "phoneNumber": request_data.get("phoneNumber"),
-                "photoId": request_data.get("photoId"), # Ensure photoId is included, even if None
+                "photoId": request_data.get(
+                    "photoId"
+                ),  # Ensure photoId is included, even if None
                 "status": request_data.get("status", "pending"),
                 "requestedAt": request_data.get("requestedAt"),
                 "processedAt": request_data.get("processedAt"),
@@ -96,9 +99,13 @@ async def list_pending_device_requests(
 
             # Convert Timestamp For JSON Compatibility
             if isinstance(processed_request["requestedAt"], datetime):
-                processed_request["requestedAt"] = processed_request["requestedAt"].isoformat()
+                processed_request["requestedAt"] = processed_request[
+                    "requestedAt"
+                ].isoformat()
             if isinstance(processed_request["processedAt"], datetime):
-                 processed_request["processedAt"] = processed_request["processedAt"].isoformat()
+                processed_request["processedAt"] = processed_request[
+                    "processedAt"
+                ].isoformat()
 
             pending_requests.append(processed_request)
 
@@ -140,7 +147,9 @@ async def list_approved_device_requests(
                 "userName": request_data.get("userName"),
                 "deviceId": request_data.get("deviceId"),
                 "phoneNumber": request_data.get("phoneNumber"),
-                "photoId": request_data.get("photoId"), # Ensure photoId is included, even if None
+                "photoId": request_data.get(
+                    "photoId"
+                ),  # Ensure photoId is included, even if None
                 "status": request_data.get("status", "approved"),
                 "requestedAt": request_data.get("requestedAt"),
                 "processedAt": request_data.get("processedAt"),
@@ -149,9 +158,13 @@ async def list_approved_device_requests(
             }
 
             if isinstance(processed_request["requestedAt"], datetime):
-                processed_request["requestedAt"] = processed_request["requestedAt"].isoformat()
+                processed_request["requestedAt"] = processed_request[
+                    "requestedAt"
+                ].isoformat()
             if isinstance(processed_request["processedAt"], datetime):
-                processed_request["processedAt"] = processed_request["processedAt"].isoformat()
+                processed_request["processedAt"] = processed_request[
+                    "processedAt"
+                ].isoformat()
 
             approved_requests.append(processed_request)
 
@@ -162,6 +175,71 @@ async def list_approved_device_requests(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not retrieve approved device requests.",
+        )
+
+
+@router.get("/approved/all")
+async def list_alltime_approved_device_requests(
+    admin_user: Annotated[dict, Depends(require_admin_role)],
+):
+    """Return ALL approved device requests of all time with the same schema as /approved.
+
+    Notes:
+    - Ordered by processedAt DESC
+    - No limit
+    - Timestamps returned as ISO strings
+    """
+    try:
+
+        # Pull Collection
+        request_ref = db.collection("deviceRequests")
+
+        # Form Query (no limit)
+        request_query = request_ref.where(
+            filter=FieldFilter("status", "==", "approved")
+        ).order_by("processedAt", direction="DESCENDING")
+
+        approved_requests: list[dict] = []
+
+        for doc in request_query.stream():
+            request_data = doc.to_dict()
+
+            processed_request = {
+                "id": doc.id,
+                "userId": request_data.get("userId"),
+                "userEmail": request_data.get("userEmail"),
+                "userName": request_data.get("userName"),
+                "deviceId": request_data.get("deviceId"),
+                "phoneNumber": request_data.get("phoneNumber"),
+                "photoId": request_data.get(
+                    "photoId"
+                ),  # Ensure photoId is included, even if None
+                "status": request_data.get("status", "approved"),
+                "requestedAt": request_data.get("requestedAt"),
+                "processedAt": request_data.get("processedAt"),
+                "processedByUid": request_data.get("processedByUid"),
+                "processedByEmail": request_data.get("processedByEmail"),
+            }
+
+            # Convert Timestamp For JSON Compatibility
+            if isinstance(processed_request["requestedAt"], datetime):
+                processed_request["requestedAt"] = processed_request[
+                    "requestedAt"
+                ].isoformat()
+            if isinstance(processed_request["processedAt"], datetime):
+                processed_request["processedAt"] = processed_request[
+                    "processedAt"
+                ].isoformat()
+
+            approved_requests.append(processed_request)
+
+        return {"status": "success", "data": approved_requests}
+
+    except Exception as e:
+        print(f"Error fetching all-time approved device requests: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not retrieve all approved device requests.",
         )
 
 
@@ -193,7 +271,9 @@ async def list_rejected_device_requests(
                 "userName": request_data.get("userName"),
                 "deviceId": request_data.get("deviceId"),
                 "phoneNumber": request_data.get("phoneNumber"),
-                "photoId": request_data.get("photoId"), # Ensure photoId is included, even if None
+                "photoId": request_data.get(
+                    "photoId"
+                ),  # Ensure photoId is included, even if None
                 "status": request_data.get("status", "rejected"),
                 "requestedAt": request_data.get("requestedAt"),
                 "processedAt": request_data.get("processedAt"),
@@ -202,19 +282,23 @@ async def list_rejected_device_requests(
             }
 
             if isinstance(processed_request["requestedAt"], datetime):
-                processed_request["requestedAt"] = processed_request["requestedAt"].isoformat()
+                processed_request["requestedAt"] = processed_request[
+                    "requestedAt"
+                ].isoformat()
             if isinstance(processed_request["processedAt"], datetime):
-                processed_request["processedAt"] = processed_request["processedAt"].isoformat()
+                processed_request["processedAt"] = processed_request[
+                    "processedAt"
+                ].isoformat()
 
             rejected_requests.append(processed_request)
 
         return {"status": "success", "data": rejected_requests}
 
     except Exception as e:
-        print(f"Error fetching rejected device requests: {e}") 
+        print(f"Error fetching rejected device requests: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not retrieve rejected device requests.", 
+            detail="Could not retrieve rejected device requests.",
         )
 
 
@@ -542,7 +626,9 @@ async def get_latest_device_request_info(  # Renamed for clarity
         )
 
 
-@router.get("/users/{user_id}/device-request-summary", response_model=DeviceRequestSummary)
+@router.get(
+    "/users/{user_id}/device-request-summary", response_model=DeviceRequestSummary
+)
 async def get_user_device_request_summary(
     user_id: str, admin_user: Annotated[dict, Depends(require_admin_role)]
 ):
@@ -620,7 +706,7 @@ async def get_device_photo_for_request(
 ):
     """
     🔒 SECURE ADMIN ENDPOINT: View photo for a specific device request.
-    
+
     Security Features:
     - Requires admin authentication
     - Access by request ID only (not photo ID)
@@ -632,35 +718,37 @@ async def get_device_photo_for_request(
         # Get the device request document
         request_ref = db.collection("deviceRequests").document(request_id)
         request_doc = request_ref.get()
-        
+
         if not request_doc.exists:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Device request {request_id} not found"
+                detail=f"Device request {request_id} not found",
             )
-        
+
         request_data = request_doc.to_dict()
-        
+
         # Only support database storage (photoId)
         photo_id = request_data.get("photoId")
         if not photo_id:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="No photo found for this device request. Only new database-stored photos are supported."
+                detail="No photo found for this device request. Only new database-stored photos are supported.",
             )
-        
+
         # Retrieve photo from secure database storage
         photo = await get_device_photo_from_db(photo_id)
         if not photo:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Photo {photo_id} not found in database"
+                detail=f"Photo {photo_id} not found in database",
             )
-        
+
         # Log secure access
         admin_email = admin_user.get("email", "unknown")
-        print(f"🔒 SECURE PHOTO ACCESS: Admin {admin_email} viewing photo {photo_id} for request {request_id}")
-        
+        print(
+            f"🔒 SECURE PHOTO ACCESS: Admin {admin_email} viewing photo {photo_id} for request {request_id}"
+        )
+
         # Return photo with security headers
         return Response(
             content=photo.image_data,
@@ -669,17 +757,17 @@ async def get_device_photo_for_request(
                 "Content-Disposition": f"inline; filename={photo.filename}",
                 "X-Request-Info": f"Request: {request_id}, User: {request_data.get('userId')}, Device: {request_data.get('deviceId')}",
                 "X-Security-Level": "admin-only",
-                "Cache-Control": "no-cache, no-store, must-revalidate"
-            }
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+            },
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
         print(f"❌ Error retrieving secure photo for request {request_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not retrieve photo for device request"
+            detail="Could not retrieve photo for device request",
         )
 
 
@@ -690,7 +778,7 @@ async def get_device_photo_base64_for_request(
 ):
     """
     🔒 SECURE ADMIN ENDPOINT: Get device photo as base64 for a specific request.
-    
+
     Security Features:
     - Requires admin authentication
     - Access by request ID only (not photo ID)
@@ -701,36 +789,38 @@ async def get_device_photo_base64_for_request(
         # Get the device request document
         request_ref = db.collection("deviceRequests").document(request_id)
         request_doc = request_ref.get()
-        
+
         if not request_doc.exists:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Device request {request_id} not found"
+                detail=f"Device request {request_id} not found",
             )
-        
+
         request_data = request_doc.to_dict()
         photo_id = request_data.get("photoId")
-        
+
         if not photo_id:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="No photo found for this device request. Only new database-stored photos are supported."
+                detail="No photo found for this device request. Only new database-stored photos are supported.",
             )
-        
+
         # Retrieve photo from secure database storage
         photo = await get_device_photo_from_db(photo_id)
         if not photo:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Photo {photo_id} not found in database"
+                detail=f"Photo {photo_id} not found in database",
             )
-        
+
         # Log secure access
         admin_email = admin_user.get("email", "unknown")
-        print(f"🔒 SECURE PHOTO ACCESS (base64): Admin {admin_email} viewing photo {photo_id} for request {request_id}")
-        
+        print(
+            f"🔒 SECURE PHOTO ACCESS (base64): Admin {admin_email} viewing photo {photo_id} for request {request_id}"
+        )
+
         base64_data = photo_to_base64(photo)
-        
+
         return {
             "request_id": request_id,
             "photo_id": photo.id,
@@ -741,14 +831,14 @@ async def get_device_photo_base64_for_request(
             "file_size": photo.file_size,
             "uploaded_at": photo.uploaded_at,
             "base64_data": base64_data,
-            "security_level": "admin-only"
+            "security_level": "admin-only",
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
         print(f"❌ Error retrieving secure base64 photo for request {request_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not retrieve photo for device request"
+            detail="Could not retrieve photo for device request",
         )
