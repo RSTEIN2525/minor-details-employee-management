@@ -2,7 +2,16 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, List
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from fastapi.responses import Response
 from google.cloud import storage
 from google.cloud.firestore_v1.base_query import FieldFilter
@@ -11,7 +20,11 @@ from pydantic import BaseModel, field_serializer
 
 from core.deps import get_current_user_basic_auth, require_admin_role
 from core.firebase import db
-from utils.database_storage import get_device_photo_from_db, photo_to_base64
+from utils.database_storage import (
+    get_device_photo_from_db,
+    photo_to_base64,
+    store_device_photo_in_db,
+)
 from utils.datetime_helpers import format_utc_datetime
 from utils.storage import debug_file_metadata, remove_download_tokens_from_file
 
@@ -496,6 +509,94 @@ async def approve_device_request(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Could not approve device request.",
+        )
+
+
+@router.post("/users/{user_id}/id-photo/reset")
+async def admin_reset_user_id_photo(
+    user_id: str,
+    id_photo: Annotated[
+        UploadFile, File(description="Replacement ID photo (JPEG/PNG/WEBP, max ~5MB)")
+    ],
+    admin_user: Annotated[dict, Depends(require_admin_role)],
+):
+    """Admin override: upload a new ID photo for a user and attach it to their most recent device request.
+
+    Behavior:
+    - Stores the new photo securely in the database.
+    - Finds the user's most recent device request (any status) and updates its photoId.
+    - If no device requests exist, creates an admin override record in deviceRequests with status "approved" and links the photo.
+    - Does NOT modify the user's devices array.
+    """
+    try:
+        # Store photo in DB without requiring a device_id yet (use placeholder)
+        placeholder_device_id = "admin_override"
+        new_photo_id = await store_device_photo_in_db(
+            id_photo, user_id, placeholder_device_id
+        )
+
+        requests_ref = db.collection("deviceRequests")
+
+        # Find most recent device request for this user
+        recent_query = (
+            requests_ref.where(filter=FieldFilter("userId", "==", user_id))
+            .order_by("requestedAt", direction="DESCENDING")
+            .limit(1)
+        )
+        results = list(recent_query.stream())
+
+        if results:
+            # Update existing most recent request with new photoId and audit info
+            req_snapshot = results[0]
+            req_snapshot.reference.update(
+                {
+                    "photoId": new_photo_id,
+                    "processedAt": datetime.now(timezone.utc),
+                    "processedByUid": admin_user.get("uid"),
+                    "processedByEmail": admin_user.get("email"),
+                }
+            )
+            target_request_id = req_snapshot.id
+            updated_status = req_snapshot.to_dict().get("status")
+        else:
+            # Create an admin override request doc to attach this photo to
+            new_doc_ref = requests_ref.add(
+                {
+                    "userId": user_id,
+                    "userEmail": None,
+                    "userName": None,
+                    "deviceId": placeholder_device_id,
+                    "phoneNumber": None,
+                    "photoId": new_photo_id,
+                    "status": "approved",
+                    "requestedAt": datetime.now(timezone.utc),
+                    "processedAt": datetime.now(timezone.utc),
+                    "processedByUid": admin_user.get("uid"),
+                    "processedByEmail": admin_user.get("email"),
+                    "adminOverride": True,
+                }
+            )
+            target_request_id = (
+                new_doc_ref[1].id if isinstance(new_doc_ref, tuple) else None
+            )
+            updated_status = "approved"
+
+        return {
+            "status": "success",
+            "message": "User ID photo reset/uploaded successfully.",
+            "user_id": user_id,
+            "request_id": target_request_id,
+            "photo_id": new_photo_id,
+            "request_status": updated_status,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error in admin_reset_user_id_photo for user {user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not reset user ID photo.",
         )
 
 
