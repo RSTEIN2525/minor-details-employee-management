@@ -1284,155 +1284,155 @@ class AutoStopShiftResponse(BaseModel):
     admin_id: str
 
 
-@router.post("/auto-stop-overlong-shift", response_model=AutoStopShiftResponse)
-async def auto_stop_overlong_shift(
-    payload: AutoStopShiftRequestPayload,
-    session: Session = Depends(get_session),
-    admin: dict = Depends(require_admin_role),
-):
-    """
-    If the employee is currently clocked in and their ongoing shift exceeds `threshold_hours`
-    (default 15h), automatically create a CLOCK_OUT entry at the current time.
+# @router.post("/auto-stop-overlong-shift", response_model=AutoStopShiftResponse)
+# async def auto_stop_overlong_shift(
+#     payload: AutoStopShiftRequestPayload,
+#     session: Session = Depends(get_session),
+#     admin: dict = Depends(require_admin_role),
+# ):
+#     """
+#     If the employee is currently clocked in and their ongoing shift exceeds `threshold_hours`
+#     (default 15h), automatically create a CLOCK_OUT entry at the current time.
 
-    - Optional `dealership_id` limits the check to a specific store when employees work across locations.
-    - Optional `reason` is appended to the auto-stop admin notes.
-    """
-    admin_uid = admin.get("uid")
-    if not admin_uid:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin user ID not found"
-        )
+#     - Optional `dealership_id` limits the check to a specific store when employees work across locations.
+#     - Optional `reason` is appended to the auto-stop admin notes.
+#     """
+#     admin_uid = admin.get("uid")
+#     if not admin_uid:
+#         raise HTTPException(
+#             status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin user ID not found"
+#         )
 
-    try:
-        # Import here to avoid circular imports
-        from api.admin_analytics_routes import is_employee_currently_active
+#     try:
+#         # Import here to avoid circular imports
+#         from api.admin_analytics_routes import is_employee_currently_active
 
-        now_utc = datetime.now(timezone.utc)
+#         now_utc = datetime.now(timezone.utc)
 
-        # Determine current active status and the most recent CLOCK_IN timestamp
-        is_active, clock_in_ts = await is_employee_currently_active(
-            session=session,
-            employee_id=payload.employee_id,
-            dealership_id=payload.dealership_id,
-        )
+#         # Determine current active status and the most recent CLOCK_IN timestamp
+#         is_active, clock_in_ts = await is_employee_currently_active(
+#             session=session,
+#             employee_id=payload.employee_id,
+#             dealership_id=payload.dealership_id,
+#         )
 
-        if not is_active or not clock_in_ts:
-            return AutoStopShiftResponse(
-                success=True,
-                message=f"Employee {payload.employee_id} is not currently clocked in",
-                employee_id=payload.employee_id,
-                threshold_hours=payload.threshold_hours,
-                is_over_threshold=False,
-                was_clock_out_created=False,
-                shift_start_time=None,
-                shift_end_time=None,
-                shift_duration_hours=None,
-                dealership_id=payload.dealership_id,
-                created_timelog_id=None,
-                admin_id=admin_uid,
-            )
+#         if not is_active or not clock_in_ts:
+#             return AutoStopShiftResponse(
+#                 success=True,
+#                 message=f"Employee {payload.employee_id} is not currently clocked in",
+#                 employee_id=payload.employee_id,
+#                 threshold_hours=payload.threshold_hours,
+#                 is_over_threshold=False,
+#                 was_clock_out_created=False,
+#                 shift_start_time=None,
+#                 shift_end_time=None,
+#                 shift_duration_hours=None,
+#                 dealership_id=payload.dealership_id,
+#                 created_timelog_id=None,
+#                 admin_id=admin_uid,
+#             )
 
-        # Compute current shift duration
-        duration_hours = (now_utc - clock_in_ts).total_seconds() / 3600.0
-        over = duration_hours > payload.threshold_hours
+#         # Compute current shift duration
+#         duration_hours = (now_utc - clock_in_ts).total_seconds() / 3600.0
+#         over = duration_hours > payload.threshold_hours
 
-        if not over:
-            return AutoStopShiftResponse(
-                success=True,
-                message=(
-                    f"Shift duration {duration_hours:.2f}h is below threshold {payload.threshold_hours:.2f}h"
-                ),
-                employee_id=payload.employee_id,
-                threshold_hours=payload.threshold_hours,
-                is_over_threshold=False,
-                was_clock_out_created=False,
-                shift_start_time=format_utc_datetime(clock_in_ts),
-                shift_end_time=format_utc_datetime(now_utc),
-                shift_duration_hours=round(duration_hours, 2),
-                dealership_id=payload.dealership_id,
-                created_timelog_id=None,
-                admin_id=admin_uid,
-            )
+#         if not over:
+#             return AutoStopShiftResponse(
+#                 success=True,
+#                 message=(
+#                     f"Shift duration {duration_hours:.2f}h is below threshold {payload.threshold_hours:.2f}h"
+#                 ),
+#                 employee_id=payload.employee_id,
+#                 threshold_hours=payload.threshold_hours,
+#                 is_over_threshold=False,
+#                 was_clock_out_created=False,
+#                 shift_start_time=format_utc_datetime(clock_in_ts),
+#                 shift_end_time=format_utc_datetime(now_utc),
+#                 shift_duration_hours=round(duration_hours, 2),
+#                 dealership_id=payload.dealership_id,
+#                 created_timelog_id=None,
+#                 admin_id=admin_uid,
+#             )
 
-        # Determine dealership if not provided: use most recent CLOCK_IN's dealership
-        if not payload.dealership_id:
-            most_recent_clock_in = session.exec(
-                select(TimeLog)
-                .where(TimeLog.employee_id == payload.employee_id)
-                .where(TimeLog.punch_type == PunchType.CLOCK_IN)
-                .order_by(TimeLog.timestamp.desc())
-                .limit(1)
-            ).first()
+#         # Determine dealership if not provided: use most recent CLOCK_IN's dealership
+#         if not payload.dealership_id:
+#             most_recent_clock_in = session.exec(
+#                 select(TimeLog)
+#                 .where(TimeLog.employee_id == payload.employee_id)
+#                 .where(TimeLog.punch_type == PunchType.CLOCK_IN)
+#                 .order_by(TimeLog.timestamp.desc())
+#                 .limit(1)
+#             ).first()
 
-            if not most_recent_clock_in:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Could not determine active dealership for employee",
-                )
-            active_dealership_id = most_recent_clock_in.dealership_id
-        else:
-            active_dealership_id = payload.dealership_id
+#             if not most_recent_clock_in:
+#                 raise HTTPException(
+#                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+#                     detail="Could not determine active dealership for employee",
+#                 )
+#             active_dealership_id = most_recent_clock_in.dealership_id
+#         else:
+#             active_dealership_id = payload.dealership_id
 
-        # Create CLOCK_OUT entry at shift_start + threshold_hours (not current time)
-        cutoff_time = clock_in_ts + timedelta(hours=payload.threshold_hours)
-        reason_suffix = f" | {payload.reason}" if payload.reason else ""
-        admin_note = f"AUTO STOP SHIFT: Exceeded threshold {payload.threshold_hours:.2f}h (actual {duration_hours:.2f}h){reason_suffix}"
+#         # Create CLOCK_OUT entry at shift_start + threshold_hours (not current time)
+#         cutoff_time = clock_in_ts + timedelta(hours=payload.threshold_hours)
+#         reason_suffix = f" | {payload.reason}" if payload.reason else ""
+#         admin_note = f"AUTO STOP SHIFT: Exceeded threshold {payload.threshold_hours:.2f}h (actual {duration_hours:.2f}h){reason_suffix}"
 
-        clock_out_entry = TimeLog(
-            employee_id=payload.employee_id,
-            dealership_id=active_dealership_id,
-            punch_type=PunchType.CLOCK_OUT,
-            timestamp=cutoff_time,
-            admin_notes=admin_note,
-            admin_modifier_id=admin_uid,
-        )
-        session.add(clock_out_entry)
-        session.flush()
+#         clock_out_entry = TimeLog(
+#             employee_id=payload.employee_id,
+#             dealership_id=active_dealership_id,
+#             punch_type=PunchType.CLOCK_OUT,
+#             timestamp=cutoff_time,
+#             admin_notes=admin_note,
+#             admin_modifier_id=admin_uid,
+#         )
+#         session.add(clock_out_entry)
+#         session.flush()
 
-        # Log the admin action
-        admin_change = AdminTimeChange(
-            admin_id=admin_uid,
-            employee_id=payload.employee_id,
-            action=AdminTimeChangeAction.CREATE,
-            reason=admin_note,
-            clock_out_id=clock_out_entry.id,
-            dealership_id=active_dealership_id,
-            end_time=cutoff_time,
-            punch_date=cutoff_time.date().isoformat(),
-        )
-        session.add(admin_change)
-        session.commit()
-        session.refresh(clock_out_entry)
+#         # Log the admin action
+#         admin_change = AdminTimeChange(
+#             admin_id=admin_uid,
+#             employee_id=payload.employee_id,
+#             action=AdminTimeChangeAction.CREATE,
+#             reason=admin_note,
+#             clock_out_id=clock_out_entry.id,
+#             dealership_id=active_dealership_id,
+#             end_time=cutoff_time,
+#             punch_date=cutoff_time.date().isoformat(),
+#         )
+#         session.add(admin_change)
+#         session.commit()
+#         session.refresh(clock_out_entry)
 
-        return AutoStopShiftResponse(
-            success=True,
-            message=(
-                f"Auto-stopped shift for employee {payload.employee_id} at {active_dealership_id} after {duration_hours:.2f}h"
-            ),
-            employee_id=payload.employee_id,
-            threshold_hours=payload.threshold_hours,
-            is_over_threshold=True,
-            was_clock_out_created=True,
-            shift_start_time=format_utc_datetime(clock_in_ts),
-            shift_end_time=format_utc_datetime(cutoff_time),
-            shift_duration_hours=round(duration_hours, 2),
-            dealership_id=active_dealership_id,
-            created_timelog_id=clock_out_entry.id,
-            admin_id=admin_uid,
-        )
+#         return AutoStopShiftResponse(
+#             success=True,
+#             message=(
+#                 f"Auto-stopped shift for employee {payload.employee_id} at {active_dealership_id} after {duration_hours:.2f}h"
+#             ),
+#             employee_id=payload.employee_id,
+#             threshold_hours=payload.threshold_hours,
+#             is_over_threshold=True,
+#             was_clock_out_created=True,
+#             shift_start_time=format_utc_datetime(clock_in_ts),
+#             shift_end_time=format_utc_datetime(cutoff_time),
+#             shift_duration_hours=round(duration_hours, 2),
+#             dealership_id=active_dealership_id,
+#             created_timelog_id=clock_out_entry.id,
+#             admin_id=admin_uid,
+#         )
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        session.rollback()
-        print(f"❌ Error during auto-stop overlong shift: {e}")
-        import traceback
+#     except HTTPException:
+#         raise
+#     except Exception as e:
+#         session.rollback()
+#         print(f"❌ Error during auto-stop overlong shift: {e}")
+#         import traceback
 
-        print(f"Full traceback: {traceback.format_exc()}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Unexpected error in auto-stop endpoint: {str(e)}",
-        )
+#         print(f"Full traceback: {traceback.format_exc()}")
+#         raise HTTPException(
+#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+#             detail=f"Unexpected error in auto-stop endpoint: {str(e)}",
+#         )
 
 
 # --- REPORT: Recent Auto-Stop Events ---
