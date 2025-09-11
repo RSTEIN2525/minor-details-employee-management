@@ -52,6 +52,8 @@ async def list_all_users_for_admin(
             "serviceWash",
             "photos",
             "lotPrep",
+            "supplier",
+
         ]
 
         # Reference To User Collection
@@ -125,6 +127,7 @@ async def set_or_update_user_wage(
             "serviceWash",
             "lotPrep",
             "photos",
+            "supplier",
         ]
 
         if user_role not in allowed_roles:
@@ -171,6 +174,8 @@ async def list_all_user_wages_for_admin(
                 "serviceWash",
                 "lotPrep",
                 "photos",
+                "supplier",
+
             ]
             if user_role not in allowed_roles:
                 continue
