@@ -1,15 +1,13 @@
-from logging.config import fileConfig
 import os
+from logging.config import fileConfig
+
 from dotenv import load_dotenv
-
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
-
-from alembic import context
-
+from sqlalchemy import engine_from_config, pool
 from sqlmodel import SQLModel
+
 # Import the models package to ensure all models are registered with SQLModel's metadata
 import models
+from alembic import context
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -28,9 +26,14 @@ DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("DB_NAME")
 
 if not all([DB_USER, DB_PASSWORD, DB_HOST, DB_NAME]):
-    raise ValueError("Database connection details (DB_USER, DB_PASSWORD, DB_HOST, DB_NAME) not found in environment variables.")
+    raise ValueError(
+        "Database connection details (DB_USER, DB_PASSWORD, DB_HOST, DB_NAME) not found in environment variables."
+    )
 
-sqlalchemy_url = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+sqlalchemy_url = (
+    f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+)
+
 config.set_main_option("sqlalchemy.url", sqlalchemy_url)
 
 # Interpret the config file for Python logging.
@@ -67,7 +70,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
-        user_module_prefix='sqlmodel.sql.sqltypes.',
+        user_module_prefix="sqlmodel.sql.sqltypes.",
     )
 
     with context.begin_transaction():
@@ -82,13 +85,14 @@ def run_migrations_online() -> None:
 
     """
     from sqlalchemy import create_engine
+
     connectable = create_engine(sqlalchemy_url, poolclass=pool.NullPool)
 
     with connectable.connect() as connection:
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
-            user_module_prefix='sqlmodel.sql.sqltypes.',
+            user_module_prefix="sqlmodel.sql.sqltypes.",
         )
 
         with context.begin_transaction():
