@@ -1,28 +1,28 @@
 # Shift History for Employee: D3akEDdYgwQTd2Fg2DjsXR2cAyy1
 
-| In Time (UTC)       | Out Time (UTC)        | Dealership         | Total Hours |
-|---------------------|-----------------------|--------------------|-------------|
-| 2025-07-10 18:52:53 | 2025-07-10 22:02:59   | Len Stoler Lexus   | 3.17        |
-| 2025-07-15 13:38:41 | 2025-07-15 22:08:40   | Len Stoler Lexus   | 8.50        |
-| 2025-07-22 13:14:54 | 2025-07-22 21:49:00   | Len Stoler Lexus   | 8.57        |
-| 2025-07-24 15:05:09 | 2025-07-24 18:37:57   | Len Stoler Lexus   | 3.55        |
-| 2025-07-25 13:46:26 | 2025-07-25 22:57:16   | Len Stoler Lexus   | 9.18        |
-| 2025-07-29 15:00:37 | 2025-07-29 22:05:46   | Len Stoler Lexus   | 7.09        |
-| 2025-07-31 12:29:26 | 2025-07-31 20:21:17   | Len Stoler Lexus   | 7.86        |
-| 2025-08-05 14:28:39 | 2025-08-05 21:38:42   | Len Stoler Lexus   | 7.17        |
-| 2025-08-06 15:29:11 | 2025-08-06 20:21:25   | Len Stoler Lexus   | 4.87        |
-| 2025-08-07 14:29:35 | 2025-08-07 22:38:13   | Len Stoler Lexus   | 8.14        |
-| 2025-08-12 14:35:59 | 2025-08-12 20:08:14   | Len Stoler Lexus   | 5.54        |
-| 2025-08-13 14:26:20 | 2025-08-13 22:18:27   | Len Stoler Lexus   | 7.87        |
-| 2025-08-14 14:46:25 | 2025-08-14 22:32:11   | Len Stoler Lexus   | 7.76        |
-| 2025-08-15 14:03:57 | 2025-08-15 22:04:04   | Len Stoler Lexus   | 8.00        |
-| 2025-08-19 13:35:14 | 2025-08-19 21:47:04   | Len Stoler Lexus   | 8.20        |
-| 2025-08-21 14:23:22 | 2025-08-21 18:04:07   | Len Stoler Lexus   | 3.68        |
-| 2025-08-26 13:06:25 | 2025-08-26 21:50:03   | Len Stoler Lexus   | 8.73        |
-| 2025-08-28 16:13:21 | 2025-08-28 23:07:52   | Len Stoler Lexus   | 6.91        |
-| 2025-08-29 15:02:50 | 2025-08-29 20:43:19   | Len Stoler Lexus   | 5.67        |
-| 2025-09-02 13:42:08 | 2025-09-02 22:25:15   | Len Stoler Lexus   | 8.72        |
-| 2025-09-02 22:25:18 | 2025-09-02 22:38:22   | Len Stoler Lexus   | 0.22        |
-| 2025-09-03 13:49:50 | 2025-09-03 22:38:25   | Len Stoler Lexus   | 8.81        |
-| 2025-09-05 15:58:13 | 2025-09-05 22:36:26   | Len Stoler Lexus   | 6.64        |
-| 2025-09-09 14:13:12 | 2025-09-09 21:00:00   | Len Stoler Lexus   | 6.78        |
+| Date       | In      | Out    | Dealership       | Total Hours |
+|----------- |---------|--------|------------------|-------------|
+| 2025-07-10 | 2:52pm  | 6:02pm | Len Stoler Lexus | 3.17        |
+| 2025-07-15 | 9:38am  | 6:08pm | Len Stoler Lexus | 8.50        |
+| 2025-07-22 | 9:14am  | 5:49pm | Len Stoler Lexus | 8.57        |
+| 2025-07-24 | 11:05am | 2:37pm | Len Stoler Lexus | 3.55        |
+| 2025-07-25 | 9:46am  | 6:57pm | Len Stoler Lexus | 9.18        |
+| 2025-07-29 | 11:00am | 6:05pm | Len Stoler Lexus | 7.09        |
+| 2025-07-31 | 8:29am  | 4:21pm | Len Stoler Lexus | 7.86        |
+| 2025-08-05 | 10:28am | 5:38pm | Len Stoler Lexus | 7.17        |
+| 2025-08-06 | 11:29am | 4:21pm | Len Stoler Lexus | 4.87        |
+| 2025-08-07 | 10:29am | 6:38pm | Len Stoler Lexus | 8.14        |
+| 2025-08-12 | 10:35am | 4:08pm | Len Stoler Lexus | 5.54        |
+| 2025-08-13 | 10:26am | 6:18pm | Len Stoler Lexus | 7.87        |
+| 2025-08-14 | 10:46am | 6:32pm | Len Stoler Lexus | 7.76        |
+| 2025-08-15 | 10:03am | 6:04pm | Len Stoler Lexus | 8.00        |
+| 2025-08-19 | 9:35am  | 5:47pm | Len Stoler Lexus | 8.20        |
+| 2025-08-21 | 10:23am | 2:04pm | Len Stoler Lexus | 3.68        |
+| 2025-08-26 | 9:06am  | 5:50pm | Len Stoler Lexus | 8.73        |
+| 2025-08-28 | 12:13pm | 7:07pm | Len Stoler Lexus | 6.91        |
+| 2025-08-29 | 11:02am | 4:43pm | Len Stoler Lexus | 5.67        |
+| 2025-09-02 | 9:42am  | 6:25pm | Len Stoler Lexus | 8.72        |
+| 2025-09-02 | 6:25pm  | 6:38pm | Len Stoler Lexus | 0.22        |
+| 2025-09-03 | 9:49am  | 6:38pm | Len Stoler Lexus | 8.81        |
+| 2025-09-05 | 11:58am | 6:36pm | Len Stoler Lexus | 6.64        |
+| 2025-09-09 | 10:13am | 5:00pm | Len Stoler Lexus | 6.78        |     
