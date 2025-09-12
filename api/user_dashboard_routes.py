@@ -32,6 +32,12 @@ def _get_daily_hours_map(punches: List[TimeLog], now: datetime) -> Dict[date, fl
     It correctly handles shifts crossing midnight and currently open shifts.
     """
     from collections import defaultdict
+    from zoneinfo import ZoneInfo
+
+    eastern_tz = ZoneInfo("America/New_York")
+
+    def get_eastern_date(utc_dt: datetime) -> date:
+        return utc_dt.astimezone(eastern_tz).date()
 
     daily_raw_seconds: Dict[date, float] = defaultdict(float)
     clock_in_time: Optional[datetime] = None
@@ -50,16 +56,24 @@ def _get_daily_hours_map(punches: List[TimeLog], now: datetime) -> Dict[date, fl
                 # Process the time segment from the last clock-in up to this new one.
                 end_time = punch_ts
                 current_time_segment = clock_in_time
-                while current_time_segment.date() < end_time.date():
-                    next_day_start = (current_time_segment + timedelta(days=1)).replace(
-                        hour=0, minute=0, second=0, microsecond=0
+                while get_eastern_date(current_time_segment) < get_eastern_date(
+                    end_time
+                ):
+                    eastern_time = current_time_segment.astimezone(eastern_tz)
+                    next_local_midnight_eastern = (
+                        eastern_time + timedelta(days=1)
+                    ).replace(hour=0, minute=0, second=0, microsecond=0)
+                    next_day_start = next_local_midnight_eastern.astimezone(
+                        timezone.utc
                     )
                     duration = (next_day_start - current_time_segment).total_seconds()
-                    daily_raw_seconds[current_time_segment.date()] += duration
+                    daily_raw_seconds[
+                        get_eastern_date(current_time_segment)
+                    ] += duration
                     current_time_segment = next_day_start
                 # Add the remainder of the time on the final day of the segment
                 duration = (end_time - current_time_segment).total_seconds()
-                daily_raw_seconds[end_time.date()] += duration
+                daily_raw_seconds[get_eastern_date(current_time_segment)] += duration
 
             clock_in_time = punch_ts
 
@@ -67,17 +81,19 @@ def _get_daily_hours_map(punches: List[TimeLog], now: datetime) -> Dict[date, fl
             end_time = punch_ts
             current_time_segment = clock_in_time
             # Distribute hours across days for shifts that span midnight
-            while current_time_segment.date() < end_time.date():
-                next_day_start = (current_time_segment + timedelta(days=1)).replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                )
+            while get_eastern_date(current_time_segment) < get_eastern_date(end_time):
+                eastern_time = current_time_segment.astimezone(eastern_tz)
+                next_local_midnight_eastern = (
+                    eastern_time + timedelta(days=1)
+                ).replace(hour=0, minute=0, second=0, microsecond=0)
+                next_day_start = next_local_midnight_eastern.astimezone(timezone.utc)
                 duration = (next_day_start - current_time_segment).total_seconds()
-                daily_raw_seconds[current_time_segment.date()] += duration
+                daily_raw_seconds[get_eastern_date(current_time_segment)] += duration
                 current_time_segment = next_day_start
 
             # Add the remainder of the time on the final day of the segment
             duration = (end_time - current_time_segment).total_seconds()
-            daily_raw_seconds[end_time.date()] += duration
+            daily_raw_seconds[get_eastern_date(current_time_segment)] += duration
             clock_in_time = None
 
     # Handle a currently open shift that hasn't been clocked out
@@ -85,17 +101,19 @@ def _get_daily_hours_map(punches: List[TimeLog], now: datetime) -> Dict[date, fl
         end_time = now
         current_time_segment = clock_in_time
         # Distribute hours across days for the open shift
-        while current_time_segment.date() < end_time.date():
-            next_day_start = (current_time_segment + timedelta(days=1)).replace(
+        while get_eastern_date(current_time_segment) < get_eastern_date(end_time):
+            eastern_time = current_time_segment.astimezone(eastern_tz)
+            next_local_midnight_eastern = (eastern_time + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0
             )
+            next_day_start = next_local_midnight_eastern.astimezone(timezone.utc)
             duration = (next_day_start - current_time_segment).total_seconds()
-            daily_raw_seconds[current_time_segment.date()] += duration
+            daily_raw_seconds[get_eastern_date(current_time_segment)] += duration
             current_time_segment = next_day_start
 
         # Add the final segment of the open shift
         duration = (end_time - current_time_segment).total_seconds()
-        daily_raw_seconds[end_time.date()] += duration
+        daily_raw_seconds[get_eastern_date(current_time_segment)] += duration
 
     # Convert seconds to hours for the final map
     return {day: seconds / 3600 for day, seconds in daily_raw_seconds.items()}
@@ -1551,13 +1569,20 @@ async def get_weekly_breakdown(
     # Calculate week_end_date
     week_end_date = week_start_date + timedelta(days=6)
 
-    # Convert to datetime for DB query (start of day to end of day)
-    start_datetime_utc = datetime.combine(
-        week_start_date, datetime.min.time(), tzinfo=timezone.utc
+    from zoneinfo import ZoneInfo
+
+    eastern_tz = ZoneInfo("America/New_York")
+    local_week_start = datetime.combine(
+        week_start_date, datetime.min.time(), tzinfo=eastern_tz
     )
-    end_datetime_utc = datetime.combine(
-        week_end_date, datetime.max.time(), tzinfo=timezone.utc
+    local_week_end = datetime.combine(
+        week_end_date, datetime.max.time(), tzinfo=eastern_tz
     )
+    extended_local_start = datetime.combine(
+        week_start_date - timedelta(days=1), datetime.min.time(), tzinfo=eastern_tz
+    )
+    start_datetime_utc = extended_local_start.astimezone(timezone.utc)
+    end_datetime_utc = local_week_end.astimezone(timezone.utc)
 
     # Fetch punches for the specified week
     punches = session.exec(
