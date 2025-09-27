@@ -20,7 +20,11 @@ from models.time_log import PunchType, TimeLog
 from models.vacation_time import VacationTime
 from utils.breaks import apply_unpaid_break, calculate_daily_hours_with_breaks
 from utils.datetime_helpers import format_utc_datetime
-from utils.timezone_helpers import get_week_range, get_default_timezone, validate_timezone
+from utils.timezone_helpers import (
+    get_default_timezone,
+    get_week_range,
+    validate_timezone,
+)
 
 router = APIRouter()
 
@@ -142,7 +146,7 @@ class EmployeeDetailResponse(BaseModel):
     # Flag indicating that unpaired punches (e.g., IN without OUT or orphan OUT)
     # were detected and excluded from hour/pay calculations in this response
     has_unpaired_punches: bool = False
-    
+
     # Timezone information
     timezone: Optional[str] = None  # IANA timezone used for calculations
 
@@ -1410,14 +1414,13 @@ async def get_all_active_employees(
     Parameters:
     - tz: IANA timezone string (e.g., 'America/Los_Angeles'). Defaults to Eastern for backwards compatibility.
     """
-    
+
     # Validate and set timezone
     if tz is None:
         tz = get_default_timezone()
     elif not validate_timezone(tz):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid timezone: {tz}"
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid timezone: {tz}"
         )
     # First, get a list of all dealerships
     dealerships_ref = firestore_db.collection("dealerships").stream()
@@ -1557,7 +1560,7 @@ async def get_employee_details(
     - Hours worked per week
     - Pay per week
     - Hourly rate
-    
+
     Parameters:
     - tz: IANA timezone string (e.g., 'America/Los_Angeles'). Defaults to Eastern for backwards compatibility.
     """
@@ -1566,10 +1569,9 @@ async def get_employee_details(
         tz = get_default_timezone()
     elif not validate_timezone(tz):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid timezone: {tz}"
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid timezone: {tz}"
         )
-    
+
     # Get current date and calculate date ranges
     now = datetime.now(timezone.utc)
     today = now.date()
@@ -4220,8 +4222,8 @@ class BasicEmployeeWeeklySummary(BaseModel):
     weekly_pay: float = 0.0
     # Timezone information for client
     week_start_date: Optional[str] = None  # Local date YYYY-MM-DD
-    week_end_date: Optional[str] = None    # Local date YYYY-MM-DD
-    timezone: Optional[str] = None         # IANA timezone used
+    week_end_date: Optional[str] = None  # Local date YYYY-MM-DD
+    timezone: Optional[str] = None  # IANA timezone used
 
 
 # --- New Endpoint ---
@@ -4239,9 +4241,9 @@ async def get_basic_weekly_summary(
 
     Parameters:
     - start_date: Start date for analysis (optional, treated as local date in tz)
-    - end_date: End date for analysis (optional, treated as local date in tz)  
+    - end_date: End date for analysis (optional, treated as local date in tz)
     - tz: IANA timezone string (e.g., 'America/Los_Angeles'). Defaults to Eastern for backwards compatibility.
-    
+
     If no dates provided, calculates current week in the specified timezone.
     All week calculations and boundaries respect the specified timezone.
     """
@@ -4249,22 +4251,22 @@ async def get_basic_weekly_summary(
 
     start_time = time.time()
     now = datetime.now(timezone.utc)
-    
+
     # Validate and set timezone
     if tz is None:
         tz = get_default_timezone()
     elif not validate_timezone(tz):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid timezone: {tz}"
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid timezone: {tz}"
         )
-    
+
     print(f"[WEEKLY_SUMMARY] Starting basic weekly summary at {now} (tz={tz})")
     print(f"[WEEKLY_SUMMARY] Date range: {start_date} to {end_date}")
 
     if start_date and end_date:
         # Use provided date range - convert local dates to UTC boundaries
-        from utils.timezone_helpers import local_start_of_day, local_end_of_day
+        from utils.timezone_helpers import local_end_of_day, local_start_of_day
+
         start_dt = local_start_of_day(start_date, tz)
         end_dt = local_end_of_day(end_date, tz)
         week_start_local = start_date.isoformat()
@@ -4544,34 +4546,35 @@ async def get_missing_shifts_summary(
 
     SIMPLIFIED VERSION: Only detects clear consecutive clock-ins and orphan clock-outs.
     Does not flag trailing open shifts to avoid false positives with overnight workers.
-    
+
     Parameters:
     - start_date: Start date for analysis (optional, treated as local date in tz)
     - end_date: End date for analysis (optional, treated as local date in tz)
     - tz: IANA timezone string (e.g., 'America/Los_Angeles'). Defaults to Eastern for backwards compatibility.
     """
-    
+
     # Validate and set timezone
     if tz is None:
         tz = get_default_timezone()
     elif not validate_timezone(tz):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid timezone: {tz}"
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid timezone: {tz}"
         )
 
     if start_date and end_date:
         # Convert local dates to UTC boundaries using timezone
-        from utils.timezone_helpers import local_start_of_day, local_end_of_day
+        from utils.timezone_helpers import local_end_of_day, local_start_of_day
+
         start_dt = local_start_of_day(start_date, tz)
         end_dt = local_end_of_day(end_date, tz)
     else:
         # Use current week calculation in specified timezone
         now = datetime.now(timezone.utc)
         from utils.timezone_helpers import get_current_time_in_tz
+
         local_now = get_current_time_in_tz(tz)
         today_local = local_now.date()
-        
+
         # 28 days lookback in local timezone
         start_date_local = today_local - timedelta(days=27)
         start_dt = local_start_of_day(start_date_local, tz)
