@@ -716,7 +716,16 @@ async def get_enhanced_daily_labor_spend(
     # Get ALL employees from Firestore to properly handle dealership assignments
     users_ref = (
         firestore_db.collection("users")
-        .where("role", "in", ["employee", "clockOnlyEmployee", "supplier","owner",])
+        .where(
+            "role",
+            "in",
+            [
+                "employee",
+                "clockOnlyEmployee",
+                "supplier",
+                "owner",
+            ],
+        )
         .stream()
     )
     all_employees = {}
@@ -2146,7 +2155,16 @@ async def get_all_employees_details(
     # Get all employees from Firestore
     users_ref = (
         firestore_db.collection("users")
-        .where("role", "in", ["employee", "clockOnlyEmployee", "supplier","owner",])
+        .where(
+            "role",
+            "in",
+            [
+                "employee",
+                "clockOnlyEmployee",
+                "supplier",
+                "owner",
+            ],
+        )
         .stream()
     )
     employees_data = {}
@@ -2396,7 +2414,16 @@ async def get_all_employees_details_by_date_range(
     # Get all employees from Firestore
     users_ref = (
         firestore_db.collection("users")
-        .where("role", "in", ["employee", "clockOnlyEmployee", "supplier","owner",])
+        .where(
+            "role",
+            "in",
+            [
+                "employee",
+                "clockOnlyEmployee",
+                "supplier",
+                "owner",
+            ],
+        )
         .stream()
     )
     employees_data = {}
@@ -2874,7 +2901,16 @@ async def get_comprehensive_labor_spend(
     # Get ALL employees from Firestore (not just those who clocked in)
     users_ref = (
         firestore_db.collection("users")
-        .where("role", "in", ["employee", "clockOnlyEmployee", "supplier","owner",])
+        .where(
+            "role",
+            "in",
+            [
+                "employee",
+                "clockOnlyEmployee",
+                "supplier",
+                "owner",
+            ],
+        )
         .stream()
     )
     all_employees = {}
@@ -3746,7 +3782,16 @@ async def get_labor_preview(
     # Get all employees with their wages
     users_ref = (
         firestore_db.collection("users")
-        .where("role", "in", ["employee", "clockOnlyEmployee", "supplier","owner",])
+        .where(
+            "role",
+            "in",
+            [
+                "employee",
+                "clockOnlyEmployee",
+                "supplier",
+                "owner",
+            ],
+        )
         .stream()
     )
     employee_wages = {}
@@ -3929,7 +3974,16 @@ async def get_all_dealerships_labor_costs_today(
     # Get ALL employees from Firestore with proper dealership assignments
     users_ref = (
         firestore_db.collection("users")
-        .where("role", "in", ["employee", "clockOnlyEmployee", "supplier","owner",])
+        .where(
+            "role",
+            "in",
+            [
+                "employee",
+                "clockOnlyEmployee",
+                "supplier",
+                "owner",
+            ],
+        )
         .stream()
     )
     all_employees = {}
@@ -4602,7 +4656,16 @@ async def get_all_dealerships_comprehensive_labor_spend(
     # Get ALL employees from Firestore with their dealership assignments
     users_ref = (
         firestore_db.collection("users")
-        .where("role", "in", ["employee", "clockOnlyEmployee", "supplier","owner",])
+        .where(
+            "role",
+            "in",
+            [
+                "employee",
+                "clockOnlyEmployee",
+                "supplier",
+                "owner",
+            ],
+        )
         .stream()
     )
     all_employees_by_dealership = {}  # dealership_id -> {employee_id -> employee_data}
@@ -5580,7 +5643,16 @@ async def get_flexible_labor_spend(
     # (EXACT same logic as original endpoint)
     users_ref = (
         firestore_db.collection("users")
-        .where("role", "in", ["employee", "clockOnlyEmployee", "supplier","owner",])
+        .where(
+            "role",
+            "in",
+            [
+                "employee",
+                "clockOnlyEmployee",
+                "supplier",
+                "owner",
+            ],
+        )
         .stream()
     )
     all_employees_by_dealership = {}  # dealership_id -> {employee_id -> employee_data}
@@ -5993,7 +6065,14 @@ async def get_all_dealerships_comprehensive_labor_spend_by_range(
         .where(
             "role",
             "in",
-            ["employee", "clockOnlyEmployee", "serviceWash", "photos", "supplier","owner",],
+            [
+                "employee",
+                "clockOnlyEmployee",
+                "serviceWash",
+                "photos",
+                "supplier",
+                "owner",
+            ],
         )
         .stream()
     )
