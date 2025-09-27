@@ -20,6 +20,7 @@ from models.time_log import PunchType, TimeLog
 from models.vacation_time import VacationTime
 from utils.breaks import apply_unpaid_break, calculate_daily_hours_with_breaks
 from utils.datetime_helpers import format_utc_datetime
+from utils.timezone_helpers import get_week_range, get_default_timezone, validate_timezone
 
 router = APIRouter()
 
@@ -141,6 +142,9 @@ class EmployeeDetailResponse(BaseModel):
     # Flag indicating that unpaired punches (e.g., IN without OUT or orphan OUT)
     # were detected and excluded from hour/pay calculations in this response
     has_unpaired_punches: bool = False
+    
+    # Timezone information
+    timezone: Optional[str] = None  # IANA timezone used for calculations
 
 
 # New model for dealership employee hours breakdown
@@ -1394,6 +1398,7 @@ async def get_active_employees_by_dealership(
 
 @router.get("/active/all", response_model=List[DealershipEmployeeStatus])
 async def get_all_active_employees(
+    tz: Optional[str] = None,
     session: Session = Depends(get_session),
     admin_user: dict = Depends(require_admin_or_supervisor_role),
 ):
@@ -1401,7 +1406,19 @@ async def get_all_active_employees(
     """
     Get information about all currently active employees across all dealerships.
     This provides a company-wide overview of current labor utilization.
+    
+    Parameters:
+    - tz: IANA timezone string (e.g., 'America/Los_Angeles'). Defaults to Eastern for backwards compatibility.
     """
+    
+    # Validate and set timezone
+    if tz is None:
+        tz = get_default_timezone()
+    elif not validate_timezone(tz):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid timezone: {tz}"
+        )
     # First, get a list of all dealerships
     dealerships_ref = firestore_db.collection("dealerships").stream()
     dealership_ids = [doc.id for doc in dealerships_ref]
@@ -1530,6 +1547,7 @@ async def get_weekly_labor_spend(
 @router.get("/employee/{employee_id}/details", response_model=EmployeeDetailResponse)
 async def get_employee_details(
     employee_id: str,
+    tz: Optional[str] = None,
     session: Session = Depends(get_session),
     admin_user: dict = Depends(require_admin_role),
 ):
@@ -1539,7 +1557,19 @@ async def get_employee_details(
     - Hours worked per week
     - Pay per week
     - Hourly rate
+    
+    Parameters:
+    - tz: IANA timezone string (e.g., 'America/Los_Angeles'). Defaults to Eastern for backwards compatibility.
     """
+    # Validate and set timezone
+    if tz is None:
+        tz = get_default_timezone()
+    elif not validate_timezone(tz):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid timezone: {tz}"
+        )
+    
     # Get current date and calculate date ranges
     now = datetime.now(timezone.utc)
     today = now.date()
@@ -1817,6 +1847,7 @@ async def get_employee_details(
         date_range_overtime_hours=range_overtime_hours,
         date_range_total_pay=range_total_pay,
         has_unpaired_punches=any_unpaired,
+        timezone=tz,
     )
 
 
@@ -1828,6 +1859,7 @@ async def get_employee_details_by_date_range(
     employee_id: str,
     start_date: date,
     end_date: date,
+    tz: Optional[str] = None,
     session: Session = Depends(get_session),
     admin_user: dict = Depends(require_admin_role),
 ):
@@ -2104,11 +2136,13 @@ async def get_employee_details_by_date_range(
         date_range_regular_hours=range_regular_hours,
         date_range_overtime_hours=range_overtime_hours,
         date_range_total_pay=range_total_pay,
+        timezone=tz,
     )
 
 
 @router.get("/employees/details", response_model=List[EmployeeDetailResponse])
 async def get_all_employees_details(
+    tz: Optional[str] = None,
     session: Session = Depends(get_session),
     admin_user: dict = Depends(require_admin_role),
     limit: Optional[int] = 100,
@@ -2352,6 +2386,7 @@ async def get_all_employees_details(
 async def get_all_employees_details_by_date_range(
     start_date: date,
     end_date: date,
+    tz: Optional[str] = None,
     session: Session = Depends(get_session),
     admin_user: dict = Depends(require_admin_role),
 ):
@@ -4183,6 +4218,10 @@ class BasicEmployeeWeeklySummary(BaseModel):
     weekly_regular_hours: float = 0.0
     weekly_overtime_hours: float = 0.0
     weekly_pay: float = 0.0
+    # Timezone information for client
+    week_start_date: Optional[str] = None  # Local date YYYY-MM-DD
+    week_end_date: Optional[str] = None    # Local date YYYY-MM-DD
+    timezone: Optional[str] = None         # IANA timezone used
 
 
 # --- New Endpoint ---
@@ -4192,38 +4231,47 @@ class BasicEmployeeWeeklySummary(BaseModel):
 async def get_basic_weekly_summary(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    tz: Optional[str] = None,
     session: Session = Depends(get_session),
     admin_user: dict = Depends(require_admin_role),
 ):
     """Return a fast, lightweight weekly summary for ALL employees.
 
-    Optional date range parameters (UTC):
-    - start_date: Start date for analysis (defaults to start of current week)
-    - end_date: End date for analysis (defaults to end of current week)
+    Parameters:
+    - start_date: Start date for analysis (optional, treated as local date in tz)
+    - end_date: End date for analysis (optional, treated as local date in tz)  
+    - tz: IANA timezone string (e.g., 'America/Los_Angeles'). Defaults to Eastern for backwards compatibility.
+    
+    If no dates provided, calculates current week in the specified timezone.
+    All week calculations and boundaries respect the specified timezone.
     """
     import time
 
     start_time = time.time()
     now = datetime.now(timezone.utc)
-    print(f"[WEEKLY_SUMMARY] Starting basic weekly summary at {now}")
+    
+    # Validate and set timezone
+    if tz is None:
+        tz = get_default_timezone()
+    elif not validate_timezone(tz):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid timezone: {tz}"
+        )
+    
+    print(f"[WEEKLY_SUMMARY] Starting basic weekly summary at {now} (tz={tz})")
     print(f"[WEEKLY_SUMMARY] Date range: {start_date} to {end_date}")
 
     if start_date and end_date:
-        # Use provided date range (passed in UTC)
-        week_start = start_date
-        week_end = end_date
+        # Use provided date range - convert local dates to UTC boundaries
+        from utils.timezone_helpers import local_start_of_day, local_end_of_day
+        start_dt = local_start_of_day(start_date, tz)
+        end_dt = local_end_of_day(end_date, tz)
+        week_start_local = start_date.isoformat()
+        week_end_local = end_date.isoformat()
     else:
-        # Use current week calculation (existing logic)
-        today = now.date()
-        week_start = today - timedelta(days=today.weekday())
-        week_end = week_start + timedelta(days=6)
-
-    start_dt = datetime.combine(week_start, datetime.min.time()).replace(
-        tzinfo=timezone.utc
-    )
-    end_dt = datetime.combine(week_end, datetime.max.time()).replace(
-        tzinfo=timezone.utc
-    )
+        # Use current week calculation in specified timezone
+        week_start_local, week_end_local, start_dt, end_dt = get_week_range(now, tz)
 
     step_time = time.time()
     print(
@@ -4329,6 +4377,9 @@ async def get_basic_weekly_summary(
                 weekly_regular_hours=round(regular_hours, 2),
                 weekly_overtime_hours=round(overtime_hours, 2),
                 weekly_pay=round(weekly_pay, 2),
+                week_start_date=week_start_local,
+                week_end_date=week_end_local,
+                timezone=tz,
             )
         )
 
@@ -4484,6 +4535,7 @@ def _detect_missing_shifts_for_employee(
 async def get_missing_shifts_summary(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    tz: Optional[str] = None,
     session: Session = Depends(get_session),
     admin_user: dict = Depends(require_admin_role),
 ):
@@ -4492,19 +4544,38 @@ async def get_missing_shifts_summary(
 
     SIMPLIFIED VERSION: Only detects clear consecutive clock-ins and orphan clock-outs.
     Does not flag trailing open shifts to avoid false positives with overnight workers.
+    
+    Parameters:
+    - start_date: Start date for analysis (optional, treated as local date in tz)
+    - end_date: End date for analysis (optional, treated as local date in tz)
+    - tz: IANA timezone string (e.g., 'America/Los_Angeles'). Defaults to Eastern for backwards compatibility.
     """
+    
+    # Validate and set timezone
+    if tz is None:
+        tz = get_default_timezone()
+    elif not validate_timezone(tz):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid timezone: {tz}"
+        )
 
     if start_date and end_date:
-        start_dt = datetime.combine(
-            start_date, datetime.min.time(), tzinfo=timezone.utc
-        )
-        end_dt = datetime.combine(end_date, datetime.max.time(), tzinfo=timezone.utc)
+        # Convert local dates to UTC boundaries using timezone
+        from utils.timezone_helpers import local_start_of_day, local_end_of_day
+        start_dt = local_start_of_day(start_date, tz)
+        end_dt = local_end_of_day(end_date, tz)
     else:
-        today = datetime.now(timezone.utc).date()
-        end_dt = datetime.combine(today, datetime.max.time(), tzinfo=timezone.utc)
-        start_dt = datetime.combine(
-            today - timedelta(days=27), datetime.min.time(), tzinfo=timezone.utc
-        )
+        # Use current week calculation in specified timezone
+        now = datetime.now(timezone.utc)
+        from utils.timezone_helpers import get_current_time_in_tz
+        local_now = get_current_time_in_tz(tz)
+        today_local = local_now.date()
+        
+        # 28 days lookback in local timezone
+        start_date_local = today_local - timedelta(days=27)
+        start_dt = local_start_of_day(start_date_local, tz)
+        end_dt = local_end_of_day(today_local, tz)
 
     # Get all punches in the window
     main_logs = session.exec(
@@ -4544,9 +4615,9 @@ async def get_missing_shifts_summary(
         for log in carry_in_logs:
             carry_in_state[log.employee_id] = log
 
-    # Process each employee using robust pairing with EST semantics
+    # Process each employee using robust pairing with timezone-aware semantics
     anomalies: List[MissingShiftEmployeeSummary] = []
-    analysis_tz = ZoneInfo("America/New_York")
+    analysis_tz = ZoneInfo(tz)
     now = datetime.now(timezone.utc)
 
     for emp_id in employee_ids:

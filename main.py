@@ -37,6 +37,7 @@ from api import (
     device_routes,
     shop_routes,
     time_routes,
+    timezone_config_routes,
     transaction_routes,
     user_dashboard_routes,
     user_shift_change_routes,
@@ -57,6 +58,7 @@ from api.admin_vacation_routes import router as admin_vacation_router
 from api.device_routes import router as device_router
 from api.shop_routes import router as shop_router
 from api.time_routes import router as time_router
+from api.timezone_config_routes import router as timezone_config_router
 from api.user_dashboard_routes import router as user_dashboard_router
 from api.vapi_handler import router as vapi_router
 from core.deps import get_session
@@ -175,6 +177,11 @@ app.include_router(
     tags=["Admin", "Signature Photos"],
 )
 app.include_router(shop_router, prefix="/shops", tags=["Shops", "Geofence"])
+app.include_router(
+    timezone_config_router,
+    prefix="/admin/timezone",
+    tags=["Admin", "Timezone Configuration"],
+)
 app.include_router(vapi_handler.router, prefix="/api", tags=["Vapi", "Webhook"])
 app.include_router(
     transaction_routes.router,
