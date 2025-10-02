@@ -37,7 +37,8 @@ gcloud run deploy employee-management-backend \
     --memory 4Gi \
     --cpu 2 \
     --timeout 900 \
-    --concurrency 80 \
+    --concurrency 20 \
+    --min-instances 2 \
     --max-instances 10 \
     --set-env-vars INSTANCE_CONNECTION_NAME=minordetails-1aff3:us-east4:minor-details-clock-in-out-db,DB_NAME=postgres,DB_USER=postgres,DB_PASSWORD=';(Ets?MBFK`^D`\>',VAPI_SECRET_TOKEN='kE7!pZ$r@N3qA*sV9bF2gH#jW1mX$yZ',INTERNAL_API_BASE_URL=https://employee-management-backend-507748767742.us-central1.run.app,OPENAI_API_KEY="$OPENAI_API_KEY" \
     --quiet

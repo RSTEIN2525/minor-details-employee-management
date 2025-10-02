@@ -1,4 +1,6 @@
+import asyncio
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -27,6 +29,293 @@ from utils.timezone_helpers import (
 )
 
 router = APIRouter()
+
+# --- Global Caching Infrastructure ---
+# In-memory caches with TTL to avoid repeated Firestore queries
+_employee_cache: Optional[Dict[str, Dict[str, Any]]] = None
+_employee_cache_time: Optional[datetime] = None
+_dealership_cache: Optional[Dict[str, str]] = None
+_dealership_cache_time: Optional[datetime] = None
+_CACHE_TTL = timedelta(minutes=5)  # Refresh every 5 minutes
+
+# Response caching for endpoint results
+_response_cache: Dict[str, Tuple[Any, datetime]] = {}
+_RESPONSE_CACHE_TTL = timedelta(minutes=2)  # Cache responses for 2 minutes
+
+# Cache refresh locks to prevent stampede (multiple requests refreshing simultaneously)
+_employee_cache_lock = asyncio.Lock()
+_dealership_cache_lock = asyncio.Lock()
+_response_cache_lock = asyncio.Lock()
+
+# Thread pool executor for running blocking Firestore calls
+# Firestore Python SDK is synchronous and blocks the event loop
+_firestore_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="firestore")
+
+
+def get_cached_response(cache_key: str) -> Optional[Any]:
+    """
+    Get a cached response if it exists and hasn't expired.
+
+    Args:
+        cache_key: Unique key for the cached response
+
+    Returns:
+        Cached response if valid, None otherwise
+    """
+    if cache_key in _response_cache:
+        cached_data, cached_time = _response_cache[cache_key]
+        if (datetime.now(timezone.utc) - cached_time) < _RESPONSE_CACHE_TTL:
+            print(f"Cache HIT for {cache_key}")
+            return cached_data
+        else:
+            # Remove expired cache entry
+            del _response_cache[cache_key]
+            print(f"Cache EXPIRED for {cache_key}")
+    return None
+
+
+def set_cached_response(cache_key: str, data: Any) -> None:
+    """
+    Store a response in the cache.
+
+    Args:
+        cache_key: Unique key for the cached response
+        data: Response data to cache
+    """
+    _response_cache[cache_key] = (data, datetime.now(timezone.utc))
+    print(f"Cache SET for {cache_key}")
+
+
+async def get_all_employees_cached() -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch ALL employees from Firestore with caching.
+    This eliminates N+1 Firestore queries by fetching once and caching.
+    Cache expires after 5 minutes.
+
+    Uses locking to prevent cache stampede: only one request refreshes at a time.
+
+    Returns:
+        Dict mapping employee_id to employee data (name, hourly_wage, dealerships)
+    """
+    global _employee_cache, _employee_cache_time
+
+    now = datetime.now(timezone.utc)
+
+    # Fast path: cache is valid, return immediately (no lock needed)
+    if (
+        _employee_cache is not None
+        and _employee_cache_time is not None
+        and (now - _employee_cache_time) <= _CACHE_TTL
+    ):
+        return _employee_cache
+
+    # Slow path: cache needs refresh, acquire lock to prevent stampede
+    async with _employee_cache_lock:
+        # Double-check: another request might have refreshed while we waited for lock
+        now = datetime.now(timezone.utc)
+        if (
+            _employee_cache is not None
+            and _employee_cache_time is not None
+            and (now - _employee_cache_time) <= _CACHE_TTL
+        ):
+            print("Cache was refreshed by another request, using it")
+            return _employee_cache
+
+        # We got the lock and cache is still expired, refresh it
+        print(f"Refreshing employee cache from Firestore at {now}...")
+
+        # Run blocking Firestore call in thread pool to avoid blocking event loop
+        def fetch_employees_from_firestore():
+            """Blocking Firestore fetch - runs in thread pool"""
+            users_ref = (
+                firestore_db.collection("users")
+                .where(
+                    "role",
+                    "in",
+                    [
+                        "employee",
+                        "clockOnlyEmployee",
+                        "serviceWash",
+                        "photos",
+                        "lotPrep",
+                        "deleted",
+                        "supplier",
+                        "owner",
+                    ],
+                )
+                .stream()
+            )
+
+            cache = {}
+            for doc in users_ref:
+                user_data = doc.to_dict()
+                employee_id = doc.id
+
+                # Parse dealership assignments
+                raw_dealerships = user_data.get("dealerships", "")
+                if isinstance(raw_dealerships, list):
+                    employee_dealerships = [str(d).strip() for d in raw_dealerships]
+                else:
+                    employee_dealerships = [
+                        s.strip() for s in str(raw_dealerships).split(",") if s.strip()
+                    ]
+
+                raw_tc_dealers = user_data.get("timeClockDealerships", "")
+                if isinstance(raw_tc_dealers, list):
+                    time_clock_dealerships = [str(d).strip() for d in raw_tc_dealers]
+                else:
+                    time_clock_dealerships = [
+                        s.strip() for s in str(raw_tc_dealers).split(",") if s.strip()
+                    ]
+
+                combined_dealerships = set(employee_dealerships) | set(
+                    time_clock_dealerships
+                )
+
+                cache[employee_id] = {
+                    "name": user_data.get("displayName", "Unknown"),
+                    "hourly_wage": (
+                        float(user_data.get("hourlyWage", 0.0))
+                        if user_data.get("hourlyWage")
+                        else 0.0
+                    ),
+                    "dealerships": combined_dealerships,
+                }
+
+            return cache
+
+        # Execute in thread pool to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        cache = await loop.run_in_executor(
+            _firestore_executor, fetch_employees_from_firestore
+        )
+
+        _employee_cache = cache
+        _employee_cache_time = now
+        print(f"Cached {len(cache)} employees")
+
+    return _employee_cache
+
+
+async def get_dealership_names_cached() -> Dict[str, str]:
+    """
+    Fetch ALL dealership names from Firestore with caching.
+    Cache expires after 5 minutes.
+
+    Uses locking to prevent cache stampede: only one request refreshes at a time.
+
+    Returns:
+        Dict mapping dealership_id to dealership name
+    """
+    global _dealership_cache, _dealership_cache_time
+
+    now = datetime.now(timezone.utc)
+
+    # Fast path: cache is valid, return immediately (no lock needed)
+    if (
+        _dealership_cache is not None
+        and _dealership_cache_time is not None
+        and (now - _dealership_cache_time) <= _CACHE_TTL
+    ):
+        return _dealership_cache
+
+    # Slow path: cache needs refresh, acquire lock to prevent stampede
+    async with _dealership_cache_lock:
+        # Double-check: another request might have refreshed while we waited for lock
+        now = datetime.now(timezone.utc)
+        if (
+            _dealership_cache is not None
+            and _dealership_cache_time is not None
+            and (now - _dealership_cache_time) <= _CACHE_TTL
+        ):
+            print("Dealership cache was refreshed by another request, using it")
+            return _dealership_cache
+
+        # We got the lock and cache is still expired, refresh it
+        print(f"Refreshing dealership cache from Firestore at {now}...")
+
+        # Run blocking Firestore call in thread pool to avoid blocking event loop
+        def fetch_dealerships_from_firestore():
+            """Blocking Firestore fetch - runs in thread pool"""
+            cache = {}
+            try:
+                dealerships_ref = firestore_db.collection("dealerships").stream()
+                for doc in dealerships_ref:
+                    dealership_data = doc.to_dict()
+                    cache[doc.id] = dealership_data.get("name", doc.id)
+            except Exception as e:
+                print(f"Warning: Could not fetch dealership names: {e}")
+            return cache
+
+        # Execute in thread pool to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        cache = await loop.run_in_executor(
+            _firestore_executor, fetch_dealerships_from_firestore
+        )
+
+        _dealership_cache = cache
+        _dealership_cache_time = now
+        print(f"Cached {len(cache)} dealerships")
+
+    return _dealership_cache
+
+
+async def get_all_active_employees_batch(
+    session: Session, employee_ids: List[str], dealership_id: Optional[str] = None
+) -> Dict[str, Tuple[bool, Optional[datetime]]]:
+    """
+    Get active status for multiple employees in a SINGLE batch query.
+    This eliminates N+1 database queries for active status checks.
+
+    Args:
+        session: Database session
+        employee_ids: List of employee IDs to check
+        dealership_id: Optional dealership filter
+
+    Returns:
+        Dict mapping employee_id to (is_active, clock_in_time)
+    """
+    if not employee_ids:
+        return {}
+
+    lookback = datetime.now(timezone.utc) - timedelta(days=3)
+
+    # Fetch ALL recent punches for ALL employees in ONE query
+    all_punches = session.exec(
+        select(TimeLog)
+        .where(TimeLog.employee_id.in_(employee_ids))
+        .where(TimeLog.timestamp >= lookback)
+        .order_by(TimeLog.timestamp.desc())
+    ).all()
+
+    # Group punches by employee and find most recent for each
+    employee_punches: Dict[str, List[TimeLog]] = defaultdict(list)
+    for punch in all_punches:
+        employee_punches[punch.employee_id].append(punch)
+
+    # Determine active status for each employee
+    active_status = {}
+    for emp_id in employee_ids:
+        punches = employee_punches.get(emp_id, [])
+        if punches:
+            # Already sorted by timestamp desc, so first is most recent
+            latest = punches[0]
+            is_active = latest.punch_type == PunchType.CLOCK_IN and (
+                not dealership_id or latest.dealership_id == dealership_id
+            )
+            # Ensure timestamp is timezone-aware
+            if is_active:
+                clock_in_time = latest.timestamp
+                if clock_in_time and clock_in_time.tzinfo is None:
+                    clock_in_time = clock_in_time.replace(tzinfo=timezone.utc)
+            else:
+                clock_in_time = None
+            active_status[emp_id] = (is_active, clock_in_time)
+        else:
+            active_status[emp_id] = (False, None)
+
+    return active_status
+
 
 # --- Pydantic Models for Responses ---
 
@@ -691,6 +980,12 @@ async def get_enhanced_daily_labor_spend(
     - Includes currently clocked-in employees
     - Applies unpaid break deductions
     """
+    # OPTIMIZED: Check response cache first
+    cache_key = f"enhanced_daily_labor:{target_date.isoformat()}"
+    cached_response = get_cached_response(cache_key)
+    if cached_response is not None:
+        return cached_response
+
     print(
         f"\n--- Starting enhanced daily labor spend analysis for date: {target_date} ---"
     )
@@ -721,56 +1016,9 @@ async def get_enhanced_daily_labor_spend(
     print(f"Analysis period (UTC) - Day: {start_of_day} to {end_of_day}")
     print(f"Analysis period (UTC) - Week: {start_of_week} to {end_of_week}")
 
-    # Get ALL employees from Firestore to properly handle dealership assignments
-    users_ref = (
-        firestore_db.collection("users")
-        .where(
-            "role",
-            "in",
-            [
-                "employee",
-                "clockOnlyEmployee",
-                "supplier",
-                "owner",
-            ],
-        )
-        .stream()
-    )
-    all_employees = {}
-    for doc in users_ref:
-        user_data = doc.to_dict()
-        employee_id = doc.id
-
-        # Parse dealership assignments
-        raw_dealerships = user_data.get("dealerships", "")
-        if isinstance(raw_dealerships, list):
-            employee_dealerships = [str(d).strip() for d in raw_dealerships]
-        else:
-            employee_dealerships = [
-                s.strip() for s in str(raw_dealerships).split(",") if s.strip()
-            ]
-
-        raw_tc_dealers = user_data.get("timeClockDealerships", "")
-        if isinstance(raw_tc_dealers, list):
-            time_clock_dealerships = [str(d).strip() for d in raw_tc_dealers]
-        else:
-            time_clock_dealerships = [
-                s.strip() for s in str(raw_tc_dealers).split(",") if s.strip()
-            ]
-
-        combined_dealerships = set(employee_dealerships) | set(time_clock_dealerships)
-
-        all_employees[employee_id] = {
-            "name": user_data.get("displayName", "Unknown"),
-            "hourly_wage": (
-                float(user_data.get("hourlyWage", 0.0))
-                if user_data.get("hourlyWage")
-                else 0.0
-            ),
-            "dealerships": combined_dealerships,
-        }
-
-    print(f"Found {len(all_employees)} total employees")
+    # OPTIMIZED: Use cached employee data instead of fetching from Firestore every time
+    all_employees = await get_all_employees_cached()
+    print(f"Found {len(all_employees)} total employees (from cache)")
 
     if not all_employees:
         return EnhancedDailyLaborSummary(
@@ -803,15 +1051,8 @@ async def get_enhanced_daily_labor_spend(
 
     print(f"Found {len(today_logs)} today logs and {len(week_logs)} week logs")
 
-    # Get dealership names from Firestore
-    dealership_names = {}
-    try:
-        dealerships_ref = firestore_db.collection("dealerships").stream()
-        for doc in dealerships_ref:
-            dealership_data = doc.to_dict()
-            dealership_names[doc.id] = dealership_data.get("name", doc.id)
-    except Exception as e:
-        print(f"Warning: Could not fetch dealership names: {e}")
+    # OPTIMIZED: Get dealership names from cache
+    dealership_names = await get_dealership_names_cached()
 
     # Process by dealership
     dealership_breakdowns = []
@@ -975,13 +1216,17 @@ async def get_enhanced_daily_labor_spend(
         f"Enhanced analysis complete. Total: ${total_labor_spend:.2f}, {total_hours:.2f} hours"
     )
 
-    return EnhancedDailyLaborSummary(
+    # OPTIMIZED: Cache the response before returning
+    response = EnhancedDailyLaborSummary(
         target_date=target_date.isoformat(),
         total_labor_spend=round(total_labor_spend, 2),
         total_hours=round(total_hours, 2),
         dealership_breakdown=dealership_breakdowns,
         hourly_breakdown=formatted_hourly_breakdown,
     )
+    set_cached_response(cache_key, response)
+
+    return response
 
 
 @router.get("/labor/daily", response_model=DailyLaborSummary)
@@ -994,6 +1239,9 @@ async def get_daily_labor_spend(
     Get the total labor spend for a specific day, broken down by hour and dealership.
     If no date is provided, defaults to today.
     """
+    # OPTIMIZED: Load employee cache once at the start
+    all_employees = await get_all_employees_cached()
+
     # Default to today if no date provided
     if not target_date:
         target_date = datetime.now(timezone.utc).date()
@@ -1032,9 +1280,9 @@ async def get_daily_labor_spend(
     # Process each dealership and its employees
     for dealership_id, employee_logs in dealership_employee_logs.items():
         for employee_id, logs in employee_logs.items():
-            # Get employee's hourly wage
-            user_details = await get_user_details(employee_id)
-            hourly_wage = user_details.get("hourly_wage", 0.0)
+            # OPTIMIZED: Get employee's hourly wage from cache instead of Firestore
+            employee_data = all_employees.get(employee_id, {})
+            hourly_wage = employee_data.get("hourly_wage", 0.0)
 
             # Sort logs by timestamp
             sorted_logs = sorted(logs, key=lambda x: x.timestamp)
@@ -1172,6 +1420,9 @@ async def get_dealership_labor_spend(
     Get the labor spend for a specific dealership on a specific day.
     If no date is provided, defaults to today.
     """
+    # OPTIMIZED: Load employee cache once at the start
+    all_employees = await get_all_employees_cached()
+
     # Default to today if no date provided
     if not target_date:
         target_date = datetime.now(timezone.utc).date()
@@ -1203,9 +1454,9 @@ async def get_dealership_labor_spend(
     total_hours = 0.0
 
     for employee_id, logs in employee_logs.items():
-        # Get employee's hourly wage
-        user_details = await get_user_details(employee_id)
-        hourly_wage = user_details.get("hourly_wage", 0.0)
+        # OPTIMIZED: Get employee's hourly wage from cache instead of Firestore
+        employee_data = all_employees.get(employee_id, {})
+        hourly_wage = employee_data.get("hourly_wage", 0.0)
 
         # Sort logs by timestamp
         sorted_logs = sorted(logs, key=lambda x: x.timestamp)
@@ -1261,6 +1512,9 @@ async def get_active_employees_by_dealership(
     Get information about all currently active employees at a specific dealership,
     including their hourly rates, shift duration, and weekly hours.
     """
+    # OPTIMIZED: Load employee cache once at the start
+    all_employees = await get_all_employees_cached()
+
     # Get all employees who have clocked in at this dealership recently
     # Look back a few days to catch cross-day shifts
     lookback_date = datetime.now(timezone.utc) - timedelta(days=2)
@@ -1279,15 +1533,21 @@ async def get_active_employees_by_dealership(
     employee_ids = list(set(clock.employee_id for clock in recent_clocks))
     print(f"Found {len(employee_ids)} unique employees for {dealership_id}")
 
+    # OPTIMIZED: Batch check all employees' active status in ONE query
+    active_statuses = await get_all_active_employees_batch(
+        session, employee_ids, dealership_id
+    )
+    print(f"Batch checked active status for {len(employee_ids)} employees")
+
     # Check each employee's current active status
     active_employees = []
     total_current_hourly_rate = 0.0
     total_labor_spend_today = 0.0
 
     for employee_id in employee_ids:
-        # Use the more robust active detection
-        is_active, most_recent_clock_in_ts = await is_employee_currently_active(
-            session, employee_id, dealership_id
+        # OPTIMIZED: Get active status from batch result
+        is_active, most_recent_clock_in_ts = active_statuses.get(
+            employee_id, (False, None)
         )
 
         if is_active and most_recent_clock_in_ts:
@@ -1295,11 +1555,11 @@ async def get_active_employees_by_dealership(
                 f"Employee {employee_id} determined ACTIVE. Most recent clock-in: {most_recent_clock_in_ts}"
             )
 
-            # Get employee details
-            user_details = await get_user_details(employee_id)
-            print(f"User details for {employee_id}: {user_details}")
-            hourly_wage = user_details.get("hourly_wage", 0.0)
-            employee_name = user_details.get("name", "Unknown")
+            # OPTIMIZED: Get employee details from cache instead of Firestore
+            employee_data = all_employees.get(employee_id, {})
+            print(f"User details for {employee_id}: {employee_data}")
+            hourly_wage = employee_data.get("hourly_wage", 0.0)
+            employee_name = employee_data.get("name", "Unknown")
 
             # Calculate current shift duration
             now = datetime.now(timezone.utc)
@@ -1460,6 +1720,9 @@ async def get_weekly_labor_spend(
     Get the weekly labor spend across all dealerships.
     If no dates are provided, defaults to the current week (Monday to Sunday).
     """
+    # OPTIMIZED: Load employee cache once at the start
+    all_employees = await get_all_employees_cached()
+
     # Default to current week if no dates provided
     today = datetime.now(timezone.utc).date()
     if not start_date:
@@ -1499,9 +1762,9 @@ async def get_weekly_labor_spend(
         total_hours = 0.0
 
         for employee_id, logs in employee_logs.items():
-            # Get employee's hourly wage
-            user_details = await get_user_details(employee_id)
-            hourly_wage = user_details.get("hourly_wage", 0.0)
+            # OPTIMIZED: Get employee's hourly wage from cache instead of Firestore
+            employee_data = all_employees.get(employee_id, {})
+            hourly_wage = employee_data.get("hourly_wage", 0.0)
 
             # Sort logs by timestamp
             sorted_logs = sorted(logs, key=lambda x: x.timestamp)
@@ -1588,10 +1851,11 @@ async def get_employee_details(
     two_weeks_ago = now - timedelta(days=14)
     print(f"DEBUG: Fetching clocks since {two_weeks_ago} for employee {employee_id}")
 
-    # Get employee details from Firestore
-    user_details = await get_user_details(employee_id)
-    employee_name = user_details.get("name", "Unknown")
-    hourly_wage = user_details.get("hourly_wage", 0.0)
+    # OPTIMIZED: Get employee details from cache instead of Firestore
+    all_employees = await get_all_employees_cached()
+    employee_data = all_employees.get(employee_id, {})
+    employee_name = employee_data.get("name", "Unknown")
+    hourly_wage = employee_data.get("hourly_wage", 0.0)
 
     # Get all clock entries for the past two weeks
     recent_clocks = session.exec(
@@ -1911,10 +2175,11 @@ async def get_employee_details_by_date_range(
         f"DEBUG: Fetching clocks from {date_range_start} to {date_range_end} for employee {employee_id} (converted from EST)"
     )
 
-    # Get employee details from Firestore
-    user_details = await get_user_details(employee_id)
-    employee_name = user_details.get("name", "Unknown")
-    hourly_wage = user_details.get("hourly_wage", 0.0)
+    # OPTIMIZED: Get employee details from cache instead of Firestore
+    all_employees = await get_all_employees_cached()
+    employee_data = all_employees.get(employee_id, {})
+    employee_name = employee_data.get("name", "Unknown")
+    hourly_wage = employee_data.get("hourly_wage", 0.0)
 
     # Get all clock entries within the specified date range
     recent_clocks = session.exec(
@@ -2188,31 +2453,16 @@ async def get_all_employees_details(
         tzinfo=timezone.utc
     )
 
-    # Get all employees from Firestore
-    users_ref = (
-        firestore_db.collection("users")
-        .where(
-            "role",
-            "in",
-            [
-                "employee",
-                "clockOnlyEmployee",
-                "supplier",
-                "owner",
-            ],
-        )
-        .stream()
-    )
+    # OPTIMIZED: Get all employees from cache instead of Firestore
+    all_employees = await get_all_employees_cached()
     employees_data = {}
     employee_ids = []
 
-    for doc in users_ref:
-        user_data = doc.to_dict()
-        employee_id = doc.id
+    for employee_id, emp_data in all_employees.items():
         employee_ids.append(employee_id)
         employees_data[employee_id] = {
-            "name": user_data.get("displayName", "Unknown"),
-            "hourly_wage": user_data.get("hourlyWage", 0.0),
+            "name": emp_data.get("name", "Unknown"),
+            "hourly_wage": emp_data.get("hourly_wage", 0.0),
         }
 
     # Apply pagination to employee list
@@ -2448,31 +2698,16 @@ async def get_all_employees_details_by_date_range(
         tzinfo=timezone.utc
     )
 
-    # Get all employees from Firestore
-    users_ref = (
-        firestore_db.collection("users")
-        .where(
-            "role",
-            "in",
-            [
-                "employee",
-                "clockOnlyEmployee",
-                "supplier",
-                "owner",
-            ],
-        )
-        .stream()
-    )
+    # OPTIMIZED: Get all employees from cache instead of Firestore
+    all_employees = await get_all_employees_cached()
     employees_data = {}
     employee_ids = []
 
-    for doc in users_ref:
-        user_data = doc.to_dict()
-        employee_id = doc.id
+    for employee_id, emp_data in all_employees.items():
         employee_ids.append(employee_id)
         employees_data[employee_id] = {
-            "name": user_data.get("displayName", "Unknown"),
-            "hourly_wage": user_data.get("hourlyWage", 0.0),
+            "name": emp_data.get("name", "Unknown"),
+            "hourly_wage": emp_data.get("hourly_wage", 0.0),
         }
 
     # No pagination - get all employees
@@ -2666,6 +2901,9 @@ async def get_dealership_employee_hours_breakdown(
         DealershipEmployeeHoursResponse with each employee's hours breakdown
     """
 
+    # OPTIMIZED: Load employee cache once at the start
+    all_employees = await get_all_employees_cached()
+
     # Set default date range to current week if not provided
     now = datetime.now(timezone.utc)
     today = now.date()
@@ -2703,6 +2941,11 @@ async def get_dealership_employee_hours_breakdown(
     # Get all unique employee IDs for this dealership
     employee_ids = list(employee_logs.keys())
 
+    # OPTIMIZED: Batch check all employees' active status in ONE query
+    active_statuses = await get_all_active_employees_batch(
+        session, employee_ids, dealership_id
+    )
+
     # Calculate summary totals
     summary_total_hours = 0.0
     summary_regular_hours = 0.0
@@ -2712,15 +2955,13 @@ async def get_dealership_employee_hours_breakdown(
     employee_breakdown_list = []
 
     for employee_id in employee_ids:
-        # Get employee details from Firestore
-        user_details = await get_user_details(employee_id)
-        employee_name = user_details.get("name", "Unknown")
-        hourly_wage = user_details.get("hourly_wage", 0.0)
+        # OPTIMIZED: Get employee details from cache instead of Firestore
+        employee_data = all_employees.get(employee_id, {})
+        employee_name = employee_data.get("name", "Unknown")
+        hourly_wage = employee_data.get("hourly_wage", 0.0)
 
-        # Check if employee is currently active at this dealership
-        is_currently_active, _ = await is_employee_currently_active(
-            session, employee_id, dealership_id
-        )
+        # OPTIMIZED: Get active status from batch result
+        is_currently_active, _ = active_statuses.get(employee_id, (False, None))
 
         # Calculate total hours worked by this employee using helper
         logs = employee_logs[employee_id]
@@ -2935,57 +3176,21 @@ async def get_comprehensive_labor_spend(
     )
     print(f"Analysis period (UTC) - Week: {start_of_week} to {end_of_week}")
 
-    # Get ALL employees from Firestore (not just those who clocked in)
-    users_ref = (
-        firestore_db.collection("users")
-        .where(
-            "role",
-            "in",
-            [
-                "employee",
-                "clockOnlyEmployee",
-                "supplier",
-                "owner",
-            ],
-        )
-        .stream()
-    )
+    # OPTIMIZED: Get ALL employees from cache instead of Firestore
+    cached_employees = await get_all_employees_cached()
     all_employees = {}
-    for doc in users_ref:
-        user_data = doc.to_dict()
-        # --- Dealership assignment check ---
-        # Parse "dealerships" field
-        raw_dealerships = user_data.get("dealerships", "")
-        if isinstance(raw_dealerships, list):
-            employee_dealerships = [str(d).strip() for d in raw_dealerships]
-        else:
-            employee_dealerships = [
-                s.strip() for s in str(raw_dealerships).split(",") if s.strip()
-            ]
 
-        # Parse optional "timeClockDealerships" field (same format)
-        raw_tc_dealers = user_data.get("timeClockDealerships", "")
-        if isinstance(raw_tc_dealers, list):
-            time_clock_dealerships = [str(d).strip() for d in raw_tc_dealers]
-        else:
-            time_clock_dealerships = [
-                s.strip() for s in str(raw_tc_dealers).split(",") if s.strip()
-            ]
-
-        combined_dealerships = set(employee_dealerships) | set(time_clock_dealerships)
+    # Filter for employees assigned to this dealership
+    for employee_id, emp_data in cached_employees.items():
+        combined_dealerships = emp_data.get("dealerships", set())
 
         # Skip employees not assigned to this dealership
         if dealership_id not in combined_dealerships:
             continue
 
-        employee_id = doc.id
         all_employees[employee_id] = {
-            "name": user_data.get("displayName", "Unknown"),
-            "hourly_wage": (
-                float(user_data.get("hourlyWage", 0.0))
-                if user_data.get("hourlyWage")
-                else 0.0
-            ),
+            "name": emp_data.get("name", "Unknown"),
+            "hourly_wage": emp_data.get("hourly_wage", 0.0),
         }
 
     print(f"Found {len(all_employees)} total employees assigned to {dealership_id}")
@@ -3006,24 +3211,18 @@ async def get_comprehensive_labor_spend(
         f"Found {len(recent_employee_ids)} employees who have clocked in at {dealership_id} recently"
     )
 
-    # For recently clocked employees not already in our list, fetch their details
+    # OPTIMIZED: For recently clocked employees not already in our list, get from cache
     for employee_id in recent_employee_ids:
         if employee_id not in all_employees:
-            # Get this employee's details from Firestore
-            try:
-                user_details = await get_user_details(employee_id)
-                all_employees[employee_id] = {
-                    "name": user_details.get("name", "Unknown"),
-                    "hourly_wage": user_details.get("hourly_wage", 0.0),
-                }
-                print(
-                    f"Added recently active employee {employee_id} ({user_details.get('name', 'Unknown')}) who isn't assigned to {dealership_id}"
-                )
-            except Exception as e:
-                print(
-                    f"Error fetching details for recently active employee {employee_id}: {e}"
-                )
-                continue
+            # Get this employee's details from cache
+            emp_data = cached_employees.get(employee_id, {})
+            all_employees[employee_id] = {
+                "name": emp_data.get("name", "Unknown"),
+                "hourly_wage": emp_data.get("hourly_wage", 0.0),
+            }
+            print(
+                f"Added recently active employee {employee_id} ({emp_data.get('name', 'Unknown')}) who isn't assigned to {dealership_id}"
+            )
 
     print(
         f"Total employees to process for {dealership_id}: {len(all_employees)} (assigned + recently active)"
@@ -4017,6 +4216,10 @@ async def get_all_dealerships_labor_costs_today(
             [
                 "employee",
                 "clockOnlyEmployee",
+                "serviceWash",
+                "photos",
+                "lotPrep",
+                "deleted",
                 "supplier",
                 "owner",
             ],
